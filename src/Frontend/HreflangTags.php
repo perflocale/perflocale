@@ -381,7 +381,7 @@ final class HreflangTags {
 		};
 
 		if ( $cache_key !== null && $cache_manager instanceof CacheManager ) {
-			// The TTL bounds staleness when a narrow flush is missed; singulars are cleared per post.
+			// The TTL bounds staleness when a narrow flush is missed; at most a day, as uninstall promises.
 			$ttl = (int) apply_filters(
 				'perflocale/seo/hreflang_cache_ttl',
 				12 * HOUR_IN_SECONDS
@@ -390,7 +390,7 @@ final class HreflangTags {
 			$html = (string) $cache_manager->get(
 				$cache_key,
 				$build_html,
-				max( 1, $ttl ),
+				min( DAY_IN_SECONDS, max( 1, $ttl ) ),
 				'perflocale_hreflang'
 			);
 		} else {
@@ -577,7 +577,7 @@ final class HreflangTags {
 			$tags = $cache_manager->get(
 				'tags_' . $cache_key,
 				fn(): array => $this->compute_hreflang_data(),
-				max( 1, $ttl ),
+				min( DAY_IN_SECONDS, max( 1, $ttl ) ),
 				'perflocale_hreflang'
 			);
 
@@ -651,47 +651,11 @@ final class HreflangTags {
 			(bool) $this->settings->get( 'seo_hreflang_include_fallbacks', false )
 		);
 
-		if ( $include_fallbacks ) {
-			$missing_action = (string) $this->settings->get( 'missing_translation_action', 'show_default' );
-			$fallbacks      = (array) $this->settings->get( 'language_fallbacks', [] );
+		// Only a page missing a language needs the fallback decision (and loads its class).
+		if ( $include_fallbacks && count( $urls ) < count( $languages ) ) {
+			require_once __DIR__ . '/FallbackResponse.php';
 
-			// The object's own link, not current_request_url(): that strips the query, and under
-			// Plain permalinks (?p=42) every alternate would point at the language home.
-			$current_url = '';
-
-			if ( is_singular() && (int) get_queried_object_id() > 0 ) {
-				$permalink   = get_permalink( get_queried_object_id() );
-				$current_url = is_string( $permalink ) ? $permalink : '';
-			} elseif ( ( is_category() || is_tag() || is_tax() ) && get_queried_object() instanceof \WP_Term ) {
-				$term_link   = get_term_link( get_queried_object() );
-				$current_url = is_string( $term_link ) ? $term_link : '';
-			}
-
-			if ( $current_url === '' ) {
-				$current_url = $this->current_request_url();
-			}
-
-			// convert() returns an unparseable URL unchanged; it never becomes an alternate.
-			$fill = wp_parse_url( $current_url ) !== false ? $languages : [];
-
-			foreach ( $fill as $lang ) {
-				if ( isset( $urls[ $lang->slug ] ) || isset( $excluded_slugs[ $lang->slug ] ) ) {
-					continue;
-				}
-
-				// Renders 200 under show_default or a non-empty fallback chain.
-				$has_fallback = ! empty( $fallbacks[ $lang->slug ] );
-
-				if ( $missing_action !== 'show_default' && ! $has_fallback ) {
-					continue;
-				}
-
-				$converted = $this->url_converter->convert( $current_url, $lang->slug );
-
-				if ( $converted !== '' ) {
-					$urls[ $lang->slug ] = $converted;
-				}
-			}
+			$urls = FallbackResponse::fallback_alternates( $urls, $languages, $excluded_slugs, $this->settings, $this->url_converter, $this->current_request_url() );
 		}
 
 		$urls = $this->drop_missing_listing_pages( $urls, $languages );

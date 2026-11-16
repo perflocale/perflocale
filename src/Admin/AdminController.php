@@ -54,7 +54,7 @@ final class AdminController {
 		'process_string_translations' => [ 'POST', 'perflocale_save_string_translations', '' ],
 		'process_strings_po_forms'    => [ 'POST', 'perflocale_strings_action', '' ],
 		'process_translations_bulk'   => [ 'POST', 'perflocale_translations_action', '' ],
-		'process_dashboard_actions'   => [ 'GET', 'page', 'perflocale' ],
+		'process_dashboard_actions'   => [ 'POST', 'perflocale_dashboard_action', '' ],
 	];
 
 	/**
@@ -108,6 +108,20 @@ final class AdminController {
 		add_action( 'admin_post_perflocale_reset_breaker', [ $this, 'handle_reset_breaker_action' ] );
 		add_action( 'admin_post_perflocale_save_addon_settings', [ $this, 'handle_save_addon_settings' ] );
 		add_action( 'admin_post_perflocale_toggle_addon', [ $this, 'handle_toggle_addon' ] );
+		add_action( 'admin_post_perflocale_kept_draft', [ Pages\KeptDraftsPanel::class, 'handle' ] );
+		add_action( 'admin_post_perflocale_dismiss_copy_errors', [ MetaBox::class, 'dismiss_copy_errors' ] );
+
+		// Content ReSync: its forms, notices and admin-post actions, only on a request that can reach them and while it is on.
+		if ( self::resync_request() && \PerfLocale\Util\ResyncSwitch::on() ) {
+			add_action( 'admin_init', [ $this, 'process_strings_update' ] );
+			add_action( 'admin_notices', [ $this, 'render_resync_notices' ] );
+			add_action( 'admin_post_perflocale_review_apply', [ $this, 'handle_review_apply' ] );
+			add_action( 'admin_post_perflocale_review_reject', [ $this, 'handle_review_reject' ] );
+			add_action( 'admin_post_perflocale_review_undo', [ $this, 'handle_review_undo' ] );
+			add_action( 'admin_post_perflocale_resync', [ ResyncEntry::class, 'handle_resync' ] );
+			add_action( 'admin_post_perflocale_resync_start', [ ResyncEntry::class, 'handle_start' ] );
+			add_action( 'admin_post_perflocale_resync_cancel', [ ResyncEntry::class, 'handle_cancel' ] );
+		}
 
 		// A new WooCommerce base currency: the rate sync runs at the next tick, not at the old pair's slot.
 		add_action( 'update_option_woocommerce_currency', [ $this, 'reschedule_rate_sync' ] );
@@ -790,6 +804,79 @@ final class AdminController {
 	}
 
 	/**
+	 * Apply a held update (admin-post, Review update screen or Strings review).
+	 *
+	 * @return void
+	 */
+	public function handle_review_apply(): void {
+		AdminForms::handle_review( 'apply' );
+	}
+
+	/**
+	 * Reject a held update.
+	 *
+	 * @return void
+	 */
+	public function handle_review_reject(): void {
+		AdminForms::handle_review( 'reject' );
+	}
+
+	/**
+	 * Undo an applied update.
+	 *
+	 * @return void
+	 */
+	public function handle_review_undo(): void {
+		AdminForms::handle_review( 'undo' );
+	}
+
+	/**
+	 * The Strings screen's "Update strings" dialog (Content ReSync of strings).
+	 *
+	 * @return void
+	 */
+	public function process_strings_update(): void {
+		// phpcs:ignore WordPress.Security.NonceVerification.Missing -- Route check only; the handler verifies the nonce.
+		if ( ! isset( $_POST['perflocale_strings_action'] ) || 'update_strings' !== $_POST['perflocale_strings_action'] ) {
+			return;
+		}
+
+		ResyncEntry::process_strings();
+	}
+
+	/**
+	 * Whether this request can reach a Content ReSync hook; literal names, so a plain admin page loads no ReSync class.
+	 *
+	 * @return bool
+	 */
+	private static function resync_request(): bool {
+		// phpcs:ignore WordPress.Security.NonceVerification -- Route checks only; the handlers verify the nonces.
+		if ( isset( $_GET['perflocale_resync_confirm'] ) || isset( $_GET['perflocale_resync_done'] ) || isset( $_POST['perflocale_strings_action'] ) ) {
+			return true;
+		}
+
+		// phpcs:ignore WordPress.Security.NonceVerification, WordPress.Security.ValidatedSanitizedInput -- Strictly compared with literals, never printed.
+		$action = $_REQUEST['action'] ?? null;
+
+		return is_string( $action ) && in_array( $action, [ 'perflocale_review_apply', 'perflocale_review_reject', 'perflocale_review_undo', 'perflocale_resync', 'perflocale_resync_start', 'perflocale_resync_cancel' ], true );
+	}
+
+	/**
+	 * Content ReSync's notices, only on a request that carries one of their flags.
+	 *
+	 * @return void
+	 */
+	public function render_resync_notices(): void {
+		// Literal names, not ResyncNotices' constants: reading one would load the class on every admin screen.
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Display flags only.
+		if ( ! isset( $_GET['perflocale_resync_confirm'] ) && ! isset( $_GET['perflocale_resync_done'] ) ) {
+			return;
+		}
+
+		ResyncNotices::admin_notices();
+	}
+
+	/**
 	 * Save an add-on card's inline settings form (action=perflocale_save_addon_settings, one addon_id,
 	 * `settings[$key]` per editable field of get_settings_fields()); hidden and add-on-managed fields are left alone.
 	 *
@@ -925,6 +1012,25 @@ final class AdminController {
 			'perflocale-settings',
 			[ $this, 'render_settings' ]
 		);
+
+		// Not in the menu: reached from a held update's links, registered on its own request only (the menu
+		// capability check costs reads on every admin page); none while Content ReSync is off.
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended, WordPress.Security.ValidatedSanitizedInput.MissingUnslash, WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Strictly compared with a literal, never printed.
+		if ( 'perflocale-review-update' !== ( $_GET['page'] ?? null ) || ! \PerfLocale\Util\ResyncSwitch::on() ) {
+			return;
+		}
+
+		$this->page_hooks['review_update'] = add_submenu_page(
+			'',
+			__( 'Review update', 'perflocale' ),
+			__( 'Review update', 'perflocale' ),
+			'perflocale_translate',
+			'perflocale-review-update',
+			[ $this, 'render_review_update' ]
+		);
+
+		// Core finds no title for a page with an empty parent, and strip_tags( null ) in admin-header.php logs a deprecation.
+		$GLOBALS['title'] = __( 'Review update', 'perflocale' ); // phpcs:ignore WordPress.WP.GlobalVariablesOverride.Prohibited -- Core's own screen title variable, for this screen only.
 	}
 
 	/**
@@ -965,6 +1071,15 @@ final class AdminController {
 	public function render_settings(): void {
 		$page = new Pages\SettingsPage( $this->settings );
 		$page->render();
+	}
+
+	/**
+	 * Render the Review update page.
+	 *
+	 * @return void
+	 */
+	public function render_review_update(): void {
+		( new Pages\ReviewUpdatePage() )->render();
 	}
 
 	/**

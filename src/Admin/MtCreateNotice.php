@@ -259,7 +259,7 @@ final class MtCreateNotice {
 		foreach ( [ 'builder_warning', 'length_warning' ] as $key ) {
 			if ( is_string( $result[ $key ] ?? null ) && '' !== $result[ $key ] ) {
 				$text       = self::plain( $result[ $key ] );
-				$warnings[] = function_exists( 'mb_substr' ) ? mb_substr( $text, 0, $half ) : substr( $text, 0, $half );
+				$warnings[] = mb_substr( $text, 0, $half );
 			}
 		}
 
@@ -504,6 +504,6 @@ final class MtCreateNotice {
 		$text = \PerfLocale\Util\SecretMasker::mask( wp_specialchars_decode( wp_strip_all_tags( $text ), ENT_QUOTES ) );
 		$text = trim( (string) preg_replace( '/\s+/u', ' ', $text ) );
 
-		return function_exists( 'mb_substr' ) ? mb_substr( $text, 0, self::MAX_REASON ) : substr( $text, 0, self::MAX_REASON );
+		return mb_substr( $text, 0, self::MAX_REASON );
 	}
 }

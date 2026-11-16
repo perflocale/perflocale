@@ -32,6 +32,12 @@ final class XliffImportErrors {
 	/** The user cannot edit the post a new translation would be copied from. */
 	public const CANNOT_EDIT_COPY_SOURCE = 'cannot_edit_copy_source';
 
+	/** The translation is one the user may not view: named nowhere. */
+	public const TRANSLATION_UNAVAILABLE = 'translation_unavailable';
+
+	/** The post a new translation would be copied from is one the user may not view: named nowhere. */
+	public const COPY_SOURCE_UNAVAILABLE = 'copy_source_unavailable';
+
 	/** The user may not create posts of the type a new translation would have. */
 	public const CANNOT_CREATE = 'cannot_create';
 
@@ -41,14 +47,44 @@ final class XliffImportErrors {
 	/** Saving the translated fields failed. */
 	public const SAVE_FAILED = 'save_failed';
 
+	/** The unit adds markup that is not allowed in translations. */
+	public const UNSAFE_MARKUP = 'unsafe_markup';
+
 	/** A stopped import's translation was edited since: left as it is. */
 	public const RECOVERY_EDITED_TRANSLATION = 'recovery_edited_translation';
 
-	/** A stopped import's unlinked draft: kept for a person to review. */
-	public const RECOVERY_KEPT_DRAFT = 'recovery_kept_draft';
+	/** A stopped import's unlinked draft may have been edited since: kept. */
+	public const RECOVERY_EDITED_DRAFT = 'recovery_edited_draft';
+
+	/** A stopped import's unlinked draft was moved to the trash. */
+	public const RECOVERY_TRASHED = 'recovery_trashed';
+
+	/** A stopped import's unlinked draft could not be moved to the trash: kept. */
+	public const RECOVERY_NOT_TRASHED = 'recovery_not_trashed';
 
 	/** The user may not finish a stopped import's translation. */
 	public const RECOVERY_CANNOT_FINISH = 'recovery_cannot_finish';
+
+	/** The user may not delete a stopped import's unlinked draft. */
+	public const RECOVERY_CANNOT_DELETE = 'recovery_cannot_delete';
+
+	/** A stopped import's unlinked draft could not be proven unchanged: kept. */
+	public const RECOVERY_KEPT_DRAFT = 'recovery_kept_draft';
+
+	/** A stopped import's unlinked draft, unchanged since the stop: kept (recovery never trashes). */
+	public const RECOVERY_STOPPED_DRAFT = 'recovery_stopped_draft';
+
+	/** A stopped import's creation could not be checked (a read failed): kept, checked again by the next import. */
+	public const RECOVERY_UNCHECKED = 'recovery_unchecked';
+
+	/** This import's translation was created, but its temporary guid could not be replaced yet (retried later). */
+	public const RECOVERY_GUID_PENDING = 'recovery_guid_pending';
+
+	/** This import's own creation could not be finished: its unlinked draft was kept. */
+	public const RECOVERY_LEFT_DRAFT = 'recovery_left_draft';
+
+	/** A stopped import's translation: copying the original's custom fields, image or terms failed again. */
+	public const RECOVERY_COPY_FAILED = 'recovery_copy_failed';
 
 	/** Unit ids listed in full up to this many; a longer list is shortened. */
 	public const UNIT_LIST_MAX = 5;
@@ -68,7 +104,7 @@ final class XliffImportErrors {
 	/**
 	 * One entry per post, cause and other post, in the order first reported.
 	 *
-	 * @var array<string, array{cause: string, post_id: int, units: array<int, string>, other_id: int}>
+	 * @var array<string, array{cause: string, post_id: int, units: array<int, string>, other_id: int, detail: string}>
 	 */
 	private array $groups = [];
 
@@ -79,9 +115,10 @@ final class XliffImportErrors {
 	 * @param int    $post_id  Post ID the unit names.
 	 * @param string $unit_id  Unit id as written in the file.
 	 * @param int    $other_id The translation or copy source the cause is about, else 0.
+	 * @param string $detail   What the cause names, for a message that lists it (the first one reported is kept).
 	 * @return void
 	 */
-	public function add( string $cause, int $post_id, string $unit_id, int $other_id = 0 ): void {
+	public function add( string $cause, int $post_id, string $unit_id, int $other_id = 0, string $detail = '' ): void {
 		$key = $cause . ':' . $post_id . ':' . $other_id;
 
 		if ( ! isset( $this->groups[ $key ] ) ) {
@@ -90,6 +127,7 @@ final class XliffImportErrors {
 				'post_id'  => $post_id,
 				'units'    => [],
 				'other_id' => $other_id,
+				'detail'   => $detail,
 			];
 		}
 
@@ -110,7 +148,7 @@ final class XliffImportErrors {
 
 		foreach ( $this->groups as $group ) {
 			$title = in_array( $group['cause'], self::NO_TITLE, true ) ? '' : $title_for( $group['post_id'] );
-			$out[] = self::message( $group['cause'], $group['post_id'], $title, $group['units'], $group['other_id'] );
+			$out[] = self::message( $group['cause'], $group['post_id'], $title, $group['units'], $group['other_id'], $group['detail'] );
 		}
 
 		return $out;
@@ -124,9 +162,10 @@ final class XliffImportErrors {
 	 * @param string             $title    Title to show, or '' for none.
 	 * @param array<int, string> $units    Unit ids.
 	 * @param int                $other_id The translation or copy source, else 0.
+	 * @param string             $detail   What the cause names (RECOVERY_COPY_FAILED: the items), else ''.
 	 * @return string
 	 */
-	public static function message( string $cause, int $post_id, string $title, array $units, int $other_id = 0 ): string {
+	public static function message( string $cause, int $post_id, string $title, array $units, int $other_id = 0, string $detail = '' ): string {
 		$subject = self::subject( $post_id, in_array( $cause, self::NO_TITLE, true ) ? '' : $title, $units );
 
 		switch ( $cause ) {
@@ -144,7 +183,15 @@ final class XliffImportErrors {
 
 			case self::CANNOT_EDIT_COPY_SOURCE:
 				/* translators: 1: the post and its unit ids, for example: Post 42 (unit post-42-title). 2: ID of the post the translation would be copied from. */
-				return sprintf( __( '%1$s: you cannot edit the original this translation is copied from (post %2$d).', 'perflocale' ), $subject, $other_id );
+				return sprintf( __( '%1$s: you need read and edit rights on the original this translation is copied from (post %2$d).', 'perflocale' ), $subject, $other_id );
+
+			case self::TRANSLATION_UNAVAILABLE:
+				/* translators: %s: the post and its unit ids, for example: Post 42 (unit post-42-title). */
+				return sprintf( __( '%s: its translation cannot be created or updated: this content has a translation you cannot open. Ask an editor who can open it.', 'perflocale' ), $subject );
+
+			case self::COPY_SOURCE_UNAVAILABLE:
+				/* translators: %s: the post and its unit ids, for example: Post 42 (unit post-42-title). */
+				return sprintf( __( '%s: its translation cannot be created or updated: you cannot open its original. Ask an editor who can open it.', 'perflocale' ), $subject );
 
 			case self::CANNOT_CREATE:
 				/* translators: %s: the post and its unit ids, for example: Post 42 (unit post-42-title). */
@@ -154,13 +201,58 @@ final class XliffImportErrors {
 				/* translators: 1: the post and its unit ids, for example: Post 42 (unit post-42-title). 2: ID of the post's translation. */
 				return sprintf( __( '%1$s: its translation (post %2$d) may have been edited since an earlier import stopped while creating it, so it was left as it is and may lack the original\'s custom fields, image and terms. To apply this file\'s text to it, import the file again.', 'perflocale' ), $subject, $other_id );
 
-			case self::RECOVERY_KEPT_DRAFT:
+			case self::RECOVERY_EDITED_DRAFT:
 				/* translators: 1: the post and its unit ids, for example: Post 42 (unit post-42-title). 2: ID of the draft. */
-				return sprintf( __( '%1$s: an earlier import stopped while creating its translation and left a draft (post %2$d), which was kept. If you do not need it, delete it, or ask an editor to, before you publish the new translation; otherwise the new translation\'s address may end in -2.', 'perflocale' ), $subject, $other_id );
+				return sprintf( __( '%1$s: an earlier import that stopped left an unlinked draft (post %2$d) that may have been edited since, so it was kept. Delete it if you do not need it.', 'perflocale' ), $subject, $other_id );
+
+			case self::RECOVERY_TRASHED:
+				/* translators: 1: the post and its unit ids, for example: Post 42 (unit post-42-title). 2: ID of the draft. */
+				return sprintf( __( '%1$s: an earlier import that stopped left an unlinked draft (post %2$d), which was moved to the trash. Restore it from the trash if you need it.', 'perflocale' ), $subject, $other_id );
+
+			case self::RECOVERY_NOT_TRASHED:
+				/* translators: 1: the post and its unit ids, for example: Post 42 (unit post-42-title). 2: ID of the draft. */
+				return sprintf( __( '%1$s: an earlier import that stopped left an unlinked draft (post %2$d), which could not be moved to the trash (the site\'s trash may be turned off), so it was kept. Delete it if you do not need it.', 'perflocale' ), $subject, $other_id );
 
 			case self::RECOVERY_CANNOT_FINISH:
 				/* translators: 1: the post and its unit ids, for example: Post 42 (unit post-42-title). 2: ID of the post's translation. */
 				return sprintf( __( '%1$s: an earlier import stopped while creating its translation (post %2$d), and you do not have permission to copy the original\'s custom fields, image and terms to it. Ask an editor of both posts to copy them.', 'perflocale' ), $subject, $other_id );
+
+			case self::RECOVERY_CANNOT_DELETE:
+				/* translators: 1: the post and its unit ids, for example: Post 42 (unit post-42-title). 2: ID of the draft. */
+				return sprintf( __( '%1$s: an earlier import that stopped left an unlinked draft (post %2$d) that you do not have permission to delete. Ask an editor to delete it.', 'perflocale' ), $subject, $other_id );
+
+			case self::RECOVERY_KEPT_DRAFT:
+				/* translators: 1: the post and its unit ids, for example: Post 42 (unit post-42-title). 2: ID of the draft. */
+				return sprintf( __( '%1$s: an earlier import stopped while creating its translation and left a draft (post %2$d), which was kept. If you do not need it, delete it, or ask an editor to, before you publish the new translation; otherwise the new translation\'s address may end in -2.', 'perflocale' ), $subject, $other_id );
+
+			case self::RECOVERY_STOPPED_DRAFT:
+				/* translators: 1: the post and its unit ids, for example: Post 42 (unit post-42-title). 2: ID of the draft. */
+				return sprintf( __( '%1$s: an earlier import that stopped left an unlinked draft (post %2$d), unchanged since, so it was kept. Move it to the trash if you do not need it.', 'perflocale' ), $subject, $other_id );
+
+			case self::RECOVERY_UNCHECKED:
+				if ( 0 === $other_id ) {
+					/* translators: %s: the post and its unit ids, for example: Post 42 (unit post-42-title). */
+					return sprintf( __( '%s: an earlier import that stopped could not be checked (a database read failed). Import the file again later; it is checked again then.', 'perflocale' ), $subject );
+				}
+
+				/* translators: 1: the post and its unit ids, for example: Post 42 (unit post-42-title). 2: ID of the draft. */
+				return sprintf( __( '%1$s: an earlier import that stopped left an unlinked draft (post %2$d) that could not be checked (a database read failed), so it was kept. Import the file again later; it is checked again then.', 'perflocale' ), $subject, $other_id );
+
+			case self::RECOVERY_GUID_PENDING:
+				/* translators: 1: the post and its unit ids, for example: Post 42 (unit post-42-title). 2: ID of the translation. */
+				return sprintf( __( '%1$s: the translation (post %2$d) was created and works, but its temporary guid could not be replaced yet (a database write failed). It is retried when a stopped import of this post is next recovered.', 'perflocale' ), $subject, $other_id );
+
+			case self::RECOVERY_LEFT_DRAFT:
+				/* translators: 1: the post and its unit ids, for example: Post 42 (unit post-42-title). 2: ID of the draft. */
+				return sprintf( __( '%1$s: the translation could not be finished, and its unlinked draft (post %2$d) was kept. Delete it if you do not need it.', 'perflocale' ), $subject, $other_id );
+
+			case self::RECOVERY_COPY_FAILED:
+				/* translators: 1: the post and its unit ids, for example: Post 42 (unit post-42-title). 2: ID of the post's translation. 3: comma-separated items, for example: custom fields (_price, gallery), featured image. */
+				return sprintf( __( '%1$s: an earlier import stopped while creating its translation (post %2$d), and these items still did not copy from the original: %3$s. Fill them in on the translation.', 'perflocale' ), $subject, $other_id, '' !== $detail ? $detail : __( 'custom fields, image or terms', 'perflocale' ) );
+
+			case self::UNSAFE_MARKUP:
+				/* translators: %s: the post and its unit ids, for example: Post 42 (unit post-42-content). */
+				return sprintf( __( '%s: the translation adds HTML that is not allowed in translations (such as a script, an event attribute or a script link), so this unit was not imported. Remove that markup from the file, or keep the original\'s markup unchanged, and import it again.', 'perflocale' ), $subject );
 
 			case self::CREATE_FAILED:
 				/* translators: %s: the post and its unit ids, for example: Post 42 (unit post-42-title). */

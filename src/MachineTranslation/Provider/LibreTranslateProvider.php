@@ -68,6 +68,7 @@ final class LibreTranslateProvider extends AbstractProvider {
 	 */
 	public function translate( string $text, string $source_lang, string $target_lang, bool $fast_fail = false, string $format = 'html' ): string {
 		$text = apply_filters( 'perflocale/machine_translation/text_before_send', $text, 'libretranslate', $target_lang );
+		$this->guard_send( \PerfLocale\Util\Utf8::length( \PerfLocale\Util\Scalar::str( $text ) ) );
 
 		$base_url = rtrim( (string) $this->settings->get( 'mt_libre_url' ), '/' );
 

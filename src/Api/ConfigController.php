@@ -223,6 +223,10 @@ final class ConfigController extends RestController {
 			}
 		}
 
+		// The raw `home` option: home_url() may carry the default prefix.
+		$home      = get_option( 'home' );
+		$home_path = '/' . trim( is_string( $home ) ? (string) wp_parse_url( $home, PHP_URL_PATH ) : '', '/' );
+
 		$payload = [
 			'version'             => PERFLOCALE_VERSION,
 			'url_mode'            => $settings->get_url_mode(),
@@ -231,6 +235,8 @@ final class ConfigController extends RestController {
 			'hide_default_prefix' => $settings->hide_default_prefix(),
 			'excluded_paths'      => array_values( array_filter( array_map( 'strval', $settings->get_excluded_paths() ) ) ),
 			'detection_order'     => array_values( array_filter( array_map( 'strval', $settings->get_detection_order() ) ) ),
+			'redirect_order'      => array_values( $settings->get_redirect_priority_order() ),
+			'home_path'           => $home_path,
 			'edge_hint_header'    => 'X-PerfLocale-Lang',
 			'edge_hint_cookie'    => 'perflocale_edge_lang',
 			'languages'           => $languages,

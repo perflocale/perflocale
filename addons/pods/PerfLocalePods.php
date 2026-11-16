@@ -280,7 +280,7 @@ final class PerfLocalePods implements \PerfLocale\Addon\AddonInterface {
 	 * @return string 'text' for a plain/paragraph field, else $format.
 	 */
 	public function mt_meta_key_format( string $format, string $key, string $post_type ): string {
-		if ( 'text' === $format ) {
+		if ( 'html' !== $format ) {
 			return $format;
 		}
 

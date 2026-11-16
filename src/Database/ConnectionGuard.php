@@ -50,6 +50,13 @@ final class ConnectionGuard {
 	private bool $open = false;
 
 	/**
+	 * The guard of the plugin transaction open in this request (begin( true ) to end()); null when none.
+	 *
+	 * @var self|null
+	 */
+	private static ?self $owner = null;
+
+	/**
 	 * The guard of one kind of unit.
 	 *
 	 * @param string $name Lowercase letters, digits and underscores: the
@@ -75,6 +82,15 @@ final class ConnectionGuard {
 	}
 
 	/**
+	 * Whether wpdb's link is mysqli, which wpdb replaces after a lost connection and resends the statement on.
+	 *
+	 * @return bool
+	 */
+	public static function reconnects(): bool {
+		return self::handle() instanceof \mysqli;
+	}
+
+	/**
 	 * Row-lock suffix for a locking read: ' FOR UPDATE' on MySQL and MariaDB, '' on SQLite (one writer per database;
 	 * the SQLite integration's 2.2.x legacy driver refuses FOR UPDATE).
 	 *
@@ -89,10 +105,20 @@ final class ConnectionGuard {
 	 *
 	 * Never CONNECTION_ID() instead: ids start again after a server restart.
 	 *
-	 * @return bool False when the marker could not be set.
+	 * @param bool $transaction Claim the request's one plugin transaction: refused while another is open, since a
+	 *                          nested START TRANSACTION commits the outer one.
+	 * @return bool False when the marker could not be set or another plugin transaction is open.
 	 */
-	public function begin(): bool {
+	public function begin( bool $transaction = false ): bool {
+		if ( $transaction && null !== self::$owner && $this !== self::$owner ) {
+			return false;
+		}
+
 		$this->end();
+
+		if ( $transaction ) {
+			self::$owner = $this;
+		}
 
 		if ( ! self::applies() ) {
 			return true;
@@ -101,9 +127,14 @@ final class ConnectionGuard {
 		$wpdb        = self::wpdb();
 		$this->token = bin2hex( random_bytes( 16 ) );
 
+		// HyperDB / LudicrousDB: the unit's locking reads must reach the primary, not a replica.
+		if ( method_exists( $wpdb, 'send_reads_to_masters' ) ) {
+			$wpdb->send_reads_to_masters();
+		}
+
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- See marker(): a checked name and a hex token.
 		if ( false === $wpdb->query( 'SET ' . $this->marker() ) ) {
-			$this->token = '';
+			$this->end();
 
 			return false;
 		}
@@ -115,6 +146,43 @@ final class ConnectionGuard {
 	}
 
 	/**
+	 * Open the request's one plugin transaction: begin( true ), then START TRANSACTION.
+	 *
+	 * @return bool False, with nothing claimed, when another is open or a step fails (a throw releases the claim too).
+	 */
+	public function start(): bool {
+		$started = false;
+
+		try {
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			$started = $this->begin( true ) && false !== self::wpdb()->query( 'START TRANSACTION' );
+		} finally {
+			if ( ! $started ) {
+				$this->end();
+			}
+		}
+
+		return $started;
+	}
+
+	/**
+	 * End start()'s transaction: ROLLBACK unless it ended, then end(); the claim goes even when the ROLLBACK throws.
+	 *
+	 * @param bool $ended Whether COMMIT or ROLLBACK was already sent.
+	 * @return void
+	 */
+	public function finish( bool $ended ): void {
+		try {
+			if ( ! $ended ) {
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				self::wpdb()->query( 'ROLLBACK' );
+			}
+		} finally {
+			$this->end();
+		}
+	}
+
+	/**
 	 * Close the unit; the variable stays on the connection and the next unit gets a new token.
 	 *
 	 * @return void
@@ -123,6 +191,28 @@ final class ConnectionGuard {
 		$this->open   = false;
 		$this->token  = '';
 		$this->handle = null;
+
+		if ( $this === self::$owner ) {
+			self::$owner = null;
+		}
+	}
+
+	/**
+	 * Whether a plugin transaction is open in this request (a guard between begin( true ) and end()).
+	 *
+	 * @return bool
+	 */
+	public static function in_transaction(): bool {
+		return null !== self::$owner;
+	}
+
+	/**
+	 * Whether this guard holds the request's plugin transaction.
+	 *
+	 * @return bool
+	 */
+	public function owns(): bool {
+		return $this === self::$owner;
 	}
 
 	/**
@@ -140,6 +230,7 @@ final class ConnectionGuard {
 	 *
 	 * No query when the handle is known, so a connection lost after a successful COMMIT is not taken for a lost unit.
 	 *
+	 * @phpstan-impure
 	 * @return bool
 	 */
 	public function kept(): bool {

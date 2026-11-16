@@ -11,6 +11,7 @@ namespace PerfLocale\Admin;
 
 use PerfLocale\Database\Schema;
 use PerfLocale\Database\Repository\StringRepository;
+use PerfLocale\Util\Scalar;
 
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
@@ -85,12 +86,15 @@ final class PoSync {
 	/**
 	 * Export every translation for one language as a PO file.
 	 *
-	 * @param string $path      Output path.
-	 * @param string $lang_slug Target language slug (matches `languages.slug`).
-	 * @param string $domain    Optional domain filter; empty = all domains.
+	 * @param string             $path            Output path.
+	 * @param string             $lang_slug       Target language slug (matches `languages.slug`).
+	 * @param string             $domain          Optional domain filter; empty = all domains.
+	 * @param array              $report          Receives the export report.
+	 * @param array<int, string> $exclude_domains Domains left out of the export (the ones the exporting user may not see).
 	 * @return int|false Bytes written, or false on failure.
+	 * @phpstan-param array<int, string> $exclude_domains
 	 */
-	public static function export_to_file( string $path, string $lang_slug, string $domain = '', array &$report = [] ) {
+	public static function export_to_file( string $path, string $lang_slug, string $domain = '', array &$report = [], array $exclude_domains = [] ) {
 		self::load_pomo();
 
 		// Set on every exit path, so a caller can read it without checking the return value.
@@ -123,6 +127,18 @@ final class PoSync {
 		if ( $domain !== '' ) {
 			$where .= ' AND s.domain = %s';
 			$args[] = $domain;
+		}
+
+		$exclude_domains = array_values( array_unique( array_filter( $exclude_domains, static fn( string $d ): bool => '' !== $d ) ) );
+
+		if ( $domain !== '' && in_array( $domain, $exclude_domains, true ) ) {
+			// A domain the user may not see: an empty file says so; a file of someone else's strings would not.
+			$where .= ' AND 1=0';
+		} elseif ( $exclude_domains !== [] ) {
+			// Kept beside a domain filter: both compare under the column collation, so no spelling of an excluded domain matches.
+			$ph     = implode( ',', array_fill( 0, count( $exclude_domains ), '%s' ) );
+			$where .= " AND s.domain NOT IN ({$ph})";
+			$args   = array_merge( $args, $exclude_domains );
 		}
 
 		$pairs = self::plural_pairs( $strings, $domain );
@@ -289,10 +305,11 @@ final class PoSync {
 
 				/*
 				 * A row whose stored original_hash is not the hash of its `original` would get a phantom twin on re-import (the
-				 * importer hashes the msgid it reads); counted per row, retaining nothing. The raw original is hashed.
+				 * importer hashes the msgid it reads); counted per row, retaining nothing. The raw original is hashed; a row still
+				 * under the old identity rule is not counted, as the import moves it.
 				 */
 				foreach ( $entry_rows as $entry_row ) {
-					if ( StringRepository::compute_hash( self::field( $entry_row, 'domain' ), self::field( $entry_row, 'context' ), self::field( $entry_row, 'original' ) ) !== self::field( $entry_row, 'original_hash' ) ) {
+					if ( ! in_array( self::field( $entry_row, 'original_hash' ), StringRepository::identity_hashes( self::field( $entry_row, 'domain' ), self::field( $entry_row, 'context' ), self::field( $entry_row, 'original' ) ), true ) ) {
 						++$report['unhashable'];
 
 						if ( count( $report['unhashable_ids'] ) < 20 ) {
@@ -555,7 +572,7 @@ final class PoSync {
 				}
 
 				// Without its own context the entry's key is the msgid alone, which a context-free string may also use.
-				if ( 'singular' === $single_context && isset( $twins[ StringRepository::compute_hash( self::field( $plural, 'domain' ), '', self::field( $single, 'original' ) ) ] ) ) {
+				if ( 'singular' === $single_context && [] !== array_intersect_key( $twins, array_flip( StringRepository::identity_hashes( self::field( $plural, 'domain' ), '', self::field( $single, 'original' ) ) ) ) ) {
 					continue;
 				}
 
@@ -629,6 +646,8 @@ final class PoSync {
 		$candidates = [];
 		$hashes     = [];
 		$hashed     = [];
+		$state      = get_option( 'perflocale_str_ident' );
+		$both       = is_string( $state ) && str_contains( $state, '"phase":"done"' ) ? 1 : 2;
 
 		foreach ( $page as $id => [ $plural, $single_context ] ) {
 			$key = '' === self::field( $plural, 'file_path' ) ? '' : self::line_key( $plural, $single_context );
@@ -644,8 +663,9 @@ final class PoSync {
 				$hashed[ $key ] = true;
 			}
 
+			// While the identity switch-over runs, a row it has not moved yet (other-form hash) is a twin too.
 			foreach ( $candidates[ $id ] as $row ) {
-				$hashes[ StringRepository::compute_hash( self::field( $plural, 'domain' ), '', self::field( $row, 'original' ) ) ] = true;
+				$hashes += array_fill_keys( array_slice( StringRepository::identity_hashes( self::field( $plural, 'domain' ), '', self::field( $row, 'original' ) ), 0, $both ), true );
 			}
 		}
 
@@ -783,8 +803,8 @@ final class PoSync {
 	}
 
 	/**
-	 * Log a database error when WP_DEBUG_LOG is on; the import result (notice, REST) gets a short message, as the
-	 * server's text can name tables and values.
+	 * Log a database error when WP_DEBUG_LOG is on, as a fixed code: the server's text can name tables and values; the
+	 * import result (notice, REST) gets a short message.
 	 *
 	 * @param string $where What the import was doing.
 	 * @param string $error The database error.
@@ -796,7 +816,7 @@ final class PoSync {
 		}
 
 		// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic, only when WP_DEBUG_LOG is on.
-		error_log( '[PerfLocale] PO import: database error while ' . $where . ' - ' . $error );
+		error_log( '[PerfLocale] PO import: database error while ' . $where . ' - code ' . \PerfLocale\Util\DbErrorCode::of( $error ) );
 	}
 
 	/**
@@ -814,7 +834,7 @@ final class PoSync {
 			return;
 		}
 
-		$cache->delete( "all_string_translations_{$lang->id}", 'perflocale_strings' );
+		$cache->delete( "all_str2_translations_{$lang->id}", 'perflocale_strings' );
 		$cache->invalidate_group( 'perflocale_strings' );
 		$cache->invalidate_group( 'perflocale_trans' );
 
@@ -855,6 +875,8 @@ final class PoSync {
 	 * @param callable|null $sanitize  Applied to every non-empty value of an importable entry before it writes; returns
 	 *                                 what to store. Null stores the file's bytes (WP-CLI); the admin upload passes one
 	 *                                 for users without `unfiltered_html`.
+	 * @param string[]      $exclude_domains Domains skipped and counted in `restricted` (the user may not see them); a
+	 *                                 replace wipes and reloads the visible domains only.
 	 * @return array{
 	 *     imported:int,
 	 *     skipped:int,
@@ -874,7 +896,7 @@ final class PoSync {
 	 *                     back, so an unexpected failure can never leave the
 	 *                     wipe committed without its re-import.
 	 */
-	public static function import_from_file( string $path, string $lang_slug, bool $replace = false, ?callable $sanitize = null ): array {
+	public static function import_from_file( string $path, string $lang_slug, bool $replace = false, ?callable $sanitize = null, array $exclude_domains = [] ): array {
 		$result = [
 			'imported'        => 0,
 			'skipped'         => 0,
@@ -887,7 +909,10 @@ final class PoSync {
 			'total_entries'   => 0,
 			'sanitized'       => 0,
 			'sanitized_empty' => 0,
+			'restricted'      => 0,
 		];
+
+		$excluded = array_fill_keys( array_filter( $exclude_domains, static fn( string $d ): bool => '' !== $d ), true );
 
 		if ( ! is_readable( $path ) ) {
 			$result['errors'][] = __( 'Cannot read PO file.', 'perflocale' );
@@ -1003,19 +1028,26 @@ final class PoSync {
 				return $result;
 			}
 
-			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter
-			$wiped = false !== $wpdb->query(
-				$wpdb->prepare(
-					'DELETE FROM %i WHERE language_id = %d',
-					$st_table,
-					(int) $lang->id
-				)
-			);
+			$lang_id = (int) $lang->id;
 
-			// Also drop the wiped rows' 'translated' string links, only in string groups (post and term links stay); only
-			// after the first delete succeeded.
-			$wiped = $wiped && self::delete_string_links( (int) $lang->id );
-			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter
+			// The values, then the wiped rows' 'translated' links of string groups only (post and term links stay), only
+			// after the first delete succeeded. A domain the user may not see keeps its values and links.
+			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter -- The domain list is placeholders only.
+			if ( $excluded === [] ) {
+				$wiped = false !== $wpdb->query( $wpdb->prepare( 'DELETE FROM %i WHERE language_id = %d', $st_table, $lang_id ) );
+			} else {
+				$excluded_list = array_keys( $excluded );
+				$excluded_ph   = implode( ',', array_fill( 0, count( $excluded_list ), '%s' ) );
+				$wiped         = false !== $wpdb->query(
+					$wpdb->prepare(
+						"DELETE FROM %i WHERE language_id = %d AND string_id IN ( SELECT id FROM %i WHERE domain NOT IN ({$excluded_ph}) )",
+						array_merge( [ $st_table, $lang_id, Schema::table( 'strings' ) ], $excluded_list )
+					)
+				);
+			}
+
+			$wiped = $wiped && self::delete_string_links( $lang_id, array_keys( $excluded ) );
+			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter
 
 			// 0 deleted rows is a valid wipe; false stops here, since after a deadlock every later statement would commit
 			// alone. Nothing was read, so no cache to flush.
@@ -1077,6 +1109,26 @@ final class PoSync {
 				$raw_context = $entry->context !== null ? (string) $entry->context : '';
 				$domain      = self::extract_domain( (string) ( $entry->extracted_comments ?? '' ) );
 
+				// A domain with a bar is no text domain: the hash is over `domain|context|text`, so such an entry could
+				// carry another domain's hash and be stored or served in its place.
+				if ( str_contains( $domain, '|' ) ) {
+					++$result['skipped'];
+					$result['errors'][] = sprintf(
+						/* translators: 1: PO msgid, 2: the domain named by the entry */
+						__( 'Not imported: "%1$s" names the domain "%2$s", which is not a text domain (a domain cannot carry "|").', 'perflocale' ),
+						mb_substr( $singular, 0, 60 ),
+						mb_substr( $domain, 0, 60 )
+					);
+					continue;
+				}
+
+				// A domain the importing user may not see (perflocale/strings/domain_capability): skipped and counted.
+				if ( isset( $excluded[ $domain ] ) ) {
+					++$result['restricted'];
+					++$result['skipped'];
+					continue;
+				}
+
 				// A gettext plural entry (msgid + msgid_plural, as in a translate.wordpress.org pack or PerfLocale's export)
 				// becomes the two rows the scanner and loader expect.
 				$forms = self::entry_to_forms( $entry, $singular, $raw_context, $domain );
@@ -1135,16 +1187,40 @@ final class PoSync {
 						continue; // No translation for this form.
 					}
 
+					// A form every write path refuses: a gettext separator in its context or text.
+					if ( StringRepository::refused( $domain, $context, $singular ) ) {
+						$result['errors'][] = sprintf(
+							/* translators: %s: PO msgid */
+							__( 'Not imported: "%s" holds a control character gettext uses as a separator.', 'perflocale' ),
+							mb_substr( $singular, 0, 60 )
+						);
+						++$result['skipped'];
+						continue;
+					}
+
 					// Find the source row by its sha256 original_hash (unique, indexed); group_id comes along for the link below.
 					// phpcs:disable PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 					$lookup_errors   = Schema::query_error_count();
+					// An other-form row of the msgid moves to its new hash first; its failure counts as the lookup's.
+					\PerfLocale\Strings\StrIdentMigration::adopt( [ StringRepository::compute_hash( $domain, $context, $singular ) => compact( 'domain', 'context' ) + [ 'original' => $singular ] ] );
 					$string_row      = $wpdb->get_row(
 						$wpdb->prepare(
-							'SELECT id, group_id FROM %i WHERE original_hash = %s LIMIT 1',
+							'SELECT id, group_id, domain, context, original, original_hash FROM %i WHERE original_hash = %s LIMIT 1',
 							$strings_table,
 							StringRepository::compute_hash( $domain, $context, $singular )
 						)
 					);
+
+					if ( is_object( $string_row ) && StringRepository::foreign( $string_row, StringRepository::compute_hash( $domain, $context, $singular ) ) ) {
+						$result['errors'][] = sprintf(
+							/* translators: %s: PO msgid */
+							__( 'Not imported: "%s" has the identity of another string kept for review on the Strings page.', 'perflocale' ),
+							mb_substr( $singular, 0, 60 )
+						);
+						++$result['skipped'];
+						continue;
+					}
+
 					$string_id       = $string_row ? (int) $string_row->id : 0;
 					$string_group_id = $string_row ? (int) $string_row->group_id : 0;
 
@@ -1153,15 +1229,19 @@ final class PoSync {
 					if ( $string_id === 0 && $singular !== '' && str_contains( $singular, "\n" ) ) {
 						$string_row      = $wpdb->get_row(
 							$wpdb->prepare(
-								'SELECT id, group_id FROM %i
-							 WHERE REPLACE(REPLACE(original, CONCAT(CHAR(13), CHAR(10)), CHAR(10)), CHAR(13), CHAR(10)) = %s
+								'SELECT id, group_id, domain FROM %i
+							 WHERE domain = %s
 							   AND context = %s
-							   AND domain = %s
+							   AND CAST( domain AS BINARY ) = CAST( %s AS BINARY )
+							   AND CAST( context AS BINARY ) = CAST( %s AS BINARY )
+							   AND CAST( REPLACE(REPLACE(original, CONCAT(CHAR(13), CHAR(10)), CHAR(10)), CHAR(13), CHAR(10)) AS BINARY ) = CAST( %s AS BINARY )
 							 LIMIT 1',
 								$strings_table,
-								$singular,
+								$domain,
 								$context,
-								$domain
+								$domain,
+								$context,
+								$singular
 							)
 						);
 						$string_id       = $string_row ? (int) $string_row->id : 0;
@@ -1211,7 +1291,7 @@ final class PoSync {
 								$wpdb->delete( $groups_table, [ 'id' => $group_id ], [ '%d' ] );
 								$string_row      = $wpdb->get_row(
 									$wpdb->prepare(
-										'SELECT id, group_id FROM %i WHERE original_hash = %s LIMIT 1',
+										'SELECT id, group_id, domain FROM %i WHERE original_hash = %s LIMIT 1',
 										$strings_table,
 										StringRepository::compute_hash( $domain, $context, $singular )
 									)
@@ -1233,6 +1313,13 @@ final class PoSync {
 							__( 'Could not create source row for: %s', 'perflocale' ),
 							mb_substr( $singular, 0, 60 )
 						);
+						++$result['skipped'];
+						continue;
+					}
+
+					// The stored row's domain decides, not the entry's comment, as the Strings page save decides per row.
+					if ( ! $group_verified && is_object( $string_row ) && isset( $excluded[ Scalar::str( Scalar::prop( $string_row, 'domain' ) ) ] ) ) {
+						++$result['restricted'];
 						++$result['skipped'];
 						continue;
 					}
@@ -1628,8 +1715,9 @@ final class PoSync {
 		}
 
 		if ( ! $verified && ! $group_repo->is_string_group( $group_id ) ) {
-			$group_id        = self::mint_string_group( $string_id, $in_transaction );
-			$minted_group_id = $group_id;
+			$own             = false;
+			$group_id        = self::mint_string_group( $string_id, $original_group_id, $in_transaction, $own );
+			$minted_group_id = $own ? $group_id : 0;
 
 			if ( $group_id === 0 ) {
 				$group_id = $original_group_id;
@@ -1715,19 +1803,21 @@ final class PoSync {
 
 	/**
 	 * Mint a string group and point one string at it, exactly as the other self-heal paths do (same statements, order
-	 * and checks). A failed INSERT changes nothing; a failed or zero-row UPDATE reclaims the group. Then 0.
+	 * and checks). A failed INSERT changes nothing; a failed repoint reclaims the group. Then 0.
 	 *
 	 * @param int  $string_id      Row in the `strings` table to repair.
+	 * @param int  $from           The group the caller read: the string moves only while it names it.
 	 * @param bool $in_transaction True inside a replace import's transaction: a failed write is not
 	 *                             followed by the clean-up DELETE (the caller rolls back).
-	 * @return int New group id, or 0 when the repair could not be completed.
+	 * @param bool $own            Receives whether the group is this call's (false: another writer's repair won).
+	 * @return int New group id, the winner's string group, or 0 when the repair could not be completed.
 	 */
-	private static function mint_string_group( int $string_id, bool $in_transaction = false ): int {
-		if ( $string_id <= 0 ) {
+	private static function mint_string_group( int $string_id, int $from, bool $in_transaction = false, bool &$own = false ): int {
+		global $wpdb;
+
+		if ( $string_id <= 0 || ! $wpdb instanceof \wpdb ) {
 			return 0;
 		}
-
-		global $wpdb;
 
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Self-heal write; there is no cache to consult and no repository accessor that mints a bare string group.
 		$inserted = $wpdb->insert(
@@ -1747,50 +1837,47 @@ final class PoSync {
 			return 0;
 		}
 
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Self-heal write, keyed on the primary key.
-		$updated = $wpdb->update(
-			Schema::table( 'strings' ),
-			[ 'group_id' => $group_id ],
-			[ 'id' => $string_id ],
-			[ '%d' ],
-			[ '%d' ]
-		);
+		$taken = \PerfLocale\Database\Repository\StringGroupAssigner::repoint( $wpdb, $string_id, $from, $group_id );
 
-		if ( ! is_int( $updated ) || $updated < 1 ) {
+		if ( 0 === $taken ) {
 			// In a transaction nothing follows a failed update: the caller's ROLLBACK removes the group.
-			if ( false === $updated && $in_transaction ) {
-				return 0;
+			if ( ! $in_transaction ) {
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Reclaiming the group this method just created, by primary key.
+				$wpdb->delete( Schema::table( 'translation_groups' ), [ 'id' => $group_id ], [ '%d' ] );
 			}
-
-			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Reclaiming the group this method just created, by primary key.
-			$wpdb->delete( Schema::table( 'translation_groups' ), [ 'id' => $group_id ], [ '%d' ] );
 
 			return 0;
 		}
 
-		return $group_id;
+		$own = $taken === $group_id;
+
+		return $taken;
 	}
 
 	/**
-	 * Delete one language's links of string groups (a replace import's wipe).
+	 * Delete one language's links of string groups (a replace import's wipe), except those of the excluded domains.
 	 *
-	 * @param int $language_id Language ID.
+	 * @param int           $language_id Language ID.
+	 * @param array<string> $excluded    Domains whose links stay.
 	 * @return bool False when the DELETE failed.
 	 */
-	private static function delete_string_links( int $language_id ): bool {
-		global $wpdb;
+	private static function delete_string_links( int $language_id, array $excluded = [] ): bool {
+		$wpdb = Typed::wpdb();
+
+		$sql  = "DELETE FROM %i WHERE language_id = %d AND group_id IN ( SELECT id FROM %i WHERE type = 'string' )";
+		$args = [ Schema::sanitize_table( Schema::table( 'translation_links' ) ), $language_id, Schema::sanitize_table( Schema::table( 'translation_groups' ) ) ];
+
+		if ( [] !== $excluded ) {
+			$sql .= ' AND group_id IN ( SELECT group_id FROM %i WHERE domain NOT IN (' . implode( ',', array_fill( 0, count( $excluded ), '%s' ) ) . ') )';
+			$args = array_merge( $args, [ Schema::sanitize_table( Schema::table( 'strings' ) ) ], array_values( $excluded ) );
+		}
 
 		// One table per DELETE: the SQLite integration's 2.2.x legacy driver mishandles a DELETE holding JOIN.
-		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter
-		return false !== $wpdb->query(
-			$wpdb->prepare(
-				"DELETE FROM %i WHERE language_id = %d AND group_id IN ( SELECT id FROM %i WHERE type = 'string' )",
-				Schema::sanitize_table( Schema::table( 'translation_links' ) ),
-				$language_id,
-				Schema::sanitize_table( Schema::table( 'translation_groups' ) )
-			)
-		);
-		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- The domain list is placeholders only.
+		$prepared = $wpdb->prepare( $sql, $args );
+
+		return is_string( $prepared ) && false !== $wpdb->query( $prepared );
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
 	}
 
 	/**
@@ -1925,7 +2012,7 @@ final class PoSync {
 
 			foreach ( $forms as $form ) {
 				if ( $form['translation'] !== '' ) {
-					$hashes[ StringRepository::compute_hash( $domain, $form['context'], $form['original'] ) ] = true;
+					$hashes[ StringRepository::compute_hash( $domain, $form['context'], $form['original'] ) ] = [ 'domain' => $domain ] + $form;
 				}
 			}
 		}
@@ -1933,6 +2020,9 @@ final class PoSync {
 		if ( $hashes === [] ) {
 			return [];
 		}
+
+		// Other-form rows of the batch move to their new hash first, so the read below finds them.
+		\PerfLocale\Strings\StrIdentMigration::adopt( $hashes );
 
 		$hashes = array_keys( $hashes );
 

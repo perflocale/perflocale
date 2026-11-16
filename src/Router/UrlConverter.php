@@ -54,6 +54,13 @@ final class UrlConverter {
 	private bool $filtering = false;
 
 	/**
+	 * See requested_term_slug().
+	 *
+	 * @var string|null
+	 */
+	private ?string $requested_term_slug = null;
+
+	/**
 	 * Soft cap for the per-request static memo arrays; cap_cache() drops the oldest 25%.
 	 */
 	private const MAX_CACHE_ENTRIES = 500;
@@ -700,26 +707,23 @@ final class UrlConverter {
 			return;
 		}
 
-		// Taxonomy query_var => taxonomy map, plus the hierarchical query vars. Deliberately not memoised in a
-		// static: taxonomies differ per blog and the translatable list is a setting.
-		$tax_query_vars  = [];
-		$hier_query_vars = [];
+		// Query var => [ taxonomy, hierarchical ]. Deliberately not memoised in a static: taxonomies differ per blog and
+		// the translatable list is a setting.
+		$tax_query_vars = [];
 
 		foreach ( $this->settings->get_translatable_taxonomies() as $taxonomy ) {
 			$tax_obj = get_taxonomy( $taxonomy );
 
+			// Read through empty(), as core does: `rewrite` is false when a taxonomy opts out.
 			if ( $tax_obj && $tax_obj->query_var ) {
-				$tax_query_vars[ $tax_obj->query_var ] = $taxonomy;
-
-				// Read through empty(), as core does: `rewrite` is false when a taxonomy opts out.
-				if ( ! empty( $tax_obj->rewrite['hierarchical'] ) ) {
-					$hier_query_vars[] = (string) $tax_obj->query_var;
-				}
+				$tax_query_vars[ $tax_obj->query_var ] = [ $taxonomy, ! empty( $tax_obj->rewrite['hierarchical'] ) ];
 			}
 		}
 
-		foreach ( $tax_query_vars as $qv => $taxonomy ) {
-			if ( empty( $wp->query_vars[ $qv ] ) || ! is_string( $wp->query_vars[ $qv ] ) ) {
+		foreach ( $tax_query_vars as $qv => [ $taxonomy, $hierarchical ] ) {
+			// A single product's category path is read only by WooCommerce's canonical check, against the raw path:
+			// another term's written-back DB slug would make it 301 the permalink to itself.
+			if ( empty( $wp->query_vars[ $qv ] ) || ! is_string( $wp->query_vars[ $qv ] ) || ( $taxonomy === 'product_cat' && ! empty( $wp->query_vars['name'] ) ) ) {
 				continue;
 			}
 
@@ -727,184 +731,184 @@ final class UrlConverter {
 			$slug = Helper::normalize_slug_for_query( $wp->query_vars[ $qv ] );
 
 			// Reduce 'parent/child' to the term's own segment, as WP_Query::parse_tax_query() does later.
-			if ( in_array( $qv, $hier_query_vars, true ) ) {
+			if ( $hierarchical ) {
 				$slug = wp_basename( $slug );
 			}
 
-			// Taxonomy-aware: "uncategorized" can exist in both category and product_cat.
-			$db_slug = $this->resolve_term_slug_for_taxonomy( $slug, $taxonomy, $language_id );
+			$this->requested_term_slug = $slug;
 
-			if ( $db_slug !== null && $db_slug !== $slug ) {
+			// Taxonomy-aware: "uncategorized" can exist in both category and product_cat.
+			$row = $this->resolve_term_slug_for_taxonomy( $slug, $taxonomy, $language_id );
+
+			// An old URL slug (history row) counts only on a term archive route.
+			if ( $row === null || ( $row['object_type'] !== 'term' && ! TermSlugHistory::record( $wp, $row['object_id'], $slug, $taxonomy ) ) ) {
+				continue;
+			}
+
+			if ( $row['db_slug'] !== $slug ) {
 				// Writing the bare DB slug back is safe: parse_tax_query() drops ancestors with wp_basename().
-				$wp->query_vars[ $qv ] = $db_slug;
+				$wp->query_vars[ $qv ] = $row['db_slug'];
 			}
 		}
 	}
 
 	/**
-	 * Resolve a translated slug to the database slug for a specific taxonomy.
+	 * The term row a requested slug names in a taxonomy and language: current display slug first, else an old one.
 	 *
-	 * Filters by object_subtype so taxonomies can share a translated slug; slug_lookup's UNIQUE index gives one row.
+	 * A row counts only while its term is unlinked or linked in that language. An old slug never shadows a live term
+	 * of the taxonomy this language reaches by its DB slug (linked here or unlinked, no display row here). Values are
+	 * bound, never compared across tables (their collations can differ).
 	 *
 	 * @param string $slug Translated slug from the URL.
 	 * @param string $taxonomy Taxonomy to match against.
 	 * @param int    $language_id Current language ID.
-	 * @return string|null Database slug, or null if not found.
+	 * @return array{db_slug: string, object_id: int, object_type: string}|null
 	 */
-	private function resolve_term_slug_for_taxonomy( string $slug, string $taxonomy, int $language_id ): ?string {
+	private function resolve_term_slug_for_taxonomy( string $slug, string $taxonomy, int $language_id ): ?array {
 		global $wpdb;
 
 		$st_table = \PerfLocale\Database\Schema::table( 'slug_translations' );
 
-		// The slug_lookup UNIQUE key (language_id, object_type, object_subtype, slug) gives one row: no term_taxonomy join.
+		// 'term' sorts before 'term_h*', so a current row wins; the shadow check runs only for a history row.
 		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Table names from Schema::table() are safe.
 		$result = $wpdb->get_row(
 			$wpdb->prepare(
-				"SELECT t.slug AS db_slug
+				"SELECT t.slug AS db_slug, st.object_id, st.object_type
 				FROM %i st
 				INNER JOIN {$wpdb->terms} t ON t.term_id = st.object_id
 				WHERE st.language_id = %d
-				  AND st.object_type = %s
+				  AND st.object_type IN ('term', 'term_h1', 'term_h2', 'term_h3', 'term_h4', 'term_h5')
 				  AND st.object_subtype = %s
 				  AND st.slug = %s
+				  AND NOT EXISTS ( SELECT 1 FROM %i ol WHERE ol.type = 'term' AND ol.object_id = st.object_id AND ol.language_id <> st.language_id )
+				ORDER BY st.object_type
 				LIMIT 1",
 				$st_table,
 				$language_id,
-				'term',
 				$taxonomy,
-				$slug
-			)
+				$slug,
+				\PerfLocale\Database\Schema::table( 'translation_links' )
+			),
+			ARRAY_A
 		);
 		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, PluginCheck.Security.DirectDB.UnescapedDBParameter
 
-		return $result ? $result->db_slug : null;
+		if ( ! is_array( $result ) || ! is_string( $result['db_slug'] ?? null ) || ! is_numeric( $result['object_id'] ?? null ) || ! is_string( $result['object_type'] ?? null ) ) {
+			return null;
+		}
+
+		if ( $result['object_type'] !== 'term' && TermSlugHistory::shadowed( $slug, $taxonomy, $language_id ) ) {
+			return null;
+		}
+
+		return [
+			'db_slug'     => $result['db_slug'],
+			'object_id'   => (int) $result['object_id'],
+			'object_type' => $result['object_type'],
+		];
 	}
 
 	/**
-	 * Redirect term archive pages from the database slug to the translated slug.
-	 *
-	 * A feed or page 2+ suffix after the term base is kept in the redirect. In query mode the request's query
-	 * args are merged into the canonical's, whose values win; otherwise the query string is appended verbatim.
+	 * Redirect a term archive to its canonical URL (rule #9): one 301 when term_redirect_target() has a target.
 	 *
 	 * @return void
 	 */
 	public function redirect_term_to_translated_slug(): void {
-		if ( is_admin() || ( ! is_tax() && ! is_category() && ! is_tag() ) ) {
-			return;
+		$target = $this->term_redirect_target();
+
+		if ( $target !== null ) {
+			Redirect\Sender::to( $target, 301, $this->history_hit( get_queried_object_id() ) ? 'term_slug_history' : 'term_slug' );
+
+			// Not sent: core's own hop, when PostQueryFilter cancelled it for this one.
+			if ( class_exists( TermRedirect::class, false ) ) {
+				TermRedirect::core_again();
+			}
+		}
+	}
+
+	/**
+	 * The term slug segment the resolver read from a taxonomy query var at parse_request:3, or null.
+	 *
+	 * @api Frozen contract (1.0.8 step 1, 9.1).
+	 * @return string|null
+	 */
+	public function requested_term_slug(): ?string {
+		return $this->requested_term_slug;
+	}
+
+	/**
+	 * Rule #9's decision, sending nothing: the term archive's canonical URL, or null when no hop is due.
+	 *
+	 * @api Frozen contract (1.0.8 step 1, 9.1).
+	 * @param string|null $uri Another URL of this request to judge (core's canonical target); null: the request URI.
+	 * @return string|null
+	 */
+	public function term_redirect_target( ?string $uri = null ): ?string {
+		if ( is_admin() || ! $this->settings->translate_slugs_enabled() || ( ! is_tax() && ! is_category() && ! is_tag() ) ) {
+			return null;
 		}
 
 		// Body-preserving methods only - 301/302 drops POST/PUT/DELETE/PATCH payloads.
 		$method = strtoupper( isset( $_SERVER['REQUEST_METHOD'] ) ? sanitize_text_field( wp_unslash( (string) $_SERVER['REQUEST_METHOD'] ) ) : 'GET' );
 
 		if ( $method !== 'GET' && $method !== 'HEAD' ) {
-			return;
+			return null;
 		}
 
 		$term = get_queried_object();
 
 		if ( ! $term instanceof \WP_Term ) {
-			return;
+			return null;
 		}
 
 		// Only handle translatable taxonomies.
 		$translatable = $this->settings->get_translatable_taxonomies();
 
 		if ( ! in_array( $term->taxonomy, $translatable, true ) ) {
-			return;
+			return null;
 		}
 
 		$language_id = $this->router->get_current_language_id();
 
 		if ( $language_id === 0 ) {
-			return;
+			return null;
 		}
 
 		$translated_slug = $this->slug_manager->get_slug( 'term', $term->term_id, $language_id );
 
 		// '' means "no translation", as in add_language_prefix_to_url(): both must agree or the canonical URL
-		// and this redirect diverge.
-		if ( $translated_slug === null || $translated_slug === '' || $translated_slug === $term->slug ) {
-			return;
+		// and this redirect diverge. An old URL slug of this term always moves to the canonical.
+		if ( ! $this->history_hit( $term->term_id ) && ( $translated_slug === null || $translated_slug === '' || $translated_slug === $term->slug ) ) {
+			return null;
 		}
 
 		// get_term_link() runs filter_term_link(), so $canonical carries the translated slug.
 		$canonical = get_term_link( $term );
 
 		if ( is_wp_error( $canonical ) ) {
-			return;
+			return null;
 		}
 
 		// esc_url_raw(), not sanitize_text_field(): the latter strips %XX octets, so a percent-encoded slug path
 		// would never match the canonical and the 301 would loop.
-		$canonical_path = untrailingslashit( (string) ( wp_parse_url( $canonical, PHP_URL_PATH ) ?: '' ) );
-		$request_uri    = ( isset( $_SERVER['REQUEST_URI'] ) ? esc_url_raw( wp_unslash( (string) $_SERVER['REQUEST_URI'] ) ) : '' );
-		$qpos           = strpos( $request_uri, '?' );
-		$request_path   = untrailingslashit( (string) ( wp_parse_url( $request_uri, PHP_URL_PATH ) ?: '' ) );
+		$request_uri = $uri ?? ( isset( $_SERVER['REQUEST_URI'] ) ? esc_url_raw( wp_unslash( (string) $_SERVER['REQUEST_URI'] ) ) : '' );
 
-		if ( $canonical_path === $request_path ) {
-			return; // Already at canonical URL.
+		// At the canonical URL (the served case) nothing more is loaded.
+		if ( untrailingslashit( (string) wp_parse_url( $canonical, PHP_URL_PATH ) ) === untrailingslashit( (string) wp_parse_url( $request_uri, PHP_URL_PATH ) ) ) {
+			return null;
 		}
 
-		// Feed and page 2+ suffix, recognised only where redirect_canonical() would, so a term slugged `feed`
-		// is never cut. Patterns come from $wp_rewrite (add_feed(), pagination base) and anchor on the end.
-		global $wp_rewrite;
+		return TermRedirect::target( $canonical, $request_uri );
+	}
 
-		$suffix         = '';
-		$suffix_pattern = '';
-
-		if ( $wp_rewrite instanceof \WP_Rewrite ) {
-			$paged = get_query_var( 'paged' );
-
-			if ( is_feed() && ! empty( $wp_rewrite->feeds ) ) {
-				$feeds          = implode( '|', array_map( static fn( $feed ): string => preg_quote( (string) $feed, '#' ), (array) $wp_rewrite->feeds ) );
-				$suffix_pattern = '/(?:' . preg_quote( (string) $wp_rewrite->feed_base, '#' ) . '/)?(?:' . $feeds . ')';
-			} elseif ( is_numeric( $paged ) && (int) $paged > 1 ) {
-				$suffix_pattern = '/' . preg_quote( (string) $wp_rewrite->pagination_base, '#' ) . '/?\d+';
-			}
-		}
-
-		if ( $suffix_pattern !== '' ) {
-			// The whole rest after the canonical base must match: a term slugged `feed` keeps its `/feed/feed/`.
-			if ( str_starts_with( $request_path, $canonical_path . '/' )
-				&& preg_match( '#^' . $suffix_pattern . '$#', substr( $request_path, strlen( $canonical_path ) ) ) === 1
-			) {
-				return;
-			}
-
-			if ( preg_match( '#' . $suffix_pattern . '$#', $request_path, $suffix_match ) === 1 ) {
-				$suffix = $suffix_match[0];
-			}
-		}
-
-		// Canonical URL plus the request's suffix. Loop-proof: the target's base is $canonical_path.
-		$query_pos       = strpos( $canonical, '?' );
-		$target          = $query_pos !== false ? substr( $canonical, 0, $query_pos ) : $canonical;
-		$canonical_query = $query_pos !== false ? substr( $canonical, $query_pos + 1 ) : '';
-
-		if ( $suffix !== '' ) {
-			$target = str_ends_with( $target, '/' ) ? untrailingslashit( $target ) . $suffix . '/' : $target . $suffix;
-		}
-
-		if ( $canonical_query === '' ) {
-			// Keep UTM, tracking and preview params, appended verbatim.
-			if ( $qpos !== false ) {
-				$target .= substr( $request_uri, $qpos );
-			}
-		} else {
-			// Query URL mode: appending would add a second `?` whose `lang` matches nothing. Drop the
-			// canonical's keys from the request args, then add the canonical's, so its language wins.
-			$canonical_args = [];
-			wp_parse_str( $canonical_query, $canonical_args );
-
-			$request_query = $qpos !== false ? substr( $request_uri, $qpos ) : '';
-			$target        = add_query_arg(
-				urlencode_deep( $canonical_args ),
-				$target . remove_query_arg( array_map( 'strval', array_keys( $canonical_args ) ), $request_query )
-			);
-		}
-
-		wp_safe_redirect( $target, 301 );
-		exit;
+	/**
+	 * Whether this request's term slug matched an old URL slug of the term.
+	 *
+	 * @param int $term_id Term.
+	 * @return bool
+	 */
+	private function history_hit( int $term_id ): bool {
+		return class_exists( TermSlugHistory::class, false ) && TermSlugHistory::has( $term_id );
 	}
 
 	/**
@@ -1356,7 +1360,7 @@ final class UrlConverter {
 	 */
 	public function get_translations_for_current_page(): array {
 		// Kept per blog for one main query (a function static is out of reach of any switch_blog reset): not before
-		// the query ran, and a later query_posts() page is another context.
+		// the query ran; a later query_posts() page or a rerun of this query (its SQL: another search or archive) is another context.
 		/** @var array<int, array{0: string|null, 1: array<string, string>}> $cached_by_blog */
 		static $cached_by_blog = [];
 
@@ -1365,7 +1369,7 @@ final class UrlConverter {
 		/** @var \WP_Query|null $wp_query */
 
 		$blog_key = function_exists( 'get_current_blog_id' ) ? (int) get_current_blog_id() : 0;
-		$context  = isset( $wp_query->posts ) ? spl_object_id( $wp_query ) . ':' . get_queried_object_id() : null;
+		$context  = isset( $wp_query->posts ) ? spl_object_id( $wp_query ) . ':' . get_queried_object_id() . ':' . $wp_query->request : null;
 
 		if ( $context !== null && ( $cached_by_blog[ $blog_key ][0] ?? null ) === $context ) {
 			return $cached_by_blog[ $blog_key ][1];

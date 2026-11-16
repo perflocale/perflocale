@@ -67,6 +67,234 @@
 	var config = window.perflocaleSiteEditor || {};
 	var i18n = config.i18n || {};
 	var supported = config.postTypes || [];
+	// "Resync from source" (DESIGN §12.1): present only for a user the
+	// handler accepts, with the types it accepts. The result or estimate
+	// step of the previous press arrives once, after that press's redirect.
+	var resync = config.resync || null;
+	var resyncNotice = config.resyncNotice || null;
+	var noticeShown = false;
+
+	// JavaScript hooks (wp.hooks), as in editor-sidebar.js; Language, PostRef and EditorContext: block-toolbar.js.
+
+	var hookWarned = {};
+
+	// The entity of the last answered rows request and its rows.
+	var shown = { id: 0, rows: [] };
+
+	// With SCRIPT_DEBUG: one console warning per hook and page load.
+	function hookWarn( name, why ) {
+		if ( config.debug && ! hookWarned[ name ] && window.console ) {
+			hookWarned[ name ] = true;
+			window.console.warn( 'PerfLocale: ' + name + ': ' + why );
+		}
+	}
+
+	// wp.hooks.doAction in a try/catch: a callback that throws does not stop the panel.
+	function doAction( name, context ) {
+		try {
+			wp.hooks.doAction( name, context );
+		} catch ( e ) {
+			hookWarn( name, 'a callback threw.' );
+		}
+	}
+
+	// The Language object of a Translations row.
+	function rowLanguage( row ) {
+		return {
+			slug:       String( row.slug ),
+			locale:     String( row.locale || '' ),
+			name:       String( row.name || '' ),
+			nativeName: String( row.native_name || row.name || '' ),
+			isDefault:  !! row.is_default
+		};
+	}
+
+	function findRow( rows, test ) {
+		for ( var i = 0; i < rows.length; i++ ) {
+			if ( rows[ i ] && test( rows[ i ] ) ) {
+				return rows[ i ];
+			}
+		}
+
+		return null;
+	}
+
+	/**
+	 * The editor context of an entity plus `extra`, from its rows once they
+	 * are answered (permission-scoped: a hidden sibling has no id).
+	 *
+	 * @returns {EditorContext}
+	 */
+	function editorContext( entity, extra ) {
+		var rows    = shown.id === entity.wpId ? shown.rows : [];
+		var current = findRow( rows, function ( r ) { return r.is_current; } );
+		var source  = findRow( rows, function ( r ) { return r.is_default && ! r.is_current && r.post_id; } );
+
+		return Object.assign( {
+			version:    1,
+			post:       {
+				id:       Number( entity.wpId ) || 0,
+				type:     String( entity.type || '' ),
+				language: current ? rowLanguage( current ) : null
+			},
+			sourcePost: ( current && ! current.is_default && source )
+				? { id: Number( source.post_id ), language: rowLanguage( source ) }
+				: null
+		}, extra );
+	}
+
+	// The previous press's result notice until its hook fired (see editor-sidebar.js).
+	var resyncResult = resyncNotice && resyncNotice.text && /^(done|background|failed)$/.test( String( resyncNotice.outcome || '' ) ) ? resyncNotice : null;
+
+	// The result hook of the previous press, once, after the first rows request settled.
+	function resyncResultHook( entity ) {
+		var result = resyncResult;
+
+		if ( ! result ) {
+			return;
+		}
+
+		resyncResult = null;
+
+		if ( 'failed' === result.outcome ) {
+			/**
+			 * @hook perflocale.resync.failed
+			 * Site Editor; documented in editor-sidebar.js.
+			 */
+			doAction( 'perflocale.resync.failed', editorContext( entity, {
+				status:  String( result.status || '' ),
+				message: String( result.text )
+			} ) );
+
+			return;
+		}
+
+		/**
+		 * @hook perflocale.resync.completed
+		 * Site Editor; documented in editor-sidebar.js.
+		 */
+		doAction( 'perflocale.resync.completed', editorContext( entity, {
+			status:     String( result.status || '' ),
+			background: 'background' === result.outcome,
+			message:    String( result.text )
+		} ) );
+	}
+
+	/**
+	 * The "Resync from source" address of the edited entity: the post id
+	 * is taken from the store when the link is built, and the run returns
+	 * to this screen. The nonce is not in it: a press posts it.
+	 *
+	 * @param {number} postId Numeric post id.
+	 * @param {string} lang   Language slug, or 'all'.
+	 * @return {string} URL.
+	 */
+	function resyncUrl( postId, lang ) {
+		return resync.url +
+			'?action=perflocale_resync' +
+			'&post=' + encodeURIComponent( postId ) +
+			'&lang=' + encodeURIComponent( lang ) +
+			'&return=referer';
+	}
+
+	// Set while a posted press's navigation is under way.
+	var posting = false;
+
+	window.addEventListener( 'pageshow', function () {
+		posting = false;
+	} );
+
+	/**
+	 * Post a Content ReSync handler's address with its nonce as `_wpnonce` (the handlers act only on POST). Once until
+	 * the page is shown again, or 3 s when the page did not leave.
+	 *
+	 * @param {string}    url      Address.
+	 * @param {string}    nonce    Nonce.
+	 * @param {?Function} [onPost] Called once the press is posted, before the form is submitted.
+	 */
+	function postTo( url, nonce, onPost ) {
+		if ( posting ) {
+			return;
+		}
+		posting = true;
+		window.setTimeout( function () {
+			posting = false;
+		}, 3000 );
+
+		if ( onPost ) {
+			onPost();
+		}
+
+		var form = document.createElement( 'form' );
+		var field = document.createElement( 'input' );
+		form.method = 'post';
+		form.action = url;
+		form.hidden = true;
+		field.type = 'hidden';
+		field.name = '_wpnonce';
+		field.value = nonce || '';
+		form.appendChild( field );
+		document.body.appendChild( form );
+		form.submit();
+	}
+
+	/**
+	 * Whether a click is a plain one (no modifier key, main button): only
+	 * that posts; any other opens the address, whose handler then shows a
+	 * button that posts it.
+	 *
+	 * @param {Object} ev Click event.
+	 * @return {boolean} Plain.
+	 */
+	function plainClick( ev ) {
+		return ev.button === 0 && ! ev.metaKey && ! ev.ctrlKey && ! ev.shiftKey && ! ev.altKey;
+	}
+
+	/**
+	 * A resync link, disabled while the entity has unsaved changes;
+	 * disabled, it stays focusable. A plain click posts it with the nonce.
+	 *
+	 * @param {Object}  entity The open entity: { wpId, type }.
+	 * @param {string}  lang   Language slug, or 'all'.
+	 * @param {string}  label  Link text.
+	 * @param {boolean} dirty  Unsaved changes.
+	 * @return {Object} Element.
+	 */
+	function resyncLink( entity, lang, label, dirty ) {
+		var postId = entity.wpId;
+
+		return el(
+			'a',
+			{
+				key: 'resync-' + lang,
+				className: 'perflocale-panel-resync' + ( dirty ? ' is-disabled' : '' ),
+				href: dirty ? undefined : resyncUrl( postId, lang ),
+				role: dirty ? 'link' : undefined,
+				tabIndex: dirty ? 0 : undefined,
+				'aria-disabled': dirty ? 'true' : undefined,
+				title: dirty ? i18n.saveFirst || 'Save first: Resync uses the saved version.' : undefined,
+				onClick: function ( ev ) {
+					if ( dirty ) {
+						ev.preventDefault();
+					} else if ( plainClick( ev ) ) {
+						ev.preventDefault();
+						postTo( resyncUrl( postId, lang ), resync.nonce, function () {
+							var target = 'all' === lang || shown.id !== postId ? null : findRow( shown.rows, function ( r ) { return r.slug === lang; } );
+
+							/**
+							 * @hook perflocale.resync.started
+							 * Site Editor; documented in editor-sidebar.js.
+							 */
+							doAction( 'perflocale.resync.started', editorContext( entity, {
+								targetLanguage: target ? rowLanguage( target ) : null
+							} ) );
+						} );
+					}
+				},
+			},
+			label
+		);
+	}
 
 	/**
 	 * Which badge to show for a language row.
@@ -151,6 +379,36 @@
 			};
 		}, [] );
 
+		var isDirty = useSelect( function ( select ) {
+			var editor = select( 'core/editor' );
+
+			return !! ( editor && editor.isEditedPostDirty && editor.isEditedPostDirty() );
+		}, [] );
+
+		// The previous press's result or estimate step, once per load.
+		useEffect( function () {
+			if ( noticeShown || ! resyncNotice || ! resyncNotice.text || ! wp.data.dispatch( 'core/notices' ) ) {
+				return;
+			}
+
+			noticeShown = true;
+			wp.data.dispatch( 'core/notices' ).createNotice( resyncNotice.status || 'info', resyncNotice.text, {
+				id: 'perflocale-resync',
+				isDismissible: true,
+				actions: ( resyncNotice.actions || [] ).map( function ( action ) {
+					// A handler's action (Start, Cancel, Show the estimate) posts its nonce.
+					return action.nonce
+						? {
+							label: action.label,
+							onClick: function () {
+								postTo( action.url, action.nonce );
+							},
+						}
+						: { label: action.label, url: action.url };
+				} ),
+			} );
+		}, [] );
+
 		var languagesState = useState( [] );
 		var languages = languagesState[ 0 ];
 		var setLanguages = languagesState[ 1 ];
@@ -223,6 +481,8 @@
 							return;
 						}
 
+						shown = { id: entity.wpId, rows: ( response && response.languages ) || [] };
+						resyncResultHook( entity );
 						setLanguages( ( response && response.languages ) || [] );
 						setIsUnassigned( !! ( response && response.is_unassigned ) );
 						setIsLoading( false );
@@ -232,6 +492,8 @@
 							return;
 						}
 
+						shown = { id: entity.wpId, rows: [] };
+						resyncResultHook( entity );
 						setLanguages( [] );
 						setIsUnassigned( false );
 						setError( ( err && err.message ) || i18n.loadError || 'Could not load translations.' );
@@ -268,12 +530,20 @@
 			apiFetch( {
 				path: 'perflocale/v1/translations/post/' + sourceId,
 				method: 'POST',
-				data: { target_lang: slug, copy_content: true },
+				// The server machine-translates the copy when "Translate on create" is on, as the post editor's Create.
+				data: { target_lang: slug, copy_content: true, translate_on_create: true },
 			} )
-				.then( function () {
+				.then( function ( response ) {
+					var queued = !! ( response && response.queued );
+
 					setBusyKey( '' );
 
-					if ( notices ) {
+					// Why machine translation did not run or was queued; a queued one has no translation yet.
+					if ( notices && response && response.mt_notice ) {
+						notices.createNotice( 'warning', response.mt_notice, { type: 'snackbar', isDismissible: true } );
+					}
+
+					if ( notices && ! queued ) {
 						notices.createNotice( 'success', i18n.created || 'Translation created.', {
 							type: 'snackbar',
 							isDismissible: true,
@@ -281,7 +551,7 @@
 					}
 
 					// A copied menu or pattern keeps the source's name.
-					if ( sourceType === 'wp_navigation' || sourceType === 'wp_block' ) {
+					if ( ! queued && ( sourceType === 'wp_navigation' || sourceType === 'wp_block' ) ) {
 						setRenameHint( { sourceId: sourceId, slug: slug, type: sourceType } );
 					}
 
@@ -394,9 +664,35 @@
 		} else if ( ! languages.length ) {
 			body = el( 'p', { className: 'perflocale-panel-loading' }, i18n.none || 'None' );
 		} else {
+			var canResync = !! ( resync && ( resync.types || [] ).indexOf( entity.type ) !== -1 );
+			var currentRow = null;
+			var defaultRow = null;
+
+			languages.forEach( function ( row ) {
+				if ( row.is_current ) {
+					currentRow = row;
+				}
+				if ( row.is_default ) {
+					defaultRow = row;
+				}
+			} );
+
+			var isSource = !! ( currentRow && currentRow.is_default );
+			var resyncBar = null;
+
+			if ( canResync ) {
+				if ( isSource && languages.some( function ( row ) { return ! row.is_current && row.has_translation && row.edit_url; } ) ) {
+					resyncBar = resyncLink( entity, 'all', i18n.resyncAll || 'Resync all translations', isDirty );
+				} else if ( currentRow && ! currentRow.is_default && defaultRow && defaultRow.has_translation ) {
+					resyncBar = resyncLink( entity, currentRow.slug, i18n.resyncSource || 'Resync from source', isDirty );
+				}
+			}
+
 			body = el(
 				'div',
 				{ className: 'perflocale-panel-rows' },
+				resyncBar ? el( 'p', { className: 'perflocale-panel-resync-bar', key: 'resync-bar' }, resyncBar ) : null,
+				resyncBar && isDirty ? el( 'p', { className: 'perflocale-panel-resync-hint', key: 'resync-hint' }, i18n.saveFirst || 'Save first: Resync uses the saved version.' ) : null,
 				languages.map( function ( row ) {
 					var state = describe( row );
 					var isCurrent = !! row.is_current;
@@ -460,13 +756,18 @@
 
 					if ( ! isCurrent && row.has_translation && row.edit_url ) {
 						action = el(
-							'a',
-							{
-								className: 'perflocale-panel-edit',
-								href: row.edit_url,
-								key: 'edit',
-							},
-							i18n.edit || 'Edit'
+							'span',
+							{ key: 'actions' },
+							el(
+								'a',
+								{
+									className: 'perflocale-panel-edit',
+									href: row.edit_url,
+									key: 'edit',
+								},
+								i18n.edit || 'Edit'
+							),
+							canResync && isSource ? resyncLink( entity, row.slug, i18n.resync || 'Resync', isDirty ) : null
 						);
 					} else if ( ! isCurrent && ! row.has_translation && ! ( isUnassigned && row.is_default ) ) {
 						var rowBusy = busyKey === entity.wpId + ':' + row.slug;
@@ -771,12 +1072,16 @@
 			apiFetch( {
 				path: 'perflocale/v1/translations/post/' + ref,
 				method: 'POST',
-				data: { target_lang: notice.slug, copy_content: true },
+				data: { target_lang: notice.slug, copy_content: true, translate_on_create: true },
 			} )
-				.then( function () {
+				.then( function ( response ) {
 					delete requests[ ref ];
 
-					if ( notices ) {
+					if ( notices && response && response.mt_notice ) {
+						notices.createNotice( 'warning', response.mt_notice, { type: 'snackbar', isDismissible: true } );
+					}
+
+					if ( notices && ! ( response && response.queued ) ) {
 						notices.createNotice( 'success', i18n.created || 'Translation created.', {
 							type: 'snackbar',
 							isDismissible: true,

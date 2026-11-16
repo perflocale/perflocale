@@ -422,14 +422,13 @@ final class PostListColumns {
 
 			$translated_id = $translations[ $lang->slug ] ?? null;
 
-			// Skip deleted posts.
-			if ( $translated_id && ! get_post( $translated_id ) ) {
+			// Skip deleted posts, and a sibling the user may not view: its badge is a missing translation's.
+			if ( $translated_id && ( ! get_post( $translated_id ) || ! \PerfLocale\Helper::user_can_view_object( (int) $translated_id ) ) ) {
 				$translated_id = null;
 			}
 
 			if ( $translated_id ) {
-				// A sibling the user may not view gets the badge without a link (its ID stays off the page).
-				$edit_url = \PerfLocale\Helper::user_can_view_object( (int) $translated_id ) ? \PerfLocale\Admin\ObjectLinks::edit_url( (int) $translated_id ) : '';
+				$edit_url = \PerfLocale\Admin\ObjectLinks::edit_url( (int) $translated_id );
 
 				if ( $edit_url !== '' ) {
 					/* translators: %s: language name */
@@ -564,6 +563,10 @@ final class PostListColumns {
 		$manager = $this->get_manager();
 
 		if ( ! $manager->set_post_language( $post_id, $language ) ) {
+			// The slug may have been decided for the refused language.
+			require_once __DIR__ . '/../Translation/PostSlugCheck.php';
+			\PerfLocale\Translation\PostSlugCheck::recheck( $post_id, null );
+
 			// Quick Edit has no notice: the row shows the unchanged language, and the cause is logged.
 			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic at a silent-failure point; quick-edit has no notice surface.
 			error_log( sprintf( 'PerfLocale: quick-edit language save failed for post %d (language "%s").', $post_id, $language ) );
@@ -573,10 +576,11 @@ final class PostListColumns {
 	/**
 	 * Enqueue the script that fills the Quick Edit language field from row data.
 	 *
+	 * @param mixed $hook_suffix Hook suffix; not a string outside a normal admin page render (iframe_header()).
 	 * @return void
 	 */
-	public function quick_edit_js(): void {
-		$screen = get_current_screen();
+	public function quick_edit_js( mixed $hook_suffix = '' ): void {
+		$screen = is_string( $hook_suffix ) ? get_current_screen() : null;
 
 		if ( ! $screen || $screen->base !== 'edit' ) {
 			return;

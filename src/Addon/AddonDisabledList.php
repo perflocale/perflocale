@@ -192,8 +192,9 @@ final class AddonDisabledList {
 					self::$last_failure = '' !== $error ? 'database' : 'unchanged';
 
 					if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+						$code = '' !== $error ? \PerfLocale\Util\DbErrorCode::of( $error ) : '';
 						// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
-						error_log( 'PerfLocale AddonRegistry::set_disabled_list rejected - the options write was refused' . ( '' !== $error && defined( 'WP_DEBUG_LOG' ) && WP_DEBUG_LOG ? ' - ' . $error : '' ) );
+						error_log( 'PerfLocale AddonRegistry::set_disabled_list rejected - the options write was refused' . ( '' !== $code && defined( 'WP_DEBUG_LOG' ) && WP_DEBUG_LOG ? ' - ' . $code : '' ) );
 					}
 					return false;
 				}

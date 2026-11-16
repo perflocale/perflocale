@@ -62,6 +62,9 @@ final class CacheManager {
 		'perflocale_mt_publisher_',
 		'perflocale_mt_rl_',
 		'perflocale_po_import_result_',
+		'perflocale_resync_request_',
+		'perflocale_resync_result_',
+		'perflocale_resync_units_',
 		'perflocale_scan_queued_notice_',
 		'perflocale_scan_result_',
 		'perflocale_strings_regenerating',
@@ -90,6 +93,11 @@ final class CacheManager {
 		'perflocale_vcopy_epoch',
 		'perflocale_vsig_epoch',
 	];
+
+	/**
+	 * A get() loader's answer for a failed read: get() returns null and stores nothing.
+	 */
+	public const SKIP_STORE = "\0perflocale-skip-store";
 
 	/**
 	 * Maximum number of entries in the L1 static cache.
@@ -266,8 +274,7 @@ final class CacheManager {
 		// L3: transients, in a ['v' => ...] envelope so a stored null or false differs from a miss.
 		// Skipped under a persistent object cache, as in set(): there transients duplicate L2.
 		if ( ! wp_using_ext_object_cache() ) {
-			$transient_key = $this->transient_key( $key, $group );
-			$envelope      = get_transient( $transient_key );
+			$envelope = get_transient( $this->derive_transient_key( $key, $group ) );
 
 			if ( is_array( $envelope ) && array_key_exists( 'v', $envelope ) ) {
 				$value = $envelope['v'];
@@ -285,6 +292,10 @@ final class CacheManager {
 
 		// Cache miss - compute the value.
 		$value = $loader();
+
+		if ( self::SKIP_STORE === $value ) {
+			return null;
+		}
 
 		$this->set( $key, $value, $ttl, $group );
 
@@ -320,7 +331,7 @@ final class CacheManager {
 		}
 
 		if ( ! wp_using_ext_object_cache() ) {
-			$envelope = get_transient( $this->transient_key( $key, $group ) );
+			$envelope = get_transient( $this->derive_transient_key( $key, $group ) );
 
 			if ( is_array( $envelope ) && array_key_exists( 'v', $envelope ) ) {
 				$value = $envelope['v'];
@@ -350,16 +361,16 @@ final class CacheManager {
 
 		$this->static_cache[ $full_key ] = $value;
 
-		// L2 (skipped if disabled in settings).
-		if ( $this->object_cache_enabled ) {
-			wp_cache_set( self::l2_key( $key, $group ), $value, $group, $ttl );
+		// L2 (skipped if disabled in settings). A sized cache refuses a large value: CacheDiagnostics logs and flags it.
+		if ( $this->object_cache_enabled && false === wp_cache_set( self::l2_key( $key, $group ), $value, $group, $ttl ) ) {
+			require_once __DIR__ . '/CacheDiagnostics.php';
+			CacheDiagnostics::refused( $key, $group, $value );
 		}
 
 		// L3 in a ['v' => ...] envelope. Skipped under a persistent object cache: transients go to its shared
 		// `transient` group there, which no group flush or wp_options sweep reaches.
 		if ( ! wp_using_ext_object_cache() ) {
-			$transient_key = $this->transient_key( $key, $group );
-			set_transient( $transient_key, [ 'v' => $value ], $ttl );
+			set_transient( $this->derive_transient_key( $key, $group ), [ 'v' => $value ], $ttl );
 		}
 	}
 
@@ -567,7 +578,7 @@ final class CacheManager {
 		// L3 exists only without a persistent object cache; under one, core would send this delete to the shared
 		// `transient` group, where this class stores nothing.
 		if ( ! wp_using_ext_object_cache() ) {
-			delete_transient( $this->transient_key( $key, $group ) );
+			delete_transient( $this->derive_transient_key( $key, $group ) );
 		}
 	}
 
@@ -1320,49 +1331,9 @@ final class CacheManager {
 	 * @return bool Whether the increment was written.
 	 */
 	public static function bump_group_generation( string $group ): bool {
-		global $wpdb;
+		require_once __DIR__ . '/GenerationBump.php';
 
-		$option   = self::GEN_OPTION_PREFIX . $group;
-		$blog     = is_multisite() ? get_current_blog_id() : 0;
-		$memo_key = $blog . ':' . $group;
-		$previous = self::$gen_memo[ $memo_key ] ?? null;
-
-		// Atomic increment in the DB, never memo + 1: a long-lived worker's memo is stale, and memo + 1 would roll
-		// the generation back and resurrect stale entries. Autoload stays 'yes' (the ON DUPLICATE branch never
-		// touches it) so l2_generation() costs no query. A missing row starts at the clock in ms, not 1: after an
-		// uninstall an unflushable cache still holds the earlier install's low generations.
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-		$bumped = $wpdb->query(
-			$wpdb->prepare(
-				"INSERT INTO {$wpdb->options} (option_name, option_value, autoload)
-				 VALUES (%s, %s, 'yes')
-				 ON DUPLICATE KEY UPDATE option_value = option_value + 1",
-				$option,
-				(string) (int) ( microtime( true ) * 1000 )
-			)
-		);
-
-		// Memoise the committed value, read past the stale options cache (the row was written by raw SQL).
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-		$committed = (int) $wpdb->get_var(
-			$wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", $option )
-		);
-
-		wp_cache_delete( $option, 'options' );
-		wp_cache_delete( 'alloptions', 'options' );
-		// Unlist only a created row (1 affected; an update gives 2): an existing one is autoloaded, and get_option()
-		// reads the alloptions dropped above before notoptions.
-		if ( 1 === $bumped ) {
-			\PerfLocale\Database\NotOptions::unlist( [ $option ] );
-		}
-
-		if ( null !== $previous && $committed !== $previous + 1 ) {
-			self::$bumped_past[ $blog ] = true;
-		}
-
-		self::$gen_memo[ $memo_key ] = $committed;
-
-		return false !== $bumped;
+		return GenerationBump::run( $group, self::GEN_OPTION_PREFIX . $group, self::$gen_memo, self::$bumped_past );
 	}
 
 	/**
@@ -1423,7 +1394,8 @@ final class CacheManager {
 		$kept_values    = [];
 		$kept_timeouts  = [];
 
-		foreach ( $keep as $kept ) {
+		// Write paths only; SiteCleanup adds Pro's and every registered add-on's prefixes to a whole-namespace sweep.
+		foreach ( \PerfLocale\Database\SiteCleanup::flush_keep( $transient_prefix, $keep ) as $kept ) {
 			$kept_values[]   = $wpdb->esc_like( '_transient_' . $kept ) . '%';
 			$kept_timeouts[] = $wpdb->esc_like( '_transient_timeout_' . $kept ) . '%';
 		}
@@ -1505,23 +1477,9 @@ final class CacheManager {
 		}
 
 		// L0: the eager link map is an autoloaded option that neither the bumps nor the sweep reach, and
-		// prime_translations() reads it first. Deleted inline, not via invalidate_eager_link_map(): deactivation
-		// must not build a repository. Keep this type list in sync with invalidate_eager_link_map().
+		// prime_translations() reads it first. A static call: deactivation must not build a repository.
 		// delete_autoloaded_options() also drops an alloptions list a concurrent request re-stored with a map.
-		self::delete_autoloaded_options(
-			[
-				'perflocale_eager_links_post',
-				'perflocale_eager_links_term',
-				'perflocale_eager_links_option',
-				'perflocale_eager_links_string',
-				'perflocale_eager_links_post_type',
-				'perflocale_eager_links_taxonomy',
-			]
-		);
-
-		// get_eager_link_map() reads a static memo before the option, and importers flush so their idempotency
-		// checks see fresh rows. reset_static_caches() is static, so it is safe on teardown paths.
-		\PerfLocale\Database\Repository\TranslationGroupRepository::reset_static_caches();
+		\PerfLocale\Database\Repository\TranslationGroupWrites::drop_eager_maps();
 
 		/** @hook perflocale/cache/flush_all Fires after all caches are flushed. */
 		do_action( 'perflocale/cache/flush_all' );
@@ -1719,16 +1677,5 @@ final class CacheManager {
 		}
 
 		return $full;
-	}
-
-	/**
-	 * Internal alias of derive_transient_key().
-	 *
-	 * @param string $key Cache key.
-	 * @param string $group Cache group.
-	 * @return string
-	 */
-	private function transient_key( string $key, string $group ): string {
-		return $this->derive_transient_key( $key, $group );
 	}
 }

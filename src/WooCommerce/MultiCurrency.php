@@ -480,7 +480,8 @@ final class MultiCurrency {
 	}
 
 	/**
-	 * An exchange rate that can price something: a finite number above zero.
+	 * An exchange rate that can price something: above zero and at most 1e9.
+	 * The cap keeps every product, shipping, tax and coupon product finite (1e308 x 100 is INF); real rates stay below 1e7.
 	 *
 	 * @param mixed $raw Rate as stored, submitted or synced.
 	 * @return float|null The rate, or null when it is not usable.
@@ -492,7 +493,7 @@ final class MultiCurrency {
 
 		$rate = (float) $raw;
 
-		return is_finite( $rate ) && $rate > 0 ? $rate : null;
+		return $rate > 0 && $rate <= 1e9 ? $rate : null;
 	}
 
 	/**
@@ -524,22 +525,22 @@ final class MultiCurrency {
 	/**
 	 * The exchange rate a settings writer stores for one language row.
 	 *
-	 * An unusable submitted rate keeps the stored rate while the currency stays the same, else 1.0.
-	 * A usable rate is stored with the 0.0001 floor.
+	 * An unusable submitted rate keeps the stored rate while the currency stays the same.
+	 * A usable rate is stored as submitted: a floor would raise a small rate (IDR -> EUR 0.00005).
 	 *
 	 * @param mixed  $raw    Submitted rate.
 	 * @param mixed  $stored The language's stored currency row, if any.
 	 * @param string $code   Currency code stored for the row.
-	 * @return float
+	 * @return float|null Null when neither is usable: the writer refuses a manual row, a synced one gets the 1.0 placeholder.
 	 */
-	public static function rate_to_store( mixed $raw, mixed $stored, string $code ): float {
+	public static function rate_to_store( mixed $raw, mixed $stored, string $code ): ?float {
 		$rate = self::usable_rate( $raw );
 
 		if ( $rate === null && is_array( $stored ) && strtoupper( (string) ( $stored['currency_code'] ?? '' ) ) === $code ) {
 			$rate = self::usable_rate( $stored['exchange_rate'] ?? null );
 		}
 
-		return max( 0.0001, $rate ?? 1.0 );
+		return $rate;
 	}
 
 	/**
@@ -576,13 +577,14 @@ final class MultiCurrency {
 			unset( $e );
 		}
 
+		// ExchangeRateSync::RATES_OPTION and LAST_SYNC_OPTION, written out: the constants would load the class.
 		if ( $auto_sync_on ) {
 			// Both options are not autoloaded: one query for the pair.
-			wp_prime_option_caches( [ ExchangeRateSync::RATES_OPTION, ExchangeRateSync::LAST_SYNC_OPTION ] );
+			wp_prime_option_caches( [ 'perflocale_exchange_rates', 'perflocale_exchange_rates_last_sync' ] );
 		}
 
-		$auto_rates = $auto_sync_on ? get_option( ExchangeRateSync::RATES_OPTION, [] ) : [];
-		$last_sync  = $auto_sync_on ? get_option( ExchangeRateSync::LAST_SYNC_OPTION, [] ) : [];
+		$auto_rates = $auto_sync_on ? get_option( 'perflocale_exchange_rates', [] ) : [];
+		$last_sync  = $auto_sync_on ? get_option( 'perflocale_exchange_rates_last_sync', [] ) : [];
 
 		// Not get_woocommerce_currency(): its filter_currency() returns the language's code, not the base.
 		$base_currency = (string) get_option( 'woocommerce_currency', '' );
@@ -602,7 +604,14 @@ final class MultiCurrency {
 			$rate = self::usable_rate( $data['exchange_rate'] ?? 1.0 ) ?? 1.0;
 
 			if ( $auto_sync_on && ! $manual_rate ) {
-				$rate = self::synced_rate( $auto_rates, $last_sync, $slug_key, $code, $base_currency ) ?? $rate;
+				$synced = self::synced_rate( $auto_rates, $last_sync, $slug_key, $code, $base_currency );
+
+				// No synced rate and the 1.0 placeholder: the language keeps the store currency (SiteHealth::fx_unpriced()).
+				if ( null === $synced && 1.0 === $rate && $code !== $base_currency ) {
+					continue;
+				}
+
+				$rate = $synced ?? $rate;
 			}
 
 			// The base currency is 1:1 and sync skips it, so a rate here is stale; after the merge, it overrides both sources.

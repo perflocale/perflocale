@@ -29,14 +29,19 @@ final class SchemaWrites {
 	/**
 	 * Create or update all plugin tables (dbDelta(), idempotent).
 	 *
+	 * @param (callable(): bool)|null $go_on Asked before each table; false stops (the upgrade runner lost its lock).
 	 * @return void
 	 */
-	public static function create_tables(): void {
+	public static function create_tables( ?callable $go_on = null ): void {
 		if ( ! function_exists( 'dbDelta' ) ) {
 			require_once ABSPATH . 'wp-admin/includes/upgrade.php';
 		}
 
 		foreach ( self::definitions() as $sql ) {
+			if ( null !== $go_on && ! $go_on() ) {
+				break;
+			}
+
 			dbDelta( $sql );
 		}
 
@@ -46,6 +51,7 @@ final class SchemaWrites {
 
 	/**
 	 * The CREATE TABLE statement of every plugin table, by short name: what dbDelta applies and missing_parts() checks.
+	 * Column types stay lowercase: dbDelta before WP 6.9 compares them case-sensitively with DESCRIBE and ALTERs on a mismatch.
 	 *
 	 * @return array<string, string>
 	 */
@@ -53,22 +59,23 @@ final class SchemaWrites {
 		global $wpdb;
 
 		$charset_collate = $wpdb->get_charset_collate();
+		$charset_collate = is_string( $charset_collate ) ? $charset_collate : '';
 		$prefix          = $wpdb->prefix . 'perflocale_';
 
 		// Table 1: Languages.
 		$sql_languages = "CREATE TABLE {$prefix}languages (
-			id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
-			slug VARCHAR(10) NOT NULL,
-			locale VARCHAR(20) NOT NULL,
-			name VARCHAR(100) NOT NULL,
-			native_name VARCHAR(100) NOT NULL,
-			flag VARCHAR(10) NOT NULL DEFAULT '',
-			is_default TINYINT(1) UNSIGNED NOT NULL DEFAULT 0,
-			is_active TINYINT(1) UNSIGNED NOT NULL DEFAULT 1,
-			sort_order INT(11) UNSIGNED NOT NULL DEFAULT 0,
-			date_format VARCHAR(50) NOT NULL DEFAULT '',
-			time_format VARCHAR(50) NOT NULL DEFAULT '',
-			text_direction VARCHAR(3) NOT NULL DEFAULT 'ltr',
+			id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+			slug varchar(10) NOT NULL,
+			locale varchar(20) NOT NULL,
+			name varchar(100) NOT NULL,
+			native_name varchar(100) NOT NULL,
+			flag varchar(10) NOT NULL DEFAULT '',
+			is_default tinyint(1) unsigned NOT NULL DEFAULT 0,
+			is_active tinyint(1) unsigned NOT NULL DEFAULT 1,
+			sort_order int(11) unsigned NOT NULL DEFAULT 0,
+			date_format varchar(50) NOT NULL DEFAULT '',
+			time_format varchar(50) NOT NULL DEFAULT '',
+			text_direction varchar(3) NOT NULL DEFAULT 'ltr',
 			PRIMARY KEY (id),
 			UNIQUE KEY slug (slug),
 			UNIQUE KEY locale (locale),
@@ -78,9 +85,9 @@ final class SchemaWrites {
 
 		// Table 2: Translation groups.
 		$sql_groups = "CREATE TABLE {$prefix}translation_groups (
-			id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
-			type VARCHAR(20) NOT NULL,
-			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+			type varchar(20) NOT NULL,
+			created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			PRIMARY KEY (id),
 			KEY type (type)
 		) ENGINE=InnoDB {$charset_collate};";
@@ -89,15 +96,15 @@ final class SchemaWrites {
 		// `object_lookup` serves queries that bind only object_id: not a prefix of `object_lang`, never "dedupe" it.
 		// KEY status and KEY group_object are left out on purpose: docs-ai/04-do-not-fix.md, 2.5.
 		$sql_links = "CREATE TABLE {$prefix}translation_links (
-			id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
-			group_id BIGINT(20) UNSIGNED NOT NULL,
-			object_id BIGINT(20) UNSIGNED NOT NULL,
-			language_id BIGINT(20) UNSIGNED NOT NULL,
-			type VARCHAR(20) NOT NULL DEFAULT '',
-			status VARCHAR(20) NOT NULL DEFAULT 'empty',
-			source VARCHAR(20) NOT NULL DEFAULT 'manual',
-			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+			id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+			group_id bigint(20) unsigned NOT NULL,
+			object_id bigint(20) unsigned NOT NULL,
+			language_id bigint(20) unsigned NOT NULL,
+			type varchar(20) NOT NULL DEFAULT '',
+			status varchar(20) NOT NULL DEFAULT 'empty',
+			source varchar(20) NOT NULL DEFAULT 'manual',
+			created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 			PRIMARY KEY (id),
 			UNIQUE KEY group_lang (group_id, language_id),
 			UNIQUE KEY object_lang (type, object_id, language_id),
@@ -111,16 +118,16 @@ final class SchemaWrites {
 		// original_hash is latin1, never ascii: an ascii column makes wpdb treat the table as ascii and reject multibyte
 		// queries (docs-ai/11-code-rationale.md, "SchemaWrites: latin1 hash columns"). last_seen_at drives the string GC.
 		$sql_strings = "CREATE TABLE {$prefix}strings (
-			id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
-			domain VARCHAR(100) NOT NULL DEFAULT 'default',
-			context VARCHAR(191) NOT NULL DEFAULT '',
-			original TEXT NOT NULL,
-			original_hash CHAR(64) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
-			group_id BIGINT(20) UNSIGNED NOT NULL DEFAULT 0,
-			file_path VARCHAR(500) NOT NULL DEFAULT '',
-			line_number INT(11) UNSIGNED NOT NULL DEFAULT 0,
-			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			last_seen_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+			domain varchar(100) NOT NULL DEFAULT 'default',
+			context varchar(191) NOT NULL DEFAULT '',
+			original text NOT NULL,
+			original_hash char(64) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+			group_id bigint(20) unsigned NOT NULL DEFAULT 0,
+			file_path varchar(500) NOT NULL DEFAULT '',
+			line_number int(11) unsigned NOT NULL DEFAULT 0,
+			created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			last_seen_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			PRIMARY KEY (id),
 			UNIQUE KEY original_hash (original_hash),
 			KEY domain_id (domain, id),
@@ -134,12 +141,12 @@ final class SchemaWrites {
 		// (post type or taxonomy), so separate URL namespaces may share a slug.
 		// slug(191) is the 767-byte per-column index limit of older MySQL, as core's post_name(191): docs-ai/04-do-not-fix.md, 2.2.
 		$sql_slugs = "CREATE TABLE {$prefix}slug_translations (
-			id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
-			object_type VARCHAR(20) NOT NULL,
-			object_subtype VARCHAR(40) NOT NULL DEFAULT '',
-			object_id BIGINT(20) UNSIGNED NOT NULL,
-			language_id BIGINT(20) UNSIGNED NOT NULL,
-			slug VARCHAR(200) NOT NULL,
+			id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+			object_type varchar(20) NOT NULL,
+			object_subtype varchar(40) NOT NULL DEFAULT '',
+			object_id bigint(20) unsigned NOT NULL,
+			language_id bigint(20) unsigned NOT NULL,
+			slug varchar(200) NOT NULL,
 			PRIMARY KEY (id),
 			UNIQUE KEY object_slug (object_type, object_id, language_id),
 			UNIQUE KEY slug_lookup (language_id, object_type, object_subtype, slug(191))
@@ -149,11 +156,11 @@ final class SchemaWrites {
 
 		// Table 9: Content hashes of source content, for change detection. content_hash is latin1, never ascii (see table 4).
 		$sql_hashes = "CREATE TABLE {$prefix}content_hashes (
-			id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
-			object_id BIGINT(20) UNSIGNED NOT NULL,
-			object_type VARCHAR(20) NOT NULL DEFAULT 'post',
-			content_hash CHAR(64) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
-			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+			id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+			object_id bigint(20) unsigned NOT NULL,
+			object_type varchar(20) NOT NULL DEFAULT 'post',
+			content_hash char(64) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+			updated_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 			PRIMARY KEY (id),
 			UNIQUE KEY object_type_id (object_type, object_id)
 		) ENGINE=InnoDB {$charset_collate};";
@@ -161,11 +168,11 @@ final class SchemaWrites {
 		// Table 11: String translations, one row per string and language.
 		// extra_forms: JSON plural forms 2..N (msgstr[2+]) on the `plural`-context row of 3-6 form languages; NULL otherwise.
 		$sql_string_translations = "CREATE TABLE {$prefix}string_translations (
-			string_id BIGINT(20) UNSIGNED NOT NULL,
-			language_id BIGINT(20) UNSIGNED NOT NULL,
-			translation LONGTEXT NOT NULL,
-			extra_forms LONGTEXT NULL DEFAULT NULL,
-			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+			string_id bigint(20) unsigned NOT NULL,
+			language_id bigint(20) unsigned NOT NULL,
+			translation longtext NOT NULL,
+			extra_forms longtext NULL DEFAULT NULL,
+			updated_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 			PRIMARY KEY (string_id, language_id),
 			KEY language_id (language_id)
 		) ENGINE=InnoDB {$charset_collate};";
@@ -174,27 +181,27 @@ final class SchemaWrites {
 		// updated_at has no ON UPDATE CURRENT_TIMESTAMP on purpose: that is the server's clock, and readers compare
 		// with PHP UTC; JobState writes it on every change (docs-ai/11-code-rationale.md, "SchemaWrites: jobs updated_at").
 		$sql_jobs = "CREATE TABLE {$prefix}jobs (
-			id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
-			uuid CHAR(36) NOT NULL,
-			type VARCHAR(64) NOT NULL,
-			hook VARCHAR(191) NOT NULL,
-			engine VARCHAR(20) NOT NULL DEFAULT 'wp_cron',
-			status VARCHAR(20) NOT NULL DEFAULT 'queued',
-			progress TINYINT(3) UNSIGNED NOT NULL DEFAULT 0,
-			total INT(11) UNSIGNED NOT NULL DEFAULT 0,
-			processed INT(11) UNSIGNED NOT NULL DEFAULT 0,
-			attempts SMALLINT(5) UNSIGNED NOT NULL DEFAULT 0,
-			created_by BIGINT(20) UNSIGNED NOT NULL DEFAULT 0,
-			blog_id BIGINT(20) UNSIGNED NOT NULL DEFAULT 0,
-			version INT(11) UNSIGNED NOT NULL DEFAULT 0,
-			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			started_at DATETIME NULL DEFAULT NULL,
-			completed_at DATETIME NULL DEFAULT NULL,
-			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			args LONGTEXT NOT NULL,
-			result LONGTEXT NOT NULL,
-			error VARCHAR(2000) NOT NULL DEFAULT '',
-			log LONGTEXT NOT NULL,
+			id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+			uuid char(36) NOT NULL,
+			type varchar(64) NOT NULL,
+			hook varchar(191) NOT NULL,
+			engine varchar(20) NOT NULL DEFAULT 'wp_cron',
+			status varchar(20) NOT NULL DEFAULT 'queued',
+			progress tinyint(3) unsigned NOT NULL DEFAULT 0,
+			total int(11) unsigned NOT NULL DEFAULT 0,
+			processed int(11) unsigned NOT NULL DEFAULT 0,
+			attempts smallint(5) unsigned NOT NULL DEFAULT 0,
+			created_by bigint(20) unsigned NOT NULL DEFAULT 0,
+			blog_id bigint(20) unsigned NOT NULL DEFAULT 0,
+			version int(11) unsigned NOT NULL DEFAULT 0,
+			created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			started_at datetime NULL DEFAULT NULL,
+			completed_at datetime NULL DEFAULT NULL,
+			updated_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			args longtext NOT NULL,
+			result longtext NOT NULL,
+			error varchar(2000) NOT NULL DEFAULT '',
+			log longtext NOT NULL,
 			PRIMARY KEY (id),
 			UNIQUE KEY uuid (uuid),
 			KEY status_updated (status, updated_at),
@@ -207,14 +214,113 @@ final class SchemaWrites {
 		// read inside create_group()'s transaction so a retried import never makes a second group for one source.
 		// UNIQUE type_key makes the lookup-or-create atomic (ON DUPLICATE KEY UPDATE).
 		$sql_migration_map = "CREATE TABLE {$prefix}migration_source_map (
-			id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
-			migration_type VARCHAR(20) NOT NULL,
-			source_key VARCHAR(191) NOT NULL,
-			group_id BIGINT(20) UNSIGNED NOT NULL,
-			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+			migration_type varchar(20) NOT NULL,
+			source_key varchar(191) NOT NULL,
+			group_id bigint(20) unsigned NOT NULL,
+			created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			PRIMARY KEY (id),
 			UNIQUE KEY type_key (migration_type, source_key),
 			KEY group_id (group_id)
+		) ENGINE=InnoDB {$charset_collate};";
+
+		// Table 13: Automation changes, one row per write the automation policy decided (pending, applied, rejected,
+		// superseded, reverted, refused). `payload` holds the proposal while pending, `previous` the replaced value for
+		// undo. JSON columns are LONGTEXT: a summary lists every field key in scope. Datetimes are PHP UTC.
+		// No KEY on status alone: pending reads add `decided_at IS NULL`, so status_decided serves them in id order.
+		// status_decided_type: one type's pending rows in id order (the Strings review list). Not a stand-in for
+		// status_decided (with no type the range is not in id order); status first, or SQLite (no statistics) reads it
+		// for a type + status filter that KEY target or source_status serves.
+		$sql_pending_changes = "CREATE TABLE {$prefix}pending_changes (
+			id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+			area varchar(32) NOT NULL,
+			object_type varchar(20) NOT NULL,
+			object_id bigint(20) unsigned NOT NULL DEFAULT 0,
+			source_id bigint(20) unsigned NOT NULL DEFAULT 0,
+			language_id bigint(20) unsigned NOT NULL,
+			origin varchar(20) NOT NULL,
+			trigger_name varchar(32) NOT NULL,
+			job_id char(36) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL DEFAULT '',
+			user_id bigint(20) unsigned NOT NULL DEFAULT 0,
+			actor varchar(8) NOT NULL DEFAULT 'user',
+			decision varchar(20) NOT NULL,
+			reason varchar(40) NOT NULL DEFAULT '',
+			status varchar(20) NOT NULL DEFAULT 'pending',
+			payload longtext NOT NULL,
+			summary longtext NOT NULL,
+			base_hash char(64) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL DEFAULT '',
+			result_hash char(64) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL DEFAULT '',
+			result_status varchar(20) NOT NULL DEFAULT '',
+			result_modified datetime NULL DEFAULT NULL,
+			previous longtext NULL DEFAULT NULL,
+			created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			decided_at datetime NULL DEFAULT NULL,
+			decided_by bigint(20) unsigned NOT NULL DEFAULT 0,
+			PRIMARY KEY (id),
+			KEY target (object_type, object_id, language_id, status),
+			KEY source_status (source_id, status),
+			KEY status_decided (status, decided_at),
+			KEY status_decided_type (status, decided_at, object_type),
+			KEY string_intent (object_type, result_status),
+			KEY user_id (user_id),
+			KEY decided_by (decided_by)
+		) ENGINE=InnoDB {$charset_collate};";
+
+		// Table 14: Content ReSync bases, one row per source state some translation was synced to (shared by languages).
+		// Snapshots are LONGBLOB so bytes round-trip whatever the charset (utf8mb3 would refuse 4-byte characters and
+		// wpdb would drop the INSERT). A `live` row matching its newest revision keeps `revision_id` and empty text.
+		// object_type: what the ids name ('post' only so far; term and string ids reuse post id numbers): last in both UNIQUE
+		// keys so prefix reads stay indexed. KEY last_used_at ends with id and object_type: a type's retention read stays
+		// covering and ordered; a key led by object_type misleads SQLite's planner.
+		$sql_resync_base = "CREATE TABLE {$prefix}resync_base (
+			id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+			source_id bigint(20) unsigned NOT NULL,
+			source_hash char(64) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL,
+			fields_hash char(64) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL DEFAULT '',
+			origin varchar(20) NOT NULL DEFAULT 'live',
+			revision_id bigint(20) unsigned NOT NULL DEFAULT 0,
+			title longblob NOT NULL,
+			content longblob NOT NULL,
+			excerpt longblob NOT NULL,
+			fields longblob NOT NULL,
+			created_at datetime NOT NULL,
+			last_used_at datetime NOT NULL,
+			object_type varchar(20) NOT NULL DEFAULT 'post',
+			PRIMARY KEY (id),
+			UNIQUE KEY source_state (source_id, source_hash, fields_hash, object_type),
+			KEY last_used_at (last_used_at, id, object_type)
+		) ENGINE=InnoDB {$charset_collate};";
+
+		// Table 15: Content ReSync state, one row per translation post: its base, the previous base (undo), hashes for
+		// the no-change check, field ownership, the block map and the write-ahead intent of a write in flight. A row
+		// made only to hold an intent has base 0 and is never used as a state. object_type: as in resync_base.
+		$sql_resync_state = "CREATE TABLE {$prefix}resync_state (
+			id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+			translation_id bigint(20) unsigned NOT NULL,
+			source_id bigint(20) unsigned NOT NULL,
+			language_id bigint(20) unsigned NOT NULL,
+			base_id bigint(20) unsigned NOT NULL DEFAULT 0,
+			prev_base_id bigint(20) unsigned NOT NULL DEFAULT 0,
+			source_hash char(64) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL DEFAULT '',
+			fields_hash char(64) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL DEFAULT '',
+			translation_hash char(64) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL DEFAULT '',
+			translation_fields_hash char(64) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL DEFAULT '',
+			how varchar(20) NOT NULL DEFAULT '',
+			base_quality varchar(20) NOT NULL DEFAULT '',
+			complete tinyint(1) unsigned NOT NULL DEFAULT 0,
+			fields_owned longtext NOT NULL,
+			fields_unknown longtext NOT NULL,
+			block_map longtext NOT NULL,
+			intent longtext NOT NULL,
+			intent_at datetime NULL DEFAULT NULL,
+			synced_at datetime NOT NULL,
+			object_type varchar(20) NOT NULL DEFAULT 'post',
+			PRIMARY KEY (id),
+			UNIQUE KEY translation (translation_id, object_type),
+			KEY source_language (source_id, language_id),
+			KEY base_id (base_id),
+			KEY prev_base_id (prev_base_id),
+			KEY intent_at (intent_at)
 		) ENGINE=InnoDB {$charset_collate};";
 
 		return [
@@ -227,33 +333,31 @@ final class SchemaWrites {
 			'string_translations'  => $sql_string_translations,
 			'jobs'                 => $sql_jobs,
 			'migration_source_map' => $sql_migration_map,
+			'pending_changes'      => $sql_pending_changes,
+			'resync_base'          => $sql_resync_base,
+			'resync_state'         => $sql_resync_state,
 		];
 	}
 
 	/**
-	 * Drop all plugin tables (uninstall only).
+	 * Drop the named plugin tables (uninstall only): never a `perflocale_*` table nobody listed.
 	 *
-	 * @param array<int, string> $keep Full table names to leave (an addon that kept its data).
+	 * @param array<int, string> $keep   Full table names to leave (an addon that kept its data).
+	 * @param array<int, string> $tables Short names (`languages`); default this version's.
 	 * @return void
 	 */
-	public static function drop_tables( array $keep = [] ): void {
+	public static function drop_tables( array $keep = [], array $tables = Schema::REQUIRED_TABLES ): void {
 		global $wpdb;
 
 		$prefix = $wpdb->prefix . 'perflocale_';
 
-		// Every existing `<prefix>perflocale_*` table, not a fixed list: tables gone from the schema are dropped too.
-		// phpcs:ignore WordPress.DB.PreparedSQLPlaceholders.UnsupportedPlaceholder, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-		$existing = (array) $wpdb->get_col(
-			$wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $prefix ) . '%' )
-		);
+		foreach ( $tables as $short ) {
+			$safe = Schema::sanitize_table( $prefix . $short );
 
-		foreach ( $existing as $full_name ) {
-			// SHOW TABLES output, still sanitized and prefix-checked before the DROP.
-			$safe = Schema::sanitize_table( (string) $full_name );
-			if ( $safe === '' || 0 !== strpos( $safe, $prefix ) || in_array( $safe, $keep, true ) ) {
+			if ( $safe !== $prefix . $short || in_array( $safe, $keep, true ) || SiteCleanup::is_foreign_table( $safe ) ) {
 				continue;
 			}
-			// phpcs:disable WordPress.DB.DirectDatabaseQuery.SchemaChange, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Teardown DDL: table name is an identifier (sanitized + prefix-checked above) and is bound with %i; DROP has no cache to invalidate.
+			// phpcs:disable WordPress.DB.DirectDatabaseQuery.SchemaChange, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Teardown DDL: table name is an identifier (sanitized above) and is bound with %i; DROP has no cache to invalidate.
 			$wpdb->query(
 				$wpdb->prepare(
 					'DROP TABLE IF EXISTS %i',
@@ -375,6 +479,25 @@ final class SchemaWrites {
 		$column = $alias . 'updated_at';
 
 		return ', ' . $column . ' = CASE WHEN ' . $same . ' THEN ' . $column . ' ELSE NOW() END';
+	}
+
+	/**
+	 * Schema::tables_exist()'s SHOW TABLES probe, past every cache.
+	 *
+	 * @param string $table Full languages table name.
+	 * @return bool|null Whether the table exists; null when the probe failed (no answer).
+	 */
+	public static function probe_tables( string $table ): ?bool {
+		global $wpdb;
+
+		if ( ! $wpdb instanceof \wpdb ) {
+			return null;
+		}
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Schema::tables_exist() caches the answer (autoloaded option, object cache, per-request static).
+		$verdict = (bool) $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table ) );
+
+		return '' !== $wpdb->last_error ? null : $verdict;
 	}
 
 	/**

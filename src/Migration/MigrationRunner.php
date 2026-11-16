@@ -11,6 +11,7 @@ namespace PerfLocale\Migration;
 
 use PerfLocale\Background\MigrationCacheHelper;
 use PerfLocale\Cache\CacheManager;
+use PerfLocale\Database\Repository\LanguageRepository;
 use PerfLocale\Plugin;
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -111,6 +112,12 @@ final class MigrationRunner {
 
 				if ( empty( $result['blocked'] ) ) {
 					MigrationCacheHelper::flush_post_migration_caches();
+
+					$clashes = self::slug_clashes( $cache );
+
+					if ( [] !== $clashes ) {
+						$result['slug_clashes'] = $clashes;
+					}
 				}
 
 				return $result;
@@ -193,7 +200,7 @@ final class MigrationRunner {
 	}
 
 	/**
-	 * Every import stage's label, by stage key.
+	 * Every job stage's label, by stage key: the stages of an import and of a Content ReSync run.
 	 *
 	 * @return array<string, string>
 	 */
@@ -221,6 +228,14 @@ final class MigrationRunner {
 			'slugs'        => __( 'Slugs', 'perflocale' ),
 			/* translators: Stage of a migration import: the language of WooCommerce orders. */
 			'orders'       => __( 'Order languages', 'perflocale' ),
+			/* translators: Stage of a Content ReSync run: translations updated from their changed sources. */
+			'resync'       => __( 'Updating translations', 'perflocale' ),
+			/* translators: Stage of a Content ReSync run: missing and empty translations created. */
+			'fill'         => __( 'Creating missing translations', 'perflocale' ),
+			/* translators: Stage of a Content ReSync run: translations that are up to date recorded as in sync. */
+			'confirm'      => __( 'Recording up-to-date translations', 'perflocale' ),
+			/* translators: Stage of a Content ReSync run: counting what a run would change and cost. */
+			'estimate'     => __( 'Estimating', 'perflocale' ),
 		];
 	}
 
@@ -258,6 +273,44 @@ final class MigrationRunner {
 			'polylang' => PolylangImporter::skipped_lines( $result ),
 			default    => [],
 		};
+	}
+
+	/**
+	 * The report lines of a finished import naming published root posts an active language's prefix takes.
+	 *
+	 * @param array<int|string, mixed> $result Import result.
+	 * @return list<string>
+	 */
+	public static function clash_lines( array $result ): array {
+		return array_values( array_filter( (array) ( $result['slug_clashes'] ?? [] ), 'is_string' ) );
+	}
+
+	/**
+	 * Root posts the active languages' prefixes take after an import: named in its report, never refused.
+	 *
+	 * @param CacheManager $cache Cache manager.
+	 * @return list<string>
+	 */
+	private static function slug_clashes( CacheManager $cache ): array {
+		$names = [];
+
+		if ( ! Plugin::get_instance()->has( 'settings' ) ) {
+			return [];
+		}
+
+		require_once dirname( __DIR__ ) . '/Translation/LanguageCodeSlugs.php';
+
+		$settings = Plugin::get_instance()->settings();
+
+		foreach ( ( new LanguageRepository( $cache ) )->get_active() as $lang ) {
+			if ( is_string( $lang->slug ?? null ) && '' !== $lang->slug && is_string( $lang->locale ?? null ) ) {
+				foreach ( \PerfLocale\Translation\LanguageCodeSlugs::paths( $lang->slug, $lang->locale, $settings ) as $path ) {
+					$names[ $path ] = is_string( $lang->name ?? null ) && '' !== $lang->name ? $lang->name : $lang->slug;
+				}
+			}
+		}
+
+		return \PerfLocale\Translation\LanguageCodeSlugs::clash_notes( $names, $settings );
 	}
 
 	/**

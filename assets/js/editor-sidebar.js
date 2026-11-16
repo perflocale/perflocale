@@ -25,6 +25,137 @@
 
 	var config = perflocaleEditor || {};
 	var i18n = config.i18n || {};
+	// The waiting updates of this post and its translations, keyed by post
+	// id, read once on the server while the screen rendered.
+	var updates = config.updates || {};
+	// "Resync from source": present only for a user and post type the
+	// handler accepts. The result or estimate step of the previous press
+	// arrives as one notice, only after that press's redirect.
+	var resync = config.resync || null;
+	var resyncNotice = config.resyncNotice || null;
+
+	/**
+	 * The "Resync from source" address of a language (or every language):
+	 * the handler's arguments, without the nonce (a press posts it).
+	 *
+	 * @param {string} lang Language slug, or 'all'.
+	 * @return {string} URL.
+	 */
+	function resyncUrl( lang ) {
+		return resync.url +
+			'?action=perflocale_resync' +
+			'&post=' + encodeURIComponent( config.postId ) +
+			'&lang=' + encodeURIComponent( lang ) +
+			'&return=edit';
+	}
+
+	// Set while a posted press's navigation is under way.
+	var posting = false;
+
+	window.addEventListener( 'pageshow', function() {
+		posting = false;
+	} );
+
+	/**
+	 * Post an admin-post handler's address with its nonce as `_wpnonce` (the handlers act only on POST). Once until
+	 * the page is shown again, or 3 s when the page did not leave.
+	 *
+	 * @param {string}    url      Address.
+	 * @param {string}    nonce    Nonce.
+	 * @param {?Function} [onPost] Called once the press is posted, before the form is submitted.
+	 * @param {Object}    [fields] More body fields, by name.
+	 */
+	function postTo( url, nonce, onPost, fields ) {
+		if ( posting ) {
+			return;
+		}
+		posting = true;
+		window.setTimeout( function() {
+			posting = false;
+		}, 3000 );
+
+		if ( onPost ) {
+			onPost();
+		}
+
+		var form = document.createElement( 'form' );
+		var field = document.createElement( 'input' );
+		form.method = 'post';
+		form.action = url;
+		form.hidden = true;
+		field.type = 'hidden';
+		field.name = '_wpnonce';
+		field.value = nonce || '';
+		form.appendChild( field );
+		Object.keys( fields || {} ).forEach( function( name ) {
+			var extra = document.createElement( 'input' );
+			extra.type = 'hidden';
+			extra.name = name;
+			extra.value = String( fields[ name ] );
+			form.appendChild( extra );
+		} );
+		document.body.appendChild( form );
+		form.submit();
+	}
+
+	/**
+	 * Whether a click is a plain one (no modifier key, main button): only
+	 * that posts; any other opens the address, whose handler then shows a
+	 * button that posts it.
+	 *
+	 * @param {Object} ev Click event.
+	 * @return {boolean} Plain.
+	 */
+	function plainClick( ev ) {
+		return ev.button === 0 && ! ev.metaKey && ! ev.ctrlKey && ! ev.shiftKey && ! ev.altKey;
+	}
+
+	/**
+	 * A resync link, disabled while the post has unsaved changes (the run
+	 * reads the saved version); disabled, it stays focusable. A plain
+	 * click posts it with the nonce.
+	 *
+	 * @param {string}  lang  Language slug, or 'all'.
+	 * @param {string}  label Link text.
+	 * @param {boolean} dirty Unsaved changes.
+	 * @param {string}  extra Extra class.
+	 * @return {Object} Element.
+	 */
+	function resyncLink( lang, label, dirty, extra ) {
+		return el( 'a', {
+			key: 'resync-' + lang,
+			className: 'perflocale-panel-resync' + ( extra ? ' ' + extra : '' ) + ( dirty ? ' is-disabled' : '' ),
+			href: dirty ? undefined : resyncUrl( lang ),
+			role: dirty ? 'link' : undefined,
+			tabIndex: dirty ? 0 : undefined,
+			'aria-disabled': dirty ? 'true' : undefined,
+			title: dirty ? ( i18n.saveFirst || __( 'Save first: Resync uses the saved version.', 'perflocale' ) ) : undefined,
+			onClick: function( ev ) {
+				if ( dirty ) {
+					ev.preventDefault();
+				} else if ( plainClick( ev ) ) {
+					ev.preventDefault();
+					postTo( resyncUrl( lang ), resync.nonce, function() {
+						/**
+						 * @hook perflocale.resync.started
+						 * @kind action
+						 * @since 1.0.8
+						 * @cardinality run
+						 * @fires A plain click on a Resync link of the Translations panel posts the press, before the page leaves (synchronous work only). Its result ends the run on the editor load after the redirect; a modifier click opens the handler's page and fires nothing.
+						 * @context {EditorContext} context
+						 * @property {?Language} context.targetLanguage The translation to update; null for Resync all translations.
+						 * @example wp.hooks.addAction( 'perflocale.resync.started', 'acme/log', function ( ctx ) {
+						 *     console.log( 'resync', ctx.post.id, ctx.targetLanguage ? ctx.targetLanguage.slug : 'all' );
+						 * } );
+						 */
+						doAction( 'perflocale.resync.started', editorContext( lastRows, {
+							targetLanguage: 'all' === lang ? null : rowLanguageBySlug( lastRows, lang )
+						} ) );
+					} );
+				}
+			}
+		}, label );
+	}
 
 	// ---------------------------------------------------------------
 	// JavaScript hooks (wp.hooks). Language, PostRef and EditorContext
@@ -72,6 +203,63 @@
 		} catch ( e ) {
 			hookWarn( name, 'a callback threw.' );
 		}
+	}
+
+	// The previous press's result notice until its hook fired: the server's
+	// outcome, as the notice status alone does not tell a refusal from a run.
+	var resyncResult = resyncNotice && resyncNotice.text && /^(done|background|failed)$/.test( String( resyncNotice.outcome || '' ) ) ? resyncNotice : null;
+
+	// The result hook of the previous press, once, after the first rows request settled.
+	function resyncResultHook() {
+		var result = resyncResult;
+
+		if ( ! result ) {
+			return;
+		}
+
+		resyncResult = null;
+
+		if ( 'failed' === result.outcome ) {
+			/**
+			 * @hook perflocale.resync.failed
+			 * @kind action
+			 * @since 1.0.8
+			 * @cardinality run
+			 * @fires Once on the editor load that shows the result notice of a press that did not run (refused, not allowed or an error), after the panel's first rows request settled.
+			 * @context {EditorContext} context
+			 * @property {string} context.status The notice's status: warning (refused) or error.
+			 * @property {string} context.message The text the notice shows.
+			 * @example wp.hooks.addAction( 'perflocale.resync.failed', 'acme/log', function ( ctx ) {
+			 *     console.warn( 'resync did not run', ctx.message );
+			 * } );
+			 */
+			doAction( 'perflocale.resync.failed', editorContext( lastRows, {
+				status:  String( result.status || '' ),
+				message: String( result.text )
+			} ) );
+
+			return;
+		}
+
+		/**
+		 * @hook perflocale.resync.completed
+		 * @kind action
+		 * @since 1.0.8
+		 * @cardinality run
+		 * @fires Once on the editor load that shows the result notice of a press that ran, after the panel's first rows request settled. The estimate step fires nothing; a run cancelled there has no terminal action.
+		 * @context {EditorContext} context
+		 * @property {string} context.status The notice's status: success (every translation done), warning (some not updated: see message) or info (queued).
+		 * @property {boolean} context.background The run, or its rest, continues as a background job (perflocale.jobs.statusChanged, type content_resync).
+		 * @property {string} context.message The text the notice shows.
+		 * @example wp.hooks.addAction( 'perflocale.resync.completed', 'acme/log', function ( ctx ) {
+		 *     console.log( 'resync', ctx.status, ctx.background ? 'continues in the background' : 'done' );
+		 * } );
+		 */
+		doAction( 'perflocale.resync.completed', editorContext( lastRows, {
+			status:     String( result.status || '' ),
+			background: 'background' === result.outcome,
+			message:    String( result.text )
+		} ) );
 	}
 
 	// The Language object of a Translations row.
@@ -198,6 +386,26 @@
 		);
 	}
 
+	// The items that did not copy to this translation (MetaBox's admin notice,
+	// which the block editor hides). Dismiss posts the classic button's form.
+	var copyWarning = config.copyWarning || null;
+
+	if ( copyWarning && copyWarning.text ) {
+		wp.data.dispatch( 'core/notices' ).createWarningNotice(
+			String( copyWarning.text ),
+			{
+				id: 'perflocale-copy-warning',
+				isDismissible: true,
+				actions: [ {
+					label: String( copyWarning.label ),
+					onClick: function() {
+						postTo( copyWarning.url, copyWarning.nonce, null, { action: copyWarning.action, post: copyWarning.post } );
+					}
+				} ]
+			}
+		);
+	}
+
 	function PerfLocalePanel() {
 		// Per-post sync opt-out flag, read/written through the registered
 		// REST meta (all hooks at top level - React rules of hooks).
@@ -205,6 +413,11 @@
 			return select( 'core/editor' ).getEditedPostAttribute( 'meta' );
 		}, [] );
 		var editPost = useDispatch( 'core/editor' ).editPost;
+		var isDirty = useSelect( function ( select ) {
+			var editor = select( 'core/editor' );
+
+			return !! ( editor && editor.isEditedPostDirty && editor.isEditedPostDirty() );
+		}, [] );
 
 		var stateData = useState( [] );
 		var languages = stateData[0];
@@ -253,11 +466,13 @@
 					setLanguages( filterRows( response.languages ) );
 					setIsUnassigned( !! response.is_unassigned );
 				}
+				resyncResultHook();
 				setIsLoading( false );
 			} ).catch( function() {
 				if ( myToken !== fetchTokenRef.current ) {
 					return;
 				}
+				resyncResultHook();
 				setIsLoading( false );
 			} );
 		}
@@ -268,8 +483,22 @@
 				path: 'perflocale/v1/translations/post/' + config.postId + '/language',
 				method: 'POST',
 				data: { slug: langSlug }
-			} ).then( function() {
+			} ).then( function( res ) {
 				setBusySlug( null );
+
+				// A published post moved to a prefixed URL: name both addresses (no redirect is kept).
+				if ( res && res.moved && res.moved.from && res.moved.to ) {
+					wp.data.dispatch( 'core/notices' ).createNotice(
+						'warning',
+						wp.i18n.sprintf(
+							/* translators: 1: old URL, 2: new URL. */
+							__( 'The language change moved this post: its address is now %2$s (it was %1$s).', 'perflocale' ),
+							res.moved.from,
+							res.moved.to
+						),
+						{ id: 'perflocale-url-moved', isDismissible: true }
+					);
+				}
 
 				/**
 				 * @hook perflocale.translation.languageAssigned
@@ -300,6 +529,29 @@
 		useEffect( function() {
 			if ( config.postId ) {
 				fetchTranslations();
+			}
+
+			// The previous press's result or estimate step, once.
+			if ( resyncNotice && resyncNotice.text ) {
+				wp.data.dispatch( 'core/notices' ).createNotice(
+					resyncNotice.status || 'info',
+					resyncNotice.text,
+					{
+						id: 'perflocale-resync',
+						isDismissible: true,
+						actions: ( resyncNotice.actions || [] ).map( function( action ) {
+							// A handler's action (Start, Cancel, Show the estimate) posts its nonce.
+							return action.nonce
+								? { label: action.label, onClick: function() { postTo( action.url, action.nonce ); } }
+								: { label: action.label, url: action.url };
+						} )
+					}
+				);
+
+				// No rows request to wait for.
+				if ( ! config.postId ) {
+					resyncResultHook();
+				}
 			}
 
 			// Watch for post status changes (e.g., publish) to refresh the panel.
@@ -363,9 +615,18 @@
 			apiFetch( {
 				path: 'perflocale/v1/translations/post/' + config.postId,
 				method: 'POST',
-				data: { target_lang: langSlug, copy_content: create.copyContent }
+				// The server machine-translates a copy when "Translate on create" is on, as the classic panel's + Create.
+				data: { target_lang: langSlug, copy_content: create.copyContent, translate_on_create: create.copyContent }
 			} ).then( function( response ) {
 				setBusySlug( null );
+				// Why machine translation did not run or was queued; a queued one has no translation yet.
+				if ( response && response.mt_notice ) {
+					wp.data.dispatch( 'core/notices' ).createNotice( 'warning', response.mt_notice, { type: 'snackbar', isDismissible: true } );
+				}
+				if ( response && response.queued ) {
+					fetchTranslations();
+					return;
+				}
 				if ( response && response.edit_url ) {
 					// A window.open() here runs in the apiFetch continuation,
 					// past the click's user-activation window - Safari blocks
@@ -379,7 +640,8 @@
 							isDismissible: true,
 							actions: [ {
 								label: __( 'Open translation', 'perflocale' ),
-								onClick: function() { window.open( response.edit_url, '_blank' ); }
+								// noopener: a filtered external editor URL gets no handle on this tab.
+								onClick: function() { window.open( response.edit_url, '_blank', 'noopener' ); }
 							} ]
 						}
 					);
@@ -445,6 +707,25 @@
 			} );
 		}
 
+		// The current row and the default-language row decide which resync
+		// links show; computed before renderRow() uses them.
+		var currentRow = null;
+		var defaultRow = null;
+
+		languages.forEach( function( row ) {
+			if ( row.is_current ) {
+				currentRow = row;
+			}
+			if ( row.is_default ) {
+				defaultRow = row;
+			}
+		} );
+
+		var isSource = !! ( currentRow && currentRow.is_default );
+		var editableTranslations = languages.filter( function( row ) {
+			return ! row.is_current && row.has_translation && row.edit_url;
+		} );
+
 		function renderRow( lang ) {
 			var isCurrent = lang.is_current;
 			var hasTranslation = lang.has_translation;
@@ -483,11 +764,22 @@
 					style: { color: '#16a34a', background: '#dcfce7' }
 				}, i18n.current || 'Current' );
 			} else if ( hasTranslation ) {
-				actionEl = el( 'a', {
-					className: 'perflocale-panel-edit',
-					href: lang.edit_url,
-					target: '_blank'
-				}, i18n.edit || __( 'Edit', 'perflocale' ) );
+				var waiting = updates[ String( lang.post_id ) ];
+
+				actionEl = el( 'span', null,
+					el( 'a', {
+						className: 'perflocale-panel-edit',
+						href: lang.edit_url,
+						target: '_blank',
+						rel: 'noopener'
+					}, i18n.edit || __( 'Edit', 'perflocale' ) ),
+					waiting ? el( 'a', {
+						className: 'perflocale-panel-update',
+						href: waiting.url
+					}, i18n.updateWaiting || __( 'Update waiting', 'perflocale' ) ) : null,
+					// On the source: resync this language (a translation the user can edit).
+					resync && isSource && lang.edit_url ? resyncLink( lang.slug, i18n.resync || __( 'Resync', 'perflocale' ), isDirty ) : null
+				);
 			} else {
 				actionEl = el( 'button', {
 					className: 'perflocale-panel-create',
@@ -511,6 +803,7 @@
 				el( 'div', { className: 'perflocale-panel-row__action' }, actionEl )
 			);
 		}
+
 
 		var content;
 
@@ -559,8 +852,42 @@
 				);
 			}
 
+			// This post's own waiting update: the line and link above the rows.
+			var ownUpdate = updates[ String( config.postId ) ];
+			var updateNote = ownUpdate
+				? el( 'p', { className: 'perflocale-panel-update-note' },
+					( i18n.updateNote || __( 'An update from the source is waiting for review.', 'perflocale' ) ) + ' ',
+					el( 'a', { href: ownUpdate.url }, i18n.reviewUpdate || __( 'Review update', 'perflocale' ) )
+				)
+				: null;
+
+			// "Resync from source" on a translation; "Resync all translations"
+			// on a source with translations the user can edit.
+			var resyncBar = null;
+
+			if ( resync && ! isUnassigned ) {
+				if ( isSource && editableTranslations.length ) {
+					resyncBar = el( 'p', { className: 'perflocale-panel-resync-bar' },
+						resyncLink( 'all', i18n.resyncAll || __( 'Resync all translations', 'perflocale' ), isDirty, 'components-button is-secondary' )
+					);
+				} else if ( currentRow && ! currentRow.is_default && defaultRow && defaultRow.has_translation ) {
+					resyncBar = el( 'p', { className: 'perflocale-panel-resync-bar' },
+						resyncLink( currentRow.slug, i18n.resyncSource || __( 'Resync from source', 'perflocale' ), isDirty, 'components-button is-secondary' )
+					);
+				}
+
+				if ( resyncBar && isDirty ) {
+					resyncBar = el( 'div', null,
+						resyncBar,
+						el( 'p', { className: 'perflocale-panel-resync-hint' }, i18n.saveFirst || __( 'Save first: Resync uses the saved version.', 'perflocale' ) )
+					);
+				}
+			}
+
 			content = el( 'div', null,
 				unassignedNote,
+				updateNote,
+				resyncBar,
 				el( 'div', { className: 'perflocale-panel-rows' },
 					languages.map( renderRow )
 				),

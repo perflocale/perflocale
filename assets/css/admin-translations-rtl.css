@@ -77,6 +77,20 @@
 	transition: background-color 0.12s ease, box-shadow 0.12s ease, color 0.12s ease;
 }
 
+/* The "Update waiting" badge: on its own line under the status badge, so it
+   stays inside the fixed-width language cell, its label wrapping when the
+   cell is narrower than the label. */
+.perflocale-translations-table .perflocale-status-badge--update-waiting {
+	display: flex;
+	justify-content: center;
+	width: fit-content;
+	max-width: 100%;
+	margin: 4px auto 0;
+	white-space: normal;
+	text-align: center;
+	box-sizing: border-box;
+}
+
 /* Linkable badges - same colours, but they carry a focus ring + hover
    darkening so it's obvious they're interactive. The non-linked variant
    (`Empty` on a source row, source-language column on its own row) is
@@ -216,5 +230,59 @@ a.perflocale-status-badge--linked:focus .perflocale-status-badge__icon {
 }
 
 .perflocale-bulk-meta-toggle {
+	margin-right: 8px;
+}
+
+/* ---- "Update translations" dialog (Content ReSync) ---- */
+.perflocale-update-translations {
+	margin: 24px 0 8px;
+	padding: 12px 16px;
+	background: #fff;
+	border: 1px solid #c3c4c7;
+	border-radius: 4px;
+	max-width: 720px;
+}
+
+.perflocale-update-translations summary {
+	cursor: pointer;
+	font-weight: 600;
+	user-select: none;
+}
+
+.perflocale-update-translations__form {
+	margin-top: 12px;
+}
+
+.perflocale-update-translations__group {
+	border: 1px solid #dcdcde;
+	border-radius: 4px;
+	padding: 8px 12px;
+	margin: 0 0 12px;
+}
+
+.perflocale-update-translations__group legend {
+	font-weight: 600;
+	padding: 0 4px;
+}
+
+.perflocale-update-translations__group label {
+	display: inline-block;
+	margin: 2px 0 2px 16px;
+}
+
+.perflocale-update-translations__fill {
+	margin: 0 24px 4px 0;
+	padding: 0;
+	border: 0;
+}
+
+.perflocale-update-translations__actions {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	flex-wrap: wrap;
+}
+
+.perflocale-bulk-fill {
 	margin-right: 8px;
 }

@@ -11,6 +11,7 @@ namespace PerfLocale\Translation;
 
 use PerfLocale\Cache\CacheManager;
 use PerfLocale\Database\Repository\LanguageRepository;
+use PerfLocale\Database\Repository\SlugTranslationWrites;
 use PerfLocale\Database\Repository\TranslationGroupRepository;
 use PerfLocale\Enum\ObjectType;
 use PerfLocale\Helper;
@@ -76,11 +77,6 @@ final class TermTranslationManager {
 	private readonly LanguageRepository $languages;
 
 	/**
-	 * @var CacheManager
-	 */
-	private readonly CacheManager $cache;
-
-	/**
 	 * Hierarchy served to core per blog and taxonomy while an adoption moves terms: two rebuilds per adoption, not
 	 * one per move.
 	 *
@@ -96,12 +92,12 @@ final class TermTranslationManager {
 	/**
 	 * Constructor.
 	 *
-	 * @param CacheManager $cache Cache manager.
+	 * @param CacheManager $cache Unused; the signature callers construct with.
 	 */
 	public function __construct( CacheManager $cache ) {
+		unset( $cache );
 		$this->groups    = \PerfLocale\Plugin::get_instance()->get( 'group_repo' );
 		$this->languages = \PerfLocale\Plugin::get_instance()->get( 'lang_repo' );
-		$this->cache     = $cache;
 	}
 
 	/**
@@ -352,9 +348,9 @@ final class TermTranslationManager {
 			}
 		}
 
-		// Record the display slug: the DB slug is "base-lang" (uncategorized-de), the URL uses the base.
-		$slug_manager = new \PerfLocale\Router\SlugManager( $this->cache );
-		$slug_manager->set_slug( 'term', $taxonomy, $new_term_id, $language_id, $base_slug );
+		// Record the display slug: the DB slug is "base-lang" (uncategorized-de), the URL uses the base. Insert-only and
+		// strict (a slug another term uses is reported, never suffixed), under the import lock.
+		SlugTranslationWrites::write_term_url_slug( $taxonomy, $new_term_id, $language_id, $base_slug, true, 3, 1000 );
 
 		// Also ensure the source term has a slug translation entry.
 		$source_lang = $this->detect_term_language( $source_id );
@@ -364,7 +360,7 @@ final class TermTranslationManager {
 
 			if ( $source_term_obj instanceof \WP_Term ) {
 				$source_base = $this->strip_language_suffix( $source_term_obj->slug );
-				$slug_manager->set_slug( 'term', $taxonomy, $source_id, (int) $source_lang->id, $source_base );
+				SlugTranslationWrites::write_term_url_slug( $taxonomy, $source_id, (int) $source_lang->id, $source_base, true, 3, 1000 );
 			}
 		}
 
@@ -1143,60 +1139,90 @@ final class TermTranslationManager {
 			$new_lang = (int) $lang->id;
 			$group_id = (int) $group->id;
 			$touch    = \PerfLocale\Database\Schema::touch_write_time( [ [ 'language_id', '%d', 'int' ] ] );
+			$old      = $this->detect_term_language( $term_id );
+			$old_lang = is_object( $old ) && is_numeric( $old->id ?? null ) ? (int) $old->id : 0;
 
-			if ( '' === $touch || ! $wpdb instanceof \wpdb ) {
-				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-				$updated = $wpdb->update(
-					$links_table,
-					[ 'language_id' => $new_lang ],
-					[
-						'group_id'  => $group_id,
-						'object_id' => $term_id,
-					],
-					[ '%d' ],
-					[ '%d', '%d' ]
-				);
-			} else {
-				// SQLite: the same write plus the updated_at that ON UPDATE CURRENT_TIMESTAMP gives on MySQL.
-				// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-				$updated = $wpdb->query(
-					$wpdb->prepare(
-						'UPDATE %i SET language_id = %d, updated_at = CASE WHEN language_id = %d THEN updated_at ELSE NOW() END WHERE group_id = %d AND object_id = %d',
+			$link = function () use ( $wpdb, $touch, $links_table, $new_lang, $group_id, $term_id, $group, $lang ): bool {
+				if ( '' === $touch || ! $wpdb instanceof \wpdb ) {
+					// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+					$updated = $wpdb->update(
 						$links_table,
-						$new_lang,
-						$new_lang,
-						$group_id,
-						$term_id
-					) ?? ''
-				);
-				// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+						[ 'language_id' => $new_lang ],
+						[
+							'group_id'  => $group_id,
+							'object_id' => $term_id,
+						],
+						[ '%d' ],
+						[ '%d', '%d' ]
+					);
+				} else {
+					// SQLite: the same write plus the updated_at that ON UPDATE CURRENT_TIMESTAMP gives on MySQL.
+					// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+					$updated = $wpdb->query(
+						$wpdb->prepare(
+							'UPDATE %i SET language_id = %d, updated_at = CASE WHEN language_id = %d THEN updated_at ELSE NOW() END WHERE group_id = %d AND object_id = %d',
+							$links_table,
+							$new_lang,
+							$new_lang,
+							$group_id,
+							$term_id
+						) ?? ''
+					);
+					// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				}
+
+				// false: a DB error (a concurrent writer took the slot). 0: the row was deleted meanwhile, or already had
+				// this language (MySQL counts changed rows, not matched), so read it back.
+				if ( $updated === false ) {
+					return false;
+				}
+
+				if ( $updated === 0 ) {
+					// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter
+					$current_lang = $wpdb->get_var(
+						$wpdb->prepare(
+							'SELECT language_id FROM %i WHERE group_id = %d AND object_id = %d LIMIT 1',
+							$links_table,
+							(int) $group->id,
+							$term_id
+						)
+					);
+					// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+					if ( $current_lang === null || (int) $current_lang !== (int) $lang->id ) {
+						return false;
+					}
+					// Else: idempotent - already at target language. Fall through.
+				}
+
+				$this->groups->invalidate_group_cache( $group_id );
+
+				return true;
+			};
+
+			if ( 0 === $old_lang || $old_lang === $new_lang ) {
+				return $link();
 			}
 
-			// false: a DB error (a concurrent writer took the slot). 0: the row was deleted meanwhile, or already had
-			// this language (MySQL counts changed rows, not matched), so read it back.
-			if ( $updated === false ) {
+			// The term's URL slug rows follow it (cold class, out of the classmap).
+			require_once __DIR__ . '/TermSlugFollow.php';
+
+			// With URL slug rows, the link and their repair commit together: a lost repair would leave two terms at one address.
+			if ( ( new \PerfLocale\Database\Repository\SlugTranslationRepository( \PerfLocale\Plugin::get_instance()->cache() ) )->has_any_slugs() ) {
+				$moved = TermSlugFollow::move_atomically( $term_id, $old_lang, $lang, $link );
+
+				if ( ! $moved ) {
+					$this->groups->invalidate_group_cache( $group_id );
+				}
+
+				return $moved;
+			}
+
+			if ( ! $link() ) {
 				return false;
 			}
 
-			if ( $updated === 0 ) {
-				// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter
-				$current_lang = $wpdb->get_var(
-					$wpdb->prepare(
-						'SELECT language_id FROM %i WHERE group_id = %d AND object_id = %d LIMIT 1',
-						$links_table,
-						(int) $group->id,
-						$term_id
-					)
-				);
-				// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter
-
-				if ( $current_lang === null || (int) $current_lang !== (int) $lang->id ) {
-					return false;
-				}
-				// Else: idempotent - already at target language. Fall through.
-			}
-
-			$this->groups->invalidate_group_cache( (int) $group->id );
+			TermSlugFollow::moved( $term_id, $old_lang, $lang );
 
 			return true;
 		}
@@ -1208,7 +1234,17 @@ final class TermTranslationManager {
 			TranslationStatus::Published->value
 		);
 
-		return $group_id !== false;
+		if ( false === $group_id ) {
+			return false;
+		}
+
+		// A first language: a DB slug another term of it shows as its URL slug gets "-N" (cold class, out of the classmap).
+		if ( '1' === get_option( 'perflocale_has_any_slugs', '' ) ) {
+			require_once __DIR__ . '/TermSlugFollow.php';
+			TermSlugFollow::moved( $term_id, 0, $lang );
+		}
+
+		return true;
 	}
 
 	/**
@@ -1225,9 +1261,10 @@ final class TermTranslationManager {
 	/**
 	 * Backfill slug translations for all existing term translation groups.
 	 *
-	 * Records each group's default-language base slug for every member. Idempotent: set_slug() upserts.
+	 * Records each group's default-language base slug for every member that has none (insert-only, strict), under the
+	 * import lock taken once, in one transaction.
 	 *
-	 * @return int Number of slug translations created.
+	 * @return int Number of slug translations created; 0 also when an import held the lock (reported as busy).
 	 */
 	public function backfill_slug_translations(): int {
 		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
@@ -1264,8 +1301,7 @@ final class TermTranslationManager {
 
 		$default_lang = $this->languages->get_default();
 		$default_id   = $default_lang ? (int) $default_lang->id : 0;
-		$slug_manager = new \PerfLocale\Router\SlugManager( $this->cache );
-		$count        = 0;
+		$items        = [];
 
 		foreach ( $groups as $members ) {
 			// Find the base slug from the default-language term in this group.
@@ -1311,14 +1347,11 @@ final class TermTranslationManager {
 					continue;
 				}
 
-				// Count only writes that landed: set_slug() returns false on a failure (perflocale/slug/write_failed).
-				if ( $slug_manager->set_slug( 'term', $tax, (int) $m->term_id, (int) $m->language_id, $base_slug ) ) {
-					++$count;
-				}
+				$items[] = [ $tax, (int) $m->term_id, (int) $m->language_id, $base_slug ];
 			}
 		}
 
-		return $count;
+		return SlugTranslationWrites::backfill_term_url_slugs( $items );
 	}
 
 	/**

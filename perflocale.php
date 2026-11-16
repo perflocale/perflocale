@@ -3,9 +3,8 @@
  * Plugin Name: PerfLocale
  * Plugin URI: https://perflocale.com
  * Description: Performance-first multilingual plugin for WordPress. Translate posts, pages, products, taxonomies, strings, and slugs, and keep your site fast.
- * Version: 1.0.7.5
+ * Version: 1.0.8
  * Requires at least: 6.4
- * Tested up to: 7.1
  * Requires PHP: 8.1
  * Author: PerfLocale
  * Author URI: https://perflocale.com/
@@ -25,13 +24,13 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 // ---- Plugin constants ----
 
-define( 'PERFLOCALE_VERSION', '1.0.7.5' );
+define( 'PERFLOCALE_VERSION', '1.0.8' );
 define( 'PERFLOCALE_FILE', __FILE__ );
 define( 'PERFLOCALE_DIR', plugin_dir_path( __FILE__ ) );
 define( 'PERFLOCALE_URL', plugin_dir_url( __FILE__ ) );
 // Schema::create_tables() ships the whole schema. dbDelta cannot reshape an index under an
-// existing name: an index reshape needs a migrate_to_N that drops the old index first.
-define( 'PERFLOCALE_DB_VERSION', 1 );
+// existing name: the upgrade runner replaces it (UpgradeRunner::replace_reshaped_keys()).
+define( 'PERFLOCALE_DB_VERSION', 2 );
 
 // ---- Autoloader ----
 
@@ -60,6 +59,9 @@ spl_autoload_register(
 	}
 );
 
+// An upgrader replacing our folder detaches the code in memory from the other version's files (class loads only then).
+add_filter( 'upgrader_source_selection', [ PerfLocale\Util\OwnFilesReplaced::class, 'on_source_selection' ], PHP_INT_MAX, 4 );
+
 require_once PERFLOCALE_DIR . 'template-tags.php';
 
 // ---- Activation / Deactivation ----
@@ -76,23 +78,9 @@ add_action(
 );
 
 // Multisite: purge a deleted site's data regardless of `delete_data_on_uninstall` (that
-// setting is for reversible plugin uninstall; blog deletion is irreversible).
-add_action(
-	'wp_uninitialize_site',
-	static function ( WP_Site $old_site ): void {
-		switch_to_blog( $old_site->blog_id );
-
-		try {
-			// Single-site teardown: network-global stores (wp_usermeta) stay for the other sites.
-			PerfLocale\Database\SiteCleanup::purge_current_site( true, true );
-		} finally {
-			restore_current_blog();
-		}
-	},
-	// Priority 5: before core's priority-10 table drop, because full_purge() reads add-on
-	// manifests from this blog's options. See docs-ai/11-code-rationale.md, "perflocale.php: site deletion".
-	5
-);
+// setting is for reversible plugin uninstall; blog deletion is irreversible). Priority 5: before core's priority-10
+// table drop, because full_purge() reads add-on manifests from this blog's options.
+add_action( 'wp_uninitialize_site', [ PerfLocale\Database\SiteCleanup::class, 'on_site_deleted' ], 5 );
 
 // ---- Screen option save filters (must register before set_screen_options() in admin.php) ----
 $perflocale_per_page_save = static function ( $status, $option, $value ) {

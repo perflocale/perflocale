@@ -149,13 +149,26 @@ final class XliffImportJob extends AbstractJob {
 		$quota = self::staging_quota();
 		$files = 0;
 		$bytes = strlen( $xml );
+		$names = @scandir( $dir ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- false refuses below.
 
-		foreach ( (array) scandir( $dir ) as $name ) {
-			if ( 1 === preg_match( '/^xliff-[0-9a-f]{32}\.xlf$/', (string) $name ) ) {
+		foreach ( false === $names ? [] : $names as $name ) {
+			if ( 1 === preg_match( '/^xliff-[0-9a-f]{32}\.xlf\z/', $name ) ) {
 				++$files;
-				// phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- A worker may delete the file since scandir(); false counts 0.
-				$bytes += (int) @filesize( $dir . '/' . $name );
+				clearstatcache( true, $dir . '/' . $name );
+				$size = @filesize( $dir . '/' . $name ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- false refuses below, also for a file a worker deleted since scandir().
+
+				if ( false === $size ) {
+					$names = false;
+					break;
+				}
+
+				$bytes += $size;
 			}
+		}
+
+		// A failed read never counts as room.
+		if ( false === $names ) {
+			throw new \RuntimeException( esc_html__( 'XLIFF import refused: the server could not read its folder of XLIFF files waiting to be imported. Send the file again in a moment.', 'perflocale' ), 503 );
 		}
 
 		if ( $files >= $quota['files'] || $bytes > $quota['bytes'] ) {
@@ -170,8 +183,9 @@ final class XliffImportJob extends AbstractJob {
 			);
 		}
 
-		$key  = wp_generate_password( 32, false );
-		$path = $dir . '/' . self::file_name( $key );
+		$token = bin2hex( random_bytes( 16 ) );
+		$key   = self::key_of( $token );
+		$path  = $dir . '/xliff-' . $token . '.xlf';
 
 		// phpcs:disable WordPress.WP.AlternativeFunctions.file_system_operations_fopen, WordPress.WP.AlternativeFunctions.file_system_operations_fwrite, WordPress.WP.AlternativeFunctions.file_system_operations_fclose, WordPress.PHP.NoSilencedErrors.Discouraged -- 'x' never opens an existing file; WP_Filesystem has no exclusive create. Failures are handled.
 		$handle  = @fopen( $path, 'xb' );
@@ -247,7 +261,7 @@ final class XliffImportJob extends AbstractJob {
 
 		// A failed read keeps it: a live import's file is never deleted on a guess.
 		if ( null === $live || isset( $live[ $key ] ) ) {
-			if ( '' !== self::path_of( $key ) ) {
+			if ( '' !== ( self::path_of( $key ) ?? 'unread' ) ) {
 				self::arm_cleanup( $key );
 			}
 
@@ -270,10 +284,16 @@ final class XliffImportJob extends AbstractJob {
 			return null;
 		}
 
-		$names = [];
+		$dir    = self::temp_dir();
+		$by_key = '' === $dir ? [] : self::names_by_key( $dir );
+		$names  = [];
+
+		if ( null === $by_key ) {
+			return null;
+		}
 
 		foreach ( array_keys( $live ) as $key ) {
-			$names[ self::file_name( (string) $key ) ] = true;
+			$names[ $by_key[ $key ] ?? self::legacy_name( (string) $key ) ] = true;
 		}
 
 		return $names;
@@ -324,14 +344,59 @@ final class XliffImportJob extends AbstractJob {
 	}
 
 	/**
-	 * The staged file's name: derived from the key with a site secret, so no job arg or event names it (where
-	 * .htaccess is ignored, the unguessable name is what keeps the file from HTTP).
+	 * The key of a staged file's random name token: a one-way hash, so the job row and the cleanup event, which hold
+	 * the key, never name the file (where .htaccess is ignored, the unguessable name keeps it from HTTP).
 	 *
-	 * @param string $key Key from stage().
+	 * @param string $token The 32 hex characters of the file name.
 	 * @return string
 	 */
-	private static function file_name( string $key ): string {
+	private static function key_of( string $token ): string {
+		return substr( hash( 'sha256', 'perflocale-xliff-key|' . $token ), 0, 32 );
+	}
+
+	/**
+	 * The staged files of a folder by key; a key with no file here has none. Null when the folder could not be read.
+	 *
+	 * @param string $dir Temp folder.
+	 * @return array<string, string>|null key => file name.
+	 */
+	private static function names_by_key( string $dir ): ?array {
+		$out   = [];
+		$names = @scandir( $dir ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- false is returned as null.
+
+		if ( false === $names ) {
+			return null;
+		}
+
+		foreach ( $names as $name ) {
+			if ( 1 === preg_match( '/^xliff-([0-9a-f]{32})\.xlf\z/', $name, $m ) ) {
+				$out[ self::key_of( $m[1] ) ] = (string) $name;
+			}
+		}
+
+		return $out;
+	}
+
+	/**
+	 * The name of a file staged before 1.0.8 (an HMAC of the key with the auth salt): found while its salts last.
+	 *
+	 * @param string $key The job's `file` arg.
+	 * @return string
+	 */
+	private static function legacy_name( string $key ): string {
 		return 'xliff-' . substr( hash_hmac( 'sha256', $key, wp_salt( 'auth' ) ), 0, 32 ) . '.xlf';
+	}
+
+	/**
+	 * The resolved temp folder, or '' when there is none.
+	 *
+	 * @return string
+	 */
+	private static function temp_dir(): string {
+		$temp = Helper::uploads_temp_dir();
+		$dir  = '' === $temp ? false : realpath( $temp );
+
+		return false === $dir ? '' : $dir;
 	}
 
 	/**
@@ -343,7 +408,8 @@ final class XliffImportJob extends AbstractJob {
 	public static function discard( string $key ): void {
 		$path = self::path_of( $key );
 
-		if ( '' === $path ) {
+		// Null (the folder could not be read) keeps the file and its cleanup event.
+		if ( null === $path || '' === $path ) {
 			return;
 		}
 
@@ -366,6 +432,10 @@ final class XliffImportJob extends AbstractJob {
 		$path  = self::path_of( $key );
 		$slice = is_array( $args['__perflocale_slice'] ?? null ) ? $args['__perflocale_slice'] : null;
 		$from  = null !== $slice && is_array( $slice['resume'] ?? null ) ? \PerfLocale\Background\JobResume::keyed( $slice['resume'] ) : [];
+
+		if ( null === $path ) {
+			return self::refused( $from, __( 'The server could not read its folder of XLIFF files waiting to be imported, so nothing more was imported. Retry this job in a moment.', 'perflocale' ) );
+		}
 
 		if ( '' === $path ) {
 			return self::refused( $from, __( 'The XLIFF file of this import is no longer on the server, so nothing more was imported. Import the file again.', 'perflocale' ) );
@@ -481,25 +551,25 @@ final class XliffImportJob extends AbstractJob {
 
 	/**
 	 * The staged file of a key, or '' when the value is not a key or no plain file has its name (job args are replayed
-	 * from the database).
+	 * from the database); null when the folder could not be read.
 	 *
 	 * @param string $key The job's `file` arg.
-	 * @return string
+	 * @return string|null
 	 */
-	private static function path_of( string $key ): string {
-		$temp = Helper::uploads_temp_dir();
+	private static function path_of( string $key ): ?string {
+		$dir = self::is_key( $key ) ? self::temp_dir() : '';
 
-		if ( '' === $temp || ! self::is_key( $key ) ) {
+		if ( '' === $dir ) {
 			return '';
 		}
 
-		$dir = realpath( $temp );
+		$by_key = self::names_by_key( $dir );
 
-		if ( false === $dir ) {
-			return '';
+		if ( null === $by_key ) {
+			return null;
 		}
 
-		$path = $dir . DIRECTORY_SEPARATOR . self::file_name( $key );
+		$path = $dir . DIRECTORY_SEPARATOR . ( $by_key[ $key ] ?? self::legacy_name( $key ) );
 
 		return is_file( $path ) && ! is_link( $path ) ? $path : '';
 	}

@@ -156,10 +156,18 @@ final class BulkTools {
 		$details = [];
 		// Whether MT produced any title: a configured provider may be skipped or fail.
 		$mt_used = false;
-
-		global $wpdb;
+		$mt_gate = null;
+		// Pairs refused by the object checks; manage_options is not an edit right on each page.
+		$skipped_permission = 0;
 
 		foreach ( $page_ids as $key => $page_id ) {
+			// Its title is copied or sent to MT, also into an existing translation: edit and read on it.
+			if ( ! Helper::user_can_copy_translation_source( \PerfLocale\Util\Scalar::int( $page_id ) ) ) {
+				$skipped_permission += count( $languages ) - 1;
+				$details[]           = ucfirst( $key ) . ': ' . __( 'skipped, you need read and edit rights on this page', 'perflocale' );
+				continue;
+			}
+
 			// Ensure the source page has a language assigned.
 			if ( ! $manager->detect_post_language( $page_id ) && ! $manager->set_post_language( $page_id, $default->slug ) ) {
 				// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic at a silent-failure point; the page-creation batch continues with remaining pages.
@@ -186,6 +194,15 @@ final class BulkTools {
 
 				$label = ucfirst( $key ) . ' → ' . $lang->slug;
 
+				// The copy checks of every other create path (0: a translation exists, nothing is copied).
+				$copy_from = $manager->get_copy_source_id( \PerfLocale\Util\Scalar::int( $page_id ), \PerfLocale\Util\Scalar::str( \PerfLocale\Util\Scalar::prop( $lang, 'slug' ) ) );
+
+				if ( $copy_from > 0 && ( ! Helper::user_can_copy_translation_source( $copy_from ) || ! Helper::user_can_create_like( $copy_from ) ) ) {
+					++$skipped_permission;
+					$details[] = $label . ': ' . __( 'skipped, no permission', 'perflocale' );
+					continue;
+				}
+
 				// MT-tagged when a provider was resolved above; otherwise Manual.
 				$link_source = $mt_provider !== null
 					? \PerfLocale\Enum\SourceType::MachineTranslation
@@ -198,6 +215,13 @@ final class BulkTools {
 					continue;
 				}
 
+				// A translation this call did not insert gets a title write below: its own edit right, named to no one else.
+				if ( ! $inserted && ! Helper::user_can_edit_object( (int) $new_id ) ) {
+					++$skipped_permission;
+					$details[] = $label . ': ' . __( 'skipped, no permission', 'perflocale' );
+					continue;
+				}
+
 				$new_post = get_post( $new_id );
 
 				if ( ! $new_post ) {
@@ -205,29 +229,22 @@ final class BulkTools {
 					continue;
 				}
 
-				// Title: local translations first, then MT; defaults to the source title so the UPDATE
-				// below never writes an empty string.
 				$original_title   = $source_post->post_title;
-				$translated_title = $original_title;
+				$translated_title = $new_post->post_title;
 
-				// Resolve a title (maybe a paid MT call) only when the row still needs one:
-				// create_translation() is idempotent, so a re-run reaches finished pages too.
-				$needs_title = (
-					$new_post->post_status !== 'publish'
-					|| $new_post->post_name !== $source_post->post_name
-					|| $new_post->post_title === $original_title
-					|| trim( $new_post->post_title ) === ''
-				);
-
+				// A translation that existed before keeps its slug, status and title; only an empty title is filled.
+				// Local translations first, then MT (maybe a paid call).
+				$needs_title        = $inserted || trim( $new_post->post_title ) === '';
 				$mt_translated_this = false;
 
 				if ( $needs_title ) {
 					$local_translation = self::find_local_translation( $original_title, $lang->locale );
 					$title_hash        = md5( $original_title );
+					$translated_title  = $original_title;
 
 					if ( $local_translation !== '' ) {
 						$translated_title = $local_translation;
-					} elseif ( $mt_service !== null && get_post_meta( $new_id, self::WC_PAGE_MT_ATTEMPT_META, true ) !== $title_hash ) {
+					} elseif ( $mt_service !== null && get_post_meta( $new_id, self::WC_PAGE_MT_ATTEMPT_META, true ) !== $title_hash && self::mt_admitted( $mt_gate ) ) {
 						// A title the provider already answered for is not sent again (an unchanged
 						// "Checkout" would be billed on every run).
 						try {
@@ -244,49 +261,51 @@ final class BulkTools {
 							$translated_title = $original_title;
 						}
 					}
-				} else {
-					// An existing translated title wins on re-runs.
-					$translated_title = $new_post->post_title;
 				}
 
-				// Matching slug and translated title; a translation that existed before keeps its status.
-				$target_status = $inserted && $may_publish ? 'publish' : $new_post->post_status;
-				$needs_update  = (
-					$new_post->post_status !== $target_status
-					|| $new_post->post_name !== $source_post->post_name
-					|| $new_post->post_title !== $translated_title
-				);
+				$update = $translated_title !== $new_post->post_title ? [ 'post_title' => $translated_title ] : [];
 
-				// The MT note reflects titles actually written, not discarded provider answers.
-				if ( $needs_update && $mt_translated_this ) {
-					$mt_used = true;
+				// Published as its source is, through wp_update_post(): WordPress keeps the slug unique in its language.
+				if ( $inserted && $may_publish && 'publish' !== $new_post->post_status ) {
+					$update['post_status'] = 'publish';
 				}
 
-				if ( $needs_update ) {
-					// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-					$wpdb->update(
-						$wpdb->posts,
-						[
-							'post_title'  => $translated_title,
-							'post_name'   => $source_post->post_name,
-							'post_status' => $target_status,
-						],
-						[ 'ID' => $new_id ],
-						[ '%s', '%s', '%s' ],
-						[ '%d' ]
-					);
-					clean_post_cache( $new_id );
+				if ( $update !== [] ) {
+					// A title update keeps a published page's slug (a same-language draft holding it would rename it).
+					require_once __DIR__ . '/../MachineTranslation/SlugPin.php';
+					$unpin = \PerfLocale\MachineTranslation\SlugPin::keep( (int) $new_id );
+
+					try {
+						$saved = wp_update_post( wp_slash( [ 'ID' => $new_id ] + $update ), true );
+					} finally {
+						$unpin();
+					}
+
+					if ( is_wp_error( $saved ) ) {
+						$details[] = $label . ': failed (ID ' . $new_id . ')';
+						continue;
+					}
+
+					// The MT note reflects titles actually written, not discarded provider answers.
+					if ( $mt_translated_this ) {
+						$mt_used = true;
+					}
+				}
+
+				$state = self::status_label( (string) get_post_status( $new_id ) );
+
+				if ( $inserted ) {
 					++$created;
-					$details[] = $label . ': created (ID ' . $new_id . ')';
+					$details[] = $label . ': created, ' . $state . ' (ID ' . $new_id . ')';
 				} else {
 					++$skipped;
-					$details[] = $label . ': exists (ID ' . $new_id . ')';
+					$details[] = $label . ': exists, ' . $state . ( isset( $update['post_title'] ) ? ', title filled' : '' ) . ' (ID ' . $new_id . ')';
 				}
 			}
 		}
 
 		if ( $created > 0 ) {
-			update_option( 'perflocale_flush_rules', '1', false );
+			update_option( 'perflocale_flush_rules', 1, true );
 		}
 
 		$message = sprintf(
@@ -300,14 +319,78 @@ final class BulkTools {
 			$message .= ' ' . __( 'Titles were machine-translated.', 'perflocale' );
 		}
 
+		$message .= null === $mt_gate || '' === $mt_gate ? '' : ' ' . $mt_gate;
+
+		$message .= self::permission_note( $skipped_permission );
+
 		wp_send_json_success(
 			[
-				'message' => $message,
-				'created' => $created,
-				'skipped' => $skipped,
-				'details' => $details,
+				'message'            => $message,
+				'created'            => $created,
+				'skipped'            => $skipped,
+				'skipped_permission' => $skipped_permission,
+				'details'            => $details,
 			]
 		);
+	}
+
+	/**
+	 * Whether this request may call the provider: perflocale_use_mt, then one hourly-limit admission (it counts, so asked
+	 * only before the first call). $gate: null until asked, then '' (admitted) or the refusal for the result message.
+	 *
+	 * @param string|null $gate Memo of the answer.
+	 * @param-out string $gate
+	 * @return bool
+	 */
+	private static function mt_admitted( ?string &$gate ): bool {
+		if ( null === $gate ) {
+			$limited = current_user_can( 'perflocale_use_mt' ) ? \PerfLocale\Translation\MtRateLimiter::admit( get_current_user_id() ) : false;
+
+			if ( false === $limited ) {
+				$gate = __( 'Machine translation was skipped: you do not have permission to use it.', 'perflocale' );
+			} else {
+				$gate = $limited instanceof \WP_Error ? $limited->get_error_message() : '';
+			}
+		}
+
+		return '' === $gate;
+	}
+
+	/**
+	 * The bulk tools' note on pairs refused by the object checks, with a leading space; '' for none.
+	 *
+	 * @param int $count Refused pairs.
+	 * @return string
+	 */
+	private static function permission_note( int $count ): string {
+		if ( $count <= 0 ) {
+			return '';
+		}
+
+		return ' ' . sprintf(
+			/* translators: %d: number of translations not created. */
+			_n(
+				'%d translation was not created: you need read and edit rights on the original, or the right to create content of its type.',
+				'%d translations were not created: you need read and edit rights on the original, or the right to create content of its type.',
+				$count,
+				'perflocale'
+			),
+			$count
+		);
+	}
+
+	/**
+	 * A post status as the WooCommerce pages tool's detail lines name it.
+	 *
+	 * @param string $status Post status.
+	 * @return string
+	 */
+	private static function status_label( string $status ): string {
+		return match ( $status ) {
+			'publish' => 'published',
+			'trash'   => 'in Trash',
+			default   => $status,
+		};
 	}
 
 	/**
@@ -506,6 +589,9 @@ final class BulkTools {
 		$skipped          = 0;
 		$taxonomy_details = [];
 		$mt_used          = false;
+		$mt_gate          = null;
+		// Pairs refused by the object checks.
+		$skipped_permission = 0;
 
 		// Local translations per locale (locale to original to translated), to avoid repeated
 		// switch_to_locale() calls.
@@ -562,6 +648,22 @@ final class BulkTools {
 
 				// Only create translations for default-language terms or unassigned terms.
 				if ( $lang_slug !== null && $lang_slug !== $default->slug ) {
+					continue;
+				}
+
+				// manage_options is not an edit right on each term. A default-language term is its own copy source.
+				if ( ! current_user_can( 'edit_term', $tid ) || ! Helper::user_can_create_term_like( $tid ) ) {
+					$known = $group_lang_map[ \PerfLocale\Util\Scalar::int( $term_group_map[ $tid ] ?? 0 ) ] ?? [];
+					$def   = \PerfLocale\Util\Scalar::str( \PerfLocale\Util\Scalar::prop( $default, 'slug' ) );
+
+					foreach ( $languages as $lang ) {
+						$slug = \PerfLocale\Util\Scalar::str( \PerfLocale\Util\Scalar::prop( $lang, 'slug' ) );
+
+						if ( $slug !== $def && ! isset( $known[ $slug ] ) ) {
+							++$skipped_permission;
+						}
+					}
+
 					continue;
 				}
 
@@ -706,10 +808,16 @@ final class BulkTools {
 		if ( $mt_service !== null && ! empty( $mt_pending ) ) {
 			foreach ( $mt_pending as $lang_slug => $by_taxonomy ) {
 				foreach ( $by_taxonomy as $taxonomy => $pending_terms ) {
-					$source_names = array_values( array_unique( array_map( 'strval', $pending_terms ) ) );
+					// A name without a letter keeps its source, unsent.
+					$source_names = array_values( array_filter( array_unique( array_map( 'strval', $pending_terms ) ), static fn( string $name ): bool => TranslationService::sends_item( $name, 'term_name', (string) $lang_slug ) ) );
 					$name_map     = [];
 
 					foreach ( array_chunk( $source_names, 50 ) as $chunk ) {
+						// Refused: no name is sent in this request, every term keeps its source name.
+						if ( ! self::mt_admitted( $mt_gate ) ) {
+							break 3;
+						}
+
 						// Each chunk is checked against the monthly limit; a refused one keeps its source names.
 						try {
 							$translated_chunk = $mt_service->translate_batch_texts(
@@ -774,19 +882,24 @@ final class BulkTools {
 			$message .= ' ' . __( 'Term names were machine-translated.', 'perflocale' );
 		}
 
+		$message .= null === $mt_gate || '' === $mt_gate ? '' : ' ' . $mt_gate;
+
+		$message .= self::permission_note( $skipped_permission );
+
 		// Release before the response: wp_send_json_success() dies.
 		Lock::release( $lock_name );
 
 		wp_send_json_success(
 			[
-				'message'          => $message,
-				'created'          => $created,
-				'skipped'          => $skipped,
-				'taxonomy_details' => $taxonomy_details,
+				'message'            => $message,
+				'created'            => $created,
+				'skipped'            => $skipped,
+				'skipped_permission' => $skipped_permission,
+				'taxonomy_details'   => $taxonomy_details,
 				// The caller sends these back, so the next run resumes here.
-				'more'             => $more,
-				'tax_index'        => $next_index,
-				'term_offset'      => $next_offset,
+				'more'               => $more,
+				'tax_index'          => $next_index,
+				'term_offset'        => $next_offset,
 			]
 		);
 	}
@@ -1062,18 +1175,7 @@ final class BulkTools {
 				$failed
 			);
 
-		if ( $skipped_permission > 0 ) {
-			$message .= ' ' . sprintf(
-				/* translators: %d: number of translations not created. */
-				_n(
-					'%d translation was not created because you cannot edit the original or create content of its type.',
-					'%d translations were not created because you cannot edit the original or create content of its type.',
-					$skipped_permission,
-					'perflocale'
-				),
-				$skipped_permission
-			);
-		}
+		$message .= self::permission_note( $skipped_permission );
 
 		Lock::release( $lock_name );
 
@@ -1172,47 +1274,74 @@ final class BulkTools {
 
 		/** @hook perflocale/assign_languages/budget_seconds Wall-clock budget for one assign run. */
 		$budget_seconds = (float) apply_filters( 'perflocale/assign_languages/budget_seconds', 15.0 );
-		/** @hook perflocale/assign_languages/batch_size Rows fetched per post type per run. */
+		/** @hook perflocale/assign_languages/batch_size Rows fetched per query. */
 		$batch_size     = max( 1, (int) apply_filters( 'perflocale/assign_languages/batch_size', 500 ) );
 
-		foreach ( $types as $post_type ) {
-			// Posts with no valid post-group link. NOT EXISTS, not a LEFT JOIN: a post with one good
-			// and one orphan link would otherwise count as unlinked and never settle.
-			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Table names from Schema::table(), post_type sanitized.
-			$ids = $wpdb->get_col(
-				$wpdb->prepare(
-					"SELECT p.ID FROM {$wpdb->posts} p
-					WHERE p.post_status IN ('publish','draft','pending','private','future')
-					  AND p.post_type = %s
-					  AND NOT EXISTS (
-					    SELECT 1 FROM %i l
-					    INNER JOIN %i g ON g.id = l.group_id AND g.type = 'post'
-					    WHERE l.object_id = p.ID
-					  )
-					ORDER BY p.ID ASC
-					LIMIT %d",
-					$post_type,
-					$links_table,
-					$groups_table,
-					$batch_size
-				)
-			);
-			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
+		// Posts the user may not edit stay unlinked and are counted; the cursor (type, last post ID) walks past them, so
+		// the caller's next call resumes after them.
+		$denied = 0;
+		// phpcs:ignore WordPress.Security.NonceVerification.Missing -- verified above.
+		$type_index = isset( $_POST['type_index'] ) && is_numeric( $_POST['type_index'] ) ? max( 0, (int) $_POST['type_index'] ) : 0;
+		// phpcs:ignore WordPress.Security.NonceVerification.Missing -- verified above.
+		$after_id   = isset( $_POST['after_id'] ) && is_numeric( $_POST['after_id'] ) ? max( 0, (int) $_POST['after_id'] ) : 0;
+		$next_index = 0;
+		$next_after = 0;
+
+		foreach ( $types as $ti => $post_type ) {
+			if ( $ti < $type_index ) {
+				continue;
+			}
 
 			$assigned = 0;
+			$after    = $ti === $type_index ? $after_id : 0;
 
-			foreach ( $ids as $post_id ) {
-				if ( $manager->set_post_language( (int) $post_id, $default->slug ) ) {
-					++$assigned;
+			do {
+				// Posts with no valid post-group link. NOT EXISTS, not a LEFT JOIN: a post with one good
+				// and one orphan link would otherwise count as unlinked and never settle.
+				// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Table names from Schema::table(), post_type sanitized.
+				$ids = $wpdb->get_col(
+					$wpdb->prepare(
+						"SELECT p.ID FROM {$wpdb->posts} p
+						WHERE p.post_status IN ('publish','draft','pending','private','future')
+						  AND p.post_type = %s
+						  AND p.ID > %d
+						  AND NOT EXISTS (
+						    SELECT 1 FROM %i l
+						    INNER JOIN %i g ON g.id = l.group_id AND g.type = 'post'
+						    WHERE l.object_id = p.ID
+						  )
+						ORDER BY p.ID ASC
+						LIMIT %d",
+						$post_type,
+						$after,
+						$links_table,
+						$groups_table,
+						$batch_size
+					)
+				);
+				// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+				foreach ( $ids as $post_id ) {
+					$post_id = (int) $post_id;
+					$after   = $post_id;
+
+					// manage_options is not an edit right on each post.
+					if ( ! Helper::user_can_edit_object( $post_id ) ) {
+						++$denied;
+					} elseif ( $manager->set_post_language( $post_id, $default->slug ) ) {
+						++$assigned;
+					}
+
+					// Bounded: stop on a clock or memory pressure (bulk_memory_pressure()) and report what
+					// is left, or a large site gets a gateway 504 while PHP keeps writing. The caller resumes.
+					if ( ( microtime( true ) - $started_at ) >= $budget_seconds || self::bulk_memory_pressure() ) {
+						$hit_budget = true;
+						break 2;
+					}
 				}
 
-				// Bounded: stop on a clock or memory pressure (bulk_memory_pressure()) and report what
-				// is left, or a large site gets a gateway 504 while PHP keeps writing. The caller resumes.
-				if ( ( microtime( true ) - $started_at ) >= $budget_seconds || self::bulk_memory_pressure() ) {
-					$hit_budget = true;
-					break;
-				}
-			}
+				$full_page = is_array( $ids ) && count( $ids ) >= $batch_size;
+			} while ( $full_page );
 
 			$per_type[] = [
 				'post_type' => $post_type,
@@ -1222,31 +1351,41 @@ final class BulkTools {
 			$total_assigned += $assigned;
 
 			if ( $hit_budget ) {
+				$next_index = $ti;
+				$next_after = $after;
 				break;
 			}
 		}
 
-		// What is still unassigned across every type: this makes the run resumable.
+		// Left after the cursor; 0 when the walk finished (every unlinked post was visited).
 		$remaining = 0;
 
-		foreach ( $types as $post_type ) {
-			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
-			$remaining += (int) $wpdb->get_var(
-				$wpdb->prepare(
-					"SELECT COUNT(*) FROM {$wpdb->posts} p
-					WHERE p.post_status IN ('publish','draft','pending','private','future')
-					  AND p.post_type = %s
-					  AND NOT EXISTS (
-					    SELECT 1 FROM %i l
-					    INNER JOIN %i g ON g.id = l.group_id AND g.type = 'post'
-					    WHERE l.object_id = p.ID
-					  )",
-					$post_type,
-					$links_table,
-					$groups_table
-				)
-			);
-			// phpcs:enable
+		if ( $hit_budget ) {
+			foreach ( $types as $ti => $post_type ) {
+				if ( $ti < $next_index ) {
+					continue;
+				}
+
+				// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
+				$remaining += (int) $wpdb->get_var(
+					$wpdb->prepare(
+						"SELECT COUNT(*) FROM {$wpdb->posts} p
+						WHERE p.post_status IN ('publish','draft','pending','private','future')
+						  AND p.post_type = %s
+						  AND p.ID > %d
+						  AND NOT EXISTS (
+						    SELECT 1 FROM %i l
+						    INNER JOIN %i g ON g.id = l.group_id AND g.type = 'post'
+						    WHERE l.object_id = p.ID
+						  )",
+						$post_type,
+						$ti === $next_index ? $next_after : 0,
+						$links_table,
+						$groups_table
+					)
+				);
+				// phpcs:enable
+			}
 		}
 
 		$message = $remaining > 0
@@ -1264,12 +1403,24 @@ final class BulkTools {
 				Helper::format_locale_as_bcp47( (string) $default->slug )
 			);
 
+		if ( $denied > 0 ) {
+			$message .= ' ' . sprintf(
+				/* translators: %d: number of posts left without a language. */
+				_n( '%d item was not assigned because you cannot edit it.', '%d items were not assigned because you cannot edit them.', $denied, 'perflocale' ),
+				$denied
+			);
+		}
+
 		wp_send_json_success(
 			[
-				'message'           => $message,
-				'assigned'          => $total_assigned,
-				'post_type_details' => $per_type,
-				'remaining'         => $remaining,
+				'message'            => $message,
+				'assigned'           => $total_assigned,
+				'skipped_permission' => $denied,
+				'post_type_details'  => $per_type,
+				'remaining'          => $remaining,
+				// The caller sends these back, so the next call resumes here.
+				'type_index'         => $next_index,
+				'after_id'           => $next_after,
 			]
 		);
 	}

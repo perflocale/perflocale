@@ -147,6 +147,6 @@ final class StringGroupRepairJob extends AbstractJob {
 		$queued = Dispatcher::enqueue( new self(), [] );
 
 		// Not queued (a veto filter, a refused dispatch): no job id, and the next admin request tries again.
-		OneTimeDispatch::publish( self::OPTION, $claim, isset( $queued['job_id'] ) && is_string( $queued['job_id'] ) ? $queued['job_id'] : '' );
+		OneTimeDispatch::publish( self::OPTION, $claim, $queued['job_id'] ?? '' );
 	}
 }

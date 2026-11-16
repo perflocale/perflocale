@@ -523,8 +523,8 @@ final class TranslatePressImporter {
 	}
 
 	/**
-	 * Log a database error's text when WP_DEBUG_LOG is on: it can carry prefixed table names and values, so results and
-	 * job rows (shown to all Jobs users) only say a database error happened.
+	 * Log a database error when WP_DEBUG_LOG is on: what was running and a fixed code, never the database's text, which
+	 * can carry prefixed table names and values; results and job rows only say a database error happened.
 	 *
 	 * @param string $where What was running, for the log line.
 	 * @param string $error The database error.
@@ -536,7 +536,7 @@ final class TranslatePressImporter {
 		}
 
 		// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic, only when WP_DEBUG_LOG is on.
-		error_log( '[PerfLocale] TranslatePress import: database error while ' . $where . ' - ' . $error );
+		error_log( '[PerfLocale] TranslatePress import: database error while ' . $where . ' - code ' . \PerfLocale\Util\DbErrorCode::of( $error ) );
 	}
 
 	/**
@@ -1699,6 +1699,12 @@ final class TranslatePressImporter {
 					// An existing string, with its group's type.
 					$existing = $this->find_string( $domain, $context, $original );
 
+					// A failed read or identity move is this row's failure, never an insert of a second row for the tuple.
+					if ( false === $existing ) {
+						$this->write_failed( $this->wpdb->last_error, $this->string_item( $original, (int) $pl_lang_id ) );
+						continue;
+					}
+
 					if ( ! $existing ) {
 						// StringRepository::insert() computes the hash.
 						$string_id = $this->strings->insert(
@@ -1790,7 +1796,7 @@ final class TranslatePressImporter {
 			foreach ( $extra_forms as $key => $forms ) {
 				[ $domain, $context, $original ] = explode( "\0", (string) $key, 3 );
 
-				$plural_row = $this->strings->find_by_hash( $domain, $context, $original );
+				$plural_row = \PerfLocale\Strings\StrIdentMigration::find_or_rehash( $this->strings, $domain, $context, $original );
 
 				// Forms 2..N only complete a plural row that has form 1, and never replace forms already there.
 				if ( $plural_row === null
@@ -1835,9 +1841,14 @@ final class TranslatePressImporter {
 	 * @param string $domain   Text domain.
 	 * @param string $context  Context.
 	 * @param string $original Original text.
-	 * @return object|null The strings row plus group_type.
+	 * @return object|null|false The strings row plus group_type; null when there is none; false when the read or the move failed.
 	 */
-	private function find_string( string $domain, string $context, string $original ): ?object {
+	private function find_string( string $domain, string $context, string $original ): object|null|false {
+		// An other-form row of the tuple moves to its new hash first; after a failed move the read could miss it.
+		if ( ! \PerfLocale\Strings\StrIdentMigration::adopt( [ StringRepository::compute_hash( $domain, $context, $original ) => compact( 'domain', 'context', 'original' ) ] ) ) {
+			return false;
+		}
+
 		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Identifiers are bound with %i; an import reads each string once.
 		$row = $this->wpdb->get_row(
 			$this->wpdb->prepare(
@@ -1848,6 +1859,15 @@ final class TranslatePressImporter {
 			)
 		);
 		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+		if ( '' !== $this->read_error() ) {
+			return false;
+		}
+
+		// Another tuple's row under its own form (a kept twin pair) holds the hash: refused, never written onto.
+		if ( is_object( $row ) && StringRepository::foreign( $row, StringRepository::compute_hash( $domain, $context, $original ) ) ) {
+			return false;
+		}
 
 		return is_object( $row ) ? $row : null;
 	}

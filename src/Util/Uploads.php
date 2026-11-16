@@ -98,7 +98,7 @@ final class Uploads {
 	/**
 	 * Daily backstop sweep of old temp and export files whose own delete event never ran.
 	 *
-	 * Never deletes the directory's hardening files, nor the file of a queued or running XLIFF import.
+	 * Never deletes the directory's hardening files, nor the file of a queued or running XLIFF or data import.
 	 *
 	 * @param int $max_age_days Files older than this (default: 7) are removed.
 	 * @return int Number of files deleted.
@@ -109,6 +109,8 @@ final class Uploads {
 		$skip    = [ '.htaccess', 'index.php', 'web.config' ];
 		$removed = 0;
 		$live    = null;
+		$temp    = $dirs[0];
+		$staged  = [];
 
 		foreach ( $dirs as $dir ) {
 			if ( $dir === '' || ! is_dir( $dir ) ) {
@@ -138,12 +140,20 @@ final class Uploads {
 					if ( $live === false || isset( $live[ $entry ] ) ) {
 						continue;
 					}
+				} elseif ( $dir === $temp ) {
+					// A data import's job may name it: decided under the import lock below.
+					$staged[] = $path;
+					continue;
 				}
 				if ( wp_delete_file( $path ) || ! file_exists( $path ) ) {
 					++$removed;
 				}
 			}
 			closedir( $dh );
+		}
+
+		if ( [] !== $staged ) {
+			$removed += \PerfLocale\Background\Jobs\DataImportJob::sweep_stale( $staged );
 		}
 
 		return $removed;

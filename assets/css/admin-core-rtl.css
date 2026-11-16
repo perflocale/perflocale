@@ -1145,6 +1145,35 @@ a.perflocale-status-badge--pending:focus      { background: #f8e9b8; }
 a.perflocale-status-badge--needs-update:hover,
 a.perflocale-status-badge--needs-update:focus { background: #f8d4d4; }
 
+.perflocale-status-badge--update-waiting { background: #fcf3d9; color: #7a5b00; }
+
+a.perflocale-status-badge--update-waiting:hover,
+a.perflocale-status-badge--update-waiting:focus { background: #f8e9b8; }
+
+/* Per-translation "Review update" screen. */
+.perflocale-review .notice.inline { margin: 12px 0; }
+
+.perflocale-review__summary { font-size: 14px; }
+
+.perflocale-review__flags { list-style: disc; margin: 0 20px 16px 0; }
+
+.perflocale-review__parts td { vertical-align: top; white-space: pre-wrap; word-break: break-word; }
+
+.perflocale-review table.diff { margin: 0 0 16px; }
+
+/* Each diff line takes its direction from its own text, so block comments read LTR on RTL screens. */
+.perflocale-review table.diff td, .perflocale-review__plain pre { unicode-bidi: plaintext; }
+
+.perflocale-review__plain { margin: 0 0 16px; table-layout: fixed; }
+
+.perflocale-review__plain td { vertical-align: top; width: 50%; }
+
+.perflocale-review__plain pre { margin: 0; max-height: 40em; overflow: auto; white-space: pre-wrap; word-break: break-word; }
+
+.perflocale-review__actions { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin: 16px 0 20px; }
+
+.perflocale-review__form { display: inline-block; }
+
 /* Empty-state row of the admin list tables (Translations). */
 .perflocale-empty-row {
 	text-align: right;
@@ -1272,18 +1301,100 @@ a.perflocale-status-badge--needs-update:focus { background: #f8d4d4; }
 	margin: 16px 0 24px;
 }
 
-/* The strip is a flex row (inline style on the <nav>), and a flex row does not
- * wrap by default -- so between 783px, where the mobile <select> above stops
- * standing in for it, and roughly 1000px, the eight sections simply ran off the
- * page: 226px of horizontal scroll on an 820px tablet. Wrapping to a second row
- * is what the shared .perflocale-nav-tabs strip already does at these widths. */
+/* Settings tab strip: sticky under the admin bar. Without settings-tabs.js the tabs wrap to a second row; with it,
+ * settings-tabs.js keeps one row and moves the tabs that do not fit into "More". */
+.perflocale-settings .perflocale-settings-tabs {
+	position: sticky;
+	top: 32px;
+	z-index: 10;
+	display: flex;
+	align-items: flex-end;
+	background: #f0f0f1;
+}
+
 .perflocale-settings .nav-tab-wrapper .perflocale-settings-tabs__items {
+	display: flex;
+	flex: 1 1 auto;
 	flex-wrap: wrap;
+	align-items: flex-end;
+	min-width: 0;
+}
+
+/* One row once settings-tabs.js has built the "More" menu; clipped only until it has measured the tabs. */
+.perflocale-settings .nav-tab-wrapper.perflocale-settings-tabs.has-more-menu .perflocale-settings-tabs__items {
+	flex-wrap: nowrap;
+}
+
+.perflocale-settings .perflocale-settings-tabs.has-more-menu:not(.is-ready) .perflocale-settings-tabs__items {
+	overflow: hidden;
+}
+
+.perflocale-settings .nav-tab-wrapper .perflocale-help-tab {
+	flex-shrink: 0;
+	margin-inline-start: auto;
+	margin-inline-end: 0;
+}
+
+.perflocale-settings .perflocale-settings-tabs__more {
+	position: relative;
+	flex-shrink: 0;
+}
+
+.perflocale-settings .nav-tab-wrapper .perflocale-settings-tabs__more-button {
+	display: inline-flex;
+	align-items: center;
+	gap: 2px;
+	font-family: inherit;
+	cursor: pointer;
+}
+
+.perflocale-settings .perflocale-settings-tabs__more-button .dashicons {
+	width: 16px;
+	height: 16px;
+	font-size: 16px;
+}
+
+.perflocale-settings .nav-tab-wrapper .perflocale-settings-tabs__more-button[aria-expanded="true"] {
+	color: #1d2327;
+	border-bottom-color: #c3c4c7;
+}
+
+.perflocale-settings .perflocale-settings-tabs__menu {
+	position: absolute;
+	top: 100%;
+	inset-inline-end: 0;
+	z-index: 20;
+	min-width: 200px;
+	margin: 0;
+	padding: 4px 0;
+	background: #fff;
+	border: 1px solid #c3c4c7;
+	border-radius: 4px;
+	box-shadow: 0 3px 8px rgba( 0, 0, 0, 0.12 );
+}
+
+.perflocale-settings .perflocale-settings-tabs__menu[hidden] {
+	display: none;
+}
+
+.perflocale-settings .nav-tab-wrapper .perflocale-settings-tabs__menu .nav-tab {
+	display: block;
+	float: none;
+	margin: 0;
+	padding: 8px 14px;
+	border: 0;
+	white-space: nowrap;
+}
+
+.perflocale-settings .nav-tab-wrapper .perflocale-settings-tabs__menu .nav-tab:hover,
+.perflocale-settings .nav-tab-wrapper .perflocale-settings-tabs__menu .nav-tab:focus {
+	background: #f0f0f1;
+	border: 0;
 }
 
 .perflocale-settings .nav-tab-wrapper .nav-tab {
 	margin: 0;
-	padding: 10px 18px;
+	padding: 10px 12px;
 	background: transparent;
 	border: none;
 	border-bottom: 2px solid transparent;
@@ -1809,4 +1920,19 @@ details[data-perflocale-popover][open] {
 		min-width: 0;
 		max-width: none;
 	}
+}
+
+/* ---- Content ReSync: the estimate step and the result ---- */
+.perflocale-resync-notice__lines {
+	margin: 0 0 8px;
+}
+
+.perflocale-resync-notice__lines li {
+	margin: 2px 0;
+}
+
+.perflocale-resync-notice__actions {
+	display: flex;
+	gap: 8px;
+	flex-wrap: wrap;
 }

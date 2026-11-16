@@ -10,7 +10,6 @@ declare( strict_types=1 );
 namespace PerfLocale\Strings;
 
 use PerfLocale\Cache\CacheManager;
-use PerfLocale\Database\Schema;
 use PerfLocale\Router\LanguageRouter;
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -23,6 +22,42 @@ if ( ! defined( 'ABSPATH' ) ) {
  * Loads on language detection (parse_request), not wp_loaded, which fires before the language is known.
  */
 final class StringTranslation {
+
+	/** ACF options pages, widgets and custom storage ids. */
+	public const ACF_OPTIONS = 'perflocale-acf-options';
+
+	/** Meta Box settings pages. */
+	public const MB_SETTINGS = 'perflocale-mb-settings';
+
+	/** ACF field settings (labels, instructions, choices); ACF calls __() on it. */
+	public const ACF_FIELDS = 'perflocale-acf-fields';
+
+	/** Meta Box choice and form labels. */
+	public const MB_FIELDS = 'perflocale-mb-fields';
+
+	/** Post type and taxonomy labels. */
+	public const LABELS = 'perflocale-labels';
+
+	/**
+	 * Domains read only through get_translation() by a bridge; a map of only these attaches no gettext filter.
+	 * Literals on purpose (no constant-expression copy per request); StringDomainsTest pins them to the constants
+	 * and TranslationFileLoader holds the same set.
+	 */
+	public const LOOKUP_ONLY = [
+		'perflocale-options',
+		'perflocale-acf-options',
+		'perflocale-mb-settings',
+		'perflocale-mb-fields',
+		'perflocale-labels',
+	];
+
+	/** Lookup-only domains whose rows carry a context prefix; only their rows read context and position. */
+	public const POSITIONED = [
+		'perflocale-acf-options',
+		'perflocale-mb-settings',
+		'perflocale-mb-fields',
+		'perflocale-labels',
+	];
 
 	/**
 	 * @var LanguageRouter
@@ -37,14 +72,35 @@ final class StringTranslation {
 	/**
 	 * Reserved $translations key of the extra-plural-forms sub-map; the NUL prefix never collides with a hash.
 	 */
-	private const EXTRA_FORMS_KEY = "\0pfl_extra_forms";
+	public const EXTRA_FORMS_KEY = "\0pfl_extra_forms";
 
 	/**
 	 * Reserved key: '1' when the map has a row the gettext filters serve, '0' when only OptionStrings rows.
 	 *
 	 * A map without the key (an older cache entry) counts as having gettext rows.
 	 */
-	private const GETTEXT_ROWS_KEY = "\0pfl_gettext_rows";
+	public const GETTEXT_ROWS_KEY = "\0pfl_gettext_rows";
+
+	/** Reserved key: lookup-only domains in the map, `[domain => '1']`; absent counts as every domain. */
+	public const DOMAINS_KEY = "\0pfl_domains";
+
+	/** Reserved key: per lookup-only domain, its context prefixes `[domain => [prefix => '1']]`; absent = all. */
+	public const CONTEXT_PREFIXES_KEY = "\0pfl_context_prefixes";
+
+	/** Reserved key: per-language option-page reference overrides, folded in at build (no front-end option read). */
+	public const FIELD_LINKS_KEY = "\0pfl_field_links";
+
+	/** Reserved key: serialized map size in bytes; the build writes none (it never serializes the map). */
+	public const MAP_BYTES_KEY = "\0pfl_map_bytes";
+
+	/** Map size above which the Strings page suggests files mode; below Memcached's 1 MB item limit. */
+	public const MAP_NOTICE_BYTES = 524288;
+
+	/** Longest composite key the hash memo keeps, so it never holds a second copy of large values. */
+	private const MEMO_MAX_KEY_BYTES = 1024;
+
+	/** Most entries of the hash memo; at the bound it starts over. */
+	private const MEMO_MAX_ENTRIES = 5000;
 
 	/**
 	 * Preloaded translations: [hash => translated_text_string].
@@ -76,6 +132,34 @@ final class StringTranslation {
 	public function __construct( LanguageRouter $router, CacheManager $cache ) {
 		$this->router = $router;
 		$this->cache  = $cache;
+	}
+
+	/**
+	 * A string's identity pre-image: 1.0.7.5's `domain|context|text`, or `domain|context\x04text` when the context holds a bar.
+	 * Injective: a domain never holds a bar and a context or text never "\x04" (refused on write), so "\x04" marks the bar
+	 * form and the first two bars split the other. $other: the form the tuple does not use (rows still to be moved).
+	 *
+	 * @param string $domain  Text domain.
+	 * @param string $context Context.
+	 * @param string $text    Original text.
+	 * @param bool   $other   The other form.
+	 * @return string
+	 */
+	public static function identity( string $domain, string $context, string $text, bool $other = false ): string {
+		return $domain . '|' . $context . ( str_contains( $context, '|' ) !== $other ? "\x04" : '|' ) . $text;
+	}
+
+	/**
+	 * The SHA-256 of identity(): the strings table's original_hash.
+	 *
+	 * @param string $domain  Text domain.
+	 * @param string $context Context.
+	 * @param string $text    Original text.
+	 * @param bool   $other   The other form.
+	 * @return non-falsy-string 64-character hex hash.
+	 */
+	public static function identity_hash( string $domain, string $context, string $text, bool $other = false ): string {
+		return hash( 'sha256', self::identity( $domain, $context, $text, $other ) );
 	}
 
 	/**
@@ -112,12 +196,85 @@ final class StringTranslation {
 		// Preload first: without gettext rows the filters are not added, sparing every __() call.
 		$this->preload_translations();
 
-		if ( $this->has_gettext_rows() ) {
+		if ( self::should_attach_gettext( $this->has_gettext_rows(), $this->translations !== [] ) ) {
 			add_filter( 'gettext', [ $this, 'translate_string' ], 10, 3 );
 			add_filter( 'gettext_with_context', [ $this, 'translate_string_with_context' ], 10, 4 );
 			add_filter( 'ngettext', [ $this, 'translate_plural_string' ], 10, 5 );
 			add_filter( 'ngettext_with_context', [ $this, 'translate_plural_string_with_context' ], 10, 6 );
 		}
+	}
+
+	/**
+	 * Whether a domain is served by lookup only.
+	 *
+	 * @param string $domain Text domain.
+	 * @return bool
+	 */
+	public static function is_lookup_only( string $domain ): bool {
+		return in_array( $domain, self::LOOKUP_ONLY, true );
+	}
+
+	/**
+	 * Whether the gettext filters attach for a loaded map.
+	 *
+	 * Never on admin-ajax with an admin referer (served by lookup); admin-ajax without one and `?wc-ajax=`
+	 * decide as a page view does.
+	 *
+	 * @param bool $gettext_rows Whether the map holds a row of a gettext domain.
+	 * @param bool $any_rows     Whether the map holds any row.
+	 * @return bool
+	 */
+	public static function should_attach_gettext( bool $gettext_rows, bool $any_rows ): bool {
+		if ( is_admin() && wp_doing_ajax() && self::referer_is_admin() ) {
+			return false;
+		}
+
+		/**
+		 * Whether the gettext filters attach on a translated request.
+		 *
+		 * @hook perflocale/strings/attach_gettext
+		 * @since 1.0.8
+		 * @param string|bool $mode 'auto' (attach when a gettext domain has translations), true (attach whenever the map is non-empty), false (never).
+		 */
+		$mode = apply_filters( 'perflocale/strings/attach_gettext', 'auto' );
+
+		if ( true === $mode ) {
+			return $any_rows;
+		}
+
+		if ( false === $mode ) {
+			return false;
+		}
+
+		return $gettext_rows;
+	}
+
+	/**
+	 * Whether the raw referer is under admin_url(); an absolute one must be on the admin host (any scheme or case).
+	 *
+	 * @return bool
+	 */
+	public static function referer_is_admin(): bool {
+		$referer = wp_get_raw_referer();
+
+		if ( ! is_string( $referer ) || '' === $referer ) {
+			return false;
+		}
+
+		$parts = wp_parse_url( $referer );
+		$admin = wp_parse_url( admin_url() );
+
+		if ( ! is_array( $parts ) || ! is_array( $admin ) ) {
+			return false;
+		}
+
+		if ( isset( $parts['host'] ) && strtolower( $parts['host'] ) !== strtolower( (string) ( $admin['host'] ?? '' ) ) ) {
+			return false;
+		}
+
+		$admin_path = (string) ( $admin['path'] ?? '' );
+
+		return '' !== $admin_path && str_starts_with( (string) ( $parts['path'] ?? '' ), $admin_path );
 	}
 
 	/**
@@ -138,79 +295,10 @@ final class StringTranslation {
 
 		$this->loaded = true;
 
-		// Every translation of the language, hash => text, in one query.
+		// Every translation of the language, hash => text, read on a miss (Strings\MapBuilder, loaded only then).
 		$preloaded = $this->cache->get(
-			"all_string_translations_{$language_id}",
-			function () use ( $language_id ): array {
-				// phpcs:disable PluginCheck.Security.DirectDB.UnescapedDBParameter
-				global $wpdb;
-
-				$strings_table = Schema::table( 'strings' );
-				$links_table   = Schema::table( 'translation_links' );
-				$groups_table  = Schema::table( 'translation_groups' );
-				$st_table      = Schema::table( 'string_translations' );
-
-				// Driven from string_translations, so its key narrows to this language before the other joins.
-				// See docs-ai/11-code-rationale.md, "StringTranslation: preload query plan".
-				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-				$results = $wpdb->get_results(
-					$wpdb->prepare(
-						"SELECT s.original_hash, st.translation AS translated_text, st.extra_forms, s.domain
-						FROM %i st
-						INNER JOIN %i s
-							ON s.id = st.string_id
-						INNER JOIN %i g
-							ON g.id = s.group_id AND g.type = 'string'
-						INNER JOIN %i l
-							ON l.group_id = s.group_id AND l.language_id = st.language_id
-						WHERE st.language_id = %d
-						AND st.translation != ''",
-						$st_table,
-						$strings_table,
-						$groups_table,
-						$links_table,
-						$language_id
-					)
-				);
-
-				$map     = [];
-				$extra   = [];
-				$gettext = false;
-
-				if ( is_array( $results ) ) {
-					foreach ( $results as $row ) {
-						// Internal "_" domains (`_pfl_dyn`) are served by the output buffer, not gettext:
-						// they must not make the map non-empty and register the filters.
-						if ( isset( $row->domain[0] ) && $row->domain[0] === '_' ) {
-							continue;
-						}
-
-						$map[ $row->original_hash ] = $row->translated_text;
-						$gettext                    = $gettext || self::is_gettext_domain( (string) $row->domain );
-
-						// Plural forms 2..N live in the plural row's extra_forms JSON (NULL for 2-form languages).
-						if ( isset( $row->extra_forms ) && $row->extra_forms !== null && $row->extra_forms !== '' ) {
-							$decoded = json_decode( (string) $row->extra_forms, true );
-
-							if ( is_array( $decoded ) && $decoded !== [] ) {
-								$extra[ $row->original_hash ] = array_map( 'strval', $decoded );
-							}
-						}
-					}
-				}
-
-				// Extra forms go under a reserved key; a cached map without it has no extra forms.
-				if ( $extra !== [] ) {
-					$map[ self::EXTRA_FORMS_KEY ] = $extra;
-				}
-
-				if ( $map !== [] ) {
-					$map[ self::GETTEXT_ROWS_KEY ] = $gettext ? '1' : '0';
-				}
-
-				// phpcs:enable PluginCheck.Security.DirectDB.UnescapedDBParameter
-				return $map;
-			},
+			"all_str2_translations_{$language_id}",
+			static fn (): array => MapBuilder::build( $language_id, false ),
 			6 * HOUR_IN_SECONDS,
 			'perflocale_strings'
 		);
@@ -259,70 +347,8 @@ final class StringTranslation {
 			$fallback_id = (int) $fallback_lang->id;
 
 			$fallback_translations = $this->cache->get(
-				"all_string_translations_{$fallback_id}",
-				function () use ( $fallback_id ): array {
-					// phpcs:disable PluginCheck.Security.DirectDB.UnescapedDBParameter
-					global $wpdb;
-
-					$strings_table = Schema::table( 'strings' );
-					$links_table   = Schema::table( 'translation_links' );
-					$groups_table  = Schema::table( 'translation_groups' );
-					$st_table      = Schema::table( 'string_translations' );
-
-					// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-					$results = $wpdb->get_results(
-						$wpdb->prepare(
-							"SELECT s.original_hash, st.translation AS translated_text, st.extra_forms, s.domain
-							FROM %i s
-							INNER JOIN %i g ON g.id = s.group_id AND g.type = 'string'
-							INNER JOIN %i l ON l.group_id = s.group_id AND l.language_id = %d
-							INNER JOIN %i st ON st.string_id = s.id AND st.language_id = %d
-							WHERE st.translation != ''",
-							$strings_table,
-							$groups_table,
-							$links_table,
-							$fallback_id,
-							$st_table,
-							$fallback_id
-						)
-					);
-
-					$map     = [];
-					$extra   = [];
-					$gettext = false;
-
-					if ( is_array( $results ) ) {
-						foreach ( $results as $row ) {
-							// Internal "_" domains are not gettext-served: they must not register the filters.
-							if ( isset( $row->domain[0] ) && $row->domain[0] === '_' ) {
-								continue;
-							}
-
-							$gettext = $gettext || self::is_gettext_domain( (string) $row->domain );
-
-							if ( isset( $row->extra_forms ) && $row->extra_forms !== null && $row->extra_forms !== '' ) {
-								$decoded = json_decode( (string) $row->extra_forms, true );
-
-								if ( is_array( $decoded ) && $decoded !== [] ) {
-									$extra[ $row->original_hash ] = array_map( 'strval', $decoded );
-								}
-							}
-
-							$map[ $row->original_hash ] = $row->translated_text;
-						}
-					}
-
-					if ( $extra !== [] ) {
-						$map[ self::EXTRA_FORMS_KEY ] = $extra;
-					}
-
-					if ( $map !== [] ) {
-						$map[ self::GETTEXT_ROWS_KEY ] = $gettext ? '1' : '0';
-					}
-
-					// phpcs:enable PluginCheck.Security.DirectDB.UnescapedDBParameter
-					return $map;
-				},
+				"all_str2_translations_{$fallback_id}",
+				static fn (): array => MapBuilder::build( $fallback_id, true ),
 				6 * HOUR_IN_SECONDS,
 				'perflocale_strings'
 			);
@@ -336,6 +362,10 @@ final class StringTranslation {
 				// Either map having gettext rows means the merged one has.
 				$gettext_rows = $this->has_gettext_rows() || '0' !== ( $fallback_translations[ self::GETTEXT_ROWS_KEY ] ?? '1' );
 				unset( $fallback_translations[ self::GETTEXT_ROWS_KEY ] );
+
+				// The domain and prefix sets are unions carried in by the merge below.
+				$fallback_translations = $this->merge_reserved_sets( $fallback_translations );
+				unset( $fallback_translations[ self::MAP_BYTES_KEY ], $fallback_translations[ self::FIELD_LINKS_KEY ] );
 
 				// Fallback extra forms only when the whole row comes from the fallback (checked before the merge):
 				// else forms 2..N would be in another language than form 1.
@@ -363,13 +393,108 @@ final class StringTranslation {
 	}
 
 	/**
-	 * Whether rows of this text domain are served through the gettext filters.
+	 * A numeric value as an int, anything else 0.
+	 *
+	 * @param mixed $value Value.
+	 * @return int
+	 */
+	private static function as_int( mixed $value ): int {
+		return is_numeric( $value ) ? (int) $value : 0;
+	}
+
+	/**
+	 * Union the domain and prefix sets into the fallback map; the loaded map's copies are unset so `+=` takes
+	 * the unions. A map lacking a key leaves the merged map without it (pessimistic).
+	 *
+	 * @param array<mixed> $fallback The fallback map as the cache returned it.
+	 * @return array<mixed> The fallback map with the merged sets.
+	 */
+	private function merge_reserved_sets( array $fallback ): array {
+		foreach ( [ self::DOMAINS_KEY, self::CONTEXT_PREFIXES_KEY ] as $key ) {
+			$own   = [] === $this->translations ? [] : self::entry( $this->translations, $key );
+			$other = $fallback[ $key ] ?? null;
+
+			unset( $this->translations[ $key ], $fallback[ $key ] );
+
+			if ( ! is_array( $own ) || ! is_array( $other ) ) {
+				continue;
+			}
+
+			if ( self::DOMAINS_KEY === $key ) {
+				$fallback[ $key ] = $own + $other;
+				continue;
+			}
+
+			foreach ( $other as $domain => $set ) {
+				$own[ $domain ] = ( is_array( $own[ $domain ] ?? null ) ? $own[ $domain ] : [] ) + ( is_array( $set ) ? $set : [] );
+			}
+
+			$fallback[ $key ] = $own;
+		}
+
+		return $fallback;
+	}
+
+	/**
+	 * One map entry as mixed (a reserved entry holds an array).
+	 *
+	 * @param array<mixed> $map A map.
+	 * @param string       $key Key.
+	 * @return mixed
+	 */
+	private static function entry( array $map, string $key ): mixed {
+		return $map[ $key ] ?? null;
+	}
+
+	/**
+	 * Whether the loaded map holds a row of a lookup-only domain; true for a map without the domain list.
 	 *
 	 * @param string $domain Text domain.
 	 * @return bool
 	 */
-	private static function is_gettext_domain( string $domain ): bool {
-		return $domain !== \PerfLocale\Frontend\OptionStrings::DOMAIN;
+	public function map_has_domain( string $domain ): bool {
+		if ( ! $this->loaded ) {
+			$this->preload_translations();
+		}
+
+		if ( $this->translations === [] ) {
+			return false;
+		}
+
+		$domains = self::entry( $this->translations, self::DOMAINS_KEY );
+
+		return ! is_array( $domains ) || isset( $domains[ $domain ] );
+	}
+
+	/**
+	 * Whether the loaded map holds a lookup-only row under a context prefix; true for a map without the list.
+	 *
+	 * @param string $domain Text domain.
+	 * @param string $prefix Context prefix (`post_type|book|`, `mb:box_id`).
+	 * @return bool
+	 */
+	public function map_has_context_prefix( string $domain, string $prefix ): bool {
+		if ( ! $this->map_has_domain( $domain ) ) {
+			return false;
+		}
+
+		$prefixes = self::entry( $this->translations, self::CONTEXT_PREFIXES_KEY );
+
+		if ( ! is_array( $prefixes ) ) {
+			return true;
+		}
+
+		return is_array( $prefixes[ $domain ] ?? null ) && isset( $prefixes[ $domain ][ $prefix ] );
+	}
+
+	/**
+	 * The serialized size a cached map carries in MAP_BYTES_KEY.
+	 *
+	 * @param mixed $map A map read from the cache.
+	 * @return int 0 when the map carries no size.
+	 */
+	public static function map_bytes( mixed $map ): int {
+		return is_array( $map ) ? self::as_int( $map[ self::MAP_BYTES_KEY ] ?? 0 ) : 0;
 	}
 
 	/**
@@ -527,7 +652,7 @@ final class StringTranslation {
 		$extra_map = $this->translations[ self::EXTRA_FORMS_KEY ] ?? null;
 
 		if ( is_array( $extra_map ) ) {
-			$hash = hash( 'sha256', $domain . '|' . $form_context . '|' . $original );
+			$hash = self::identity_hash( $domain, $form_context, $original );
 
 			if ( isset( $extra_map[ $hash ] ) && is_array( $extra_map[ $hash ] ) ) {
 				// extra_forms holds forms 2..N; index 2 → offset 0.
@@ -564,14 +689,21 @@ final class StringTranslation {
 			return null;
 		}
 
-		// Per-request memo of the SHA-256 of repeated strings.
-		$cache_key = $domain . '|' . $context . '|' . $text;
+		// Memo key only ("\x04" ends the context); the stored hash is identity_hash()'s.
+		$cache_key = $domain . '|' . $context . "\x04" . $text;
 
 		if ( isset( $this->hash_cache[ $cache_key ] ) ) {
 			$hash = $this->hash_cache[ $cache_key ];
 		} else {
-			$hash                           = hash( 'sha256', $cache_key );
-			$this->hash_cache[ $cache_key ] = $hash;
+			$hash = self::identity_hash( $domain, $context, $text );
+
+			if ( strlen( $cache_key ) <= self::MEMO_MAX_KEY_BYTES ) {
+				if ( count( $this->hash_cache ) >= self::MEMO_MAX_ENTRIES ) {
+					$this->hash_cache = [];
+				}
+
+				$this->hash_cache[ $cache_key ] = $hash;
+			}
 		}
 
 		if ( ! isset( $this->translations[ $hash ] ) ) {

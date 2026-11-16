@@ -1,3 +1,8 @@
+/* A row or block the server or a script marks hidden stays hidden, whatever display rule it has. */
+.perflocale-settings [hidden] {
+	display: none !important;
+}
+
 /* Language Switcher Info Box (Settings tab) */
 .perflocale-switcher-info {
 	background: #f8faff;
@@ -575,4 +580,161 @@
 .perflocale-import-addon__choice {
 	display: block;
 	margin-bottom: 4px;
+}
+
+/* Subtabs under a settings tab (the "Grouped set" design): a grey bar, the active item on a white chip.
+   It scrolls inside its bar when it is wider than the screen. */
+.perflocale-subtabs {
+	display: flex;
+	box-sizing: border-box;
+	width: fit-content;
+	max-width: 100%;
+	gap: 2px;
+	margin: 0 0 12px;
+	padding: 3px;
+	overflow-x: auto;
+	background: #e3e5e8;
+	border-radius: 7px;
+	scrollbar-width: thin;
+}
+
+.perflocale-subtabs__item {
+	flex: 0 0 auto;
+	padding: 5px 14px;
+	border-radius: 5px;
+	color: #50575e;
+	font-size: 13px;
+	font-weight: 500;
+	line-height: 1.5;
+	text-decoration: none;
+	white-space: nowrap;
+}
+
+.perflocale-subtabs__item:hover {
+	color: #1d2327;
+}
+
+.perflocale-subtabs__item.is-active {
+	background: #fff;
+	color: var(--wp-admin-theme-color, #2271b1);
+	font-weight: 600;
+	box-shadow: 0 1px 2px rgba( 0, 0, 0, 0.1 ), 0 0 0 1px rgba( 0, 0, 0, 0.04 );
+}
+
+/* Inside the bar, so the ring is drawn inside the item and the scroll box cannot clip it. */
+.perflocale-subtabs__item:focus {
+	box-shadow: none;
+	outline: none;
+}
+
+.perflocale-subtabs__item:focus-visible {
+	outline: 2px solid var(--wp-admin-theme-color, #2271b1);
+	outline-offset: -2px;
+}
+
+.perflocale-subtabs__item.is-active:focus-visible {
+	box-shadow: 0 1px 2px rgba( 0, 0, 0, 0.1 ), 0 0 0 1px rgba( 0, 0, 0, 0.04 );
+}
+
+/* Translation > General: the Content to translate table. Resets the .form-table cell rules the nested cells inherit. */
+.perflocale-settings .form-table td .perflocale-ctt-hint {
+	margin: 0 0 8px;
+}
+
+.perflocale-table-responsive > .perflocale-ctt-table {
+	min-width: 560px;
+}
+
+.perflocale-settings .form-table .perflocale-ctt-table th,
+.perflocale-settings .form-table .perflocale-ctt-table td {
+	display: table-cell;
+	width: auto;
+	padding: 8px 10px;
+	text-align: start;
+	vertical-align: top;
+	line-height: 1.5;
+}
+
+.perflocale-settings .form-table .perflocale-ctt-table thead th {
+	font-weight: 600;
+}
+
+.perflocale-settings .form-table .perflocale-ctt-table td.perflocale-ctt-check,
+.perflocale-settings .form-table .perflocale-ctt-table th.perflocale-ctt-check {
+	width: 5em;
+	text-align: center;
+}
+
+.perflocale-settings .form-table .perflocale-ctt-table td.perflocale-ctt-check input[type="checkbox"] {
+	margin: 0;
+}
+
+.perflocale-settings .form-table .perflocale-ctt-group th {
+	padding-top: 6px;
+	padding-bottom: 6px;
+	background: #f6f7f7;
+	border-top: 1px solid #c3c4c7;
+	border-bottom: 1px solid #dcdcde;
+	color: #50575e;
+	font-size: 12px;
+	font-weight: 600;
+	letter-spacing: 0.05em;
+	text-transform: uppercase;
+}
+
+.perflocale-ctt-table tbody tr:not(.perflocale-ctt-group) + tr td {
+	border-top: 1px solid #f0f0f1;
+}
+
+.perflocale-ctt-types code {
+	display: inline-block;
+	margin: 0 0 2px;
+	margin-inline-end: 4px;
+	white-space: nowrap;
+}
+
+.perflocale-ctt-note {
+	color: #50575e;
+}
+
+/* URL Bases: the old addresses "Stop these redirects" ends. */
+.perflocale-ub-kept {
+	max-width: 760px;
+	margin-bottom: 8px;
+}
+
+/* Select All in the header sits like the row checkboxes: core pads a header th check cell otherwise. */
+.perflocale-ub-kept > thead > tr > .check-column,
+.perflocale-ub-kept > tbody > tr > .check-column {
+	padding: 11px 0 0 3px;
+	vertical-align: top;
+}
+
+.perflocale-ub-kept .check-column input[type="checkbox"] {
+	margin: 0 0 0 8px;
+	vertical-align: text-top;
+}
+
+/* The header's label stays screen-reader only: core sizes check-column labels to cover the cell. */
+.perflocale-ub-kept .perflocale-ub-forget-all label {
+	width: 1px;
+	height: 1px;
+}
+
+/* Positioned, or the absolutely placed screen-reader labels escape the scroll and widen the page. */
+.perflocale-ub-table-wrap {
+	position: relative;
+}
+
+/* URL Bases table: inputs share the column so the table fits; the wrapper scrolls when it cannot. */
+.perflocale-ub-table .regular-text {
+	box-sizing: border-box;
+	max-width: 100%;
+	min-width: 8em;
+	width: 100%;
+}
+
+/* Settings > Translation: the note beside Generate Missing Translations. */
+.perflocale-generate-dialog {
+	margin: 0 0 8px;
 }

@@ -81,15 +81,40 @@ final class WorkerRunner {
 		) {
 			switch_to_blog( $target_blog );
 			$switched_blog = true;
+
+			if ( class_exists( \PerfLocale\Translation\Fields\FieldMap::class, false ) ) {
+				\PerfLocale\Translation\Fields\FieldMap::take_skipped();
+			}
 		}
 
 		try {
 			self::run_on_current_blog( $job_id, $args, $target_blog );
 		} finally {
 			if ( $switched_blog ) {
+				self::note_skipped_fields( $job_id );
 				restore_current_blog();
 			}
 		}
+	}
+
+	/**
+	 * Log once per job that a switched run skipped its custom-field and post-meta steps (FieldMap::definitions_unavailable()).
+	 *
+	 * @param string $job_id Job id.
+	 * @return void
+	 */
+	private static function note_skipped_fields( string $job_id ): void {
+		if ( ! class_exists( \PerfLocale\Translation\Fields\FieldMap::class, false ) || ! \PerfLocale\Translation\Fields\FieldMap::take_skipped() ) {
+			return;
+		}
+
+		foreach ( (array) ( JobState::get( $job_id )['log'] ?? [] ) as $entry ) {
+			if ( is_array( $entry ) && 'fields_switched' === ( $entry['k'] ?? null ) ) {
+				return;
+			}
+		}
+
+		JobState::append_log( $job_id, __( 'Custom fields and other plugins\' post meta (except WooCommerce product data) skipped (not copied, translated or synced): this job ran from another site of the network, where this site\'s field definitions are not loaded. Run it again from this site\'s own WP-Cron to include them.', 'perflocale' ), 'fields_switched' );
 	}
 
 	/**
@@ -340,7 +365,7 @@ final class WorkerRunner {
 			// dispatch.
 			$created_by = (int) ( $state['created_by'] ?? 0 );
 
-			$required_cap = $job->get_required_capability();
+			$required_cap = $job->required_capability_for( $args );
 			if ( ! is_string( $required_cap ) || $required_cap === '' ) {
 				self::fail_for_good(
 					$job_id,
@@ -355,7 +380,7 @@ final class WorkerRunner {
 			}
 
 			// A row with no user (anonymized, or a system job) runs only for a type that opts in.
-			if ( ( $created_by <= 0 && ! $job->runs_without_user() ) || ! user_can( $created_by, $required_cap ) ) {
+			if ( ( $created_by <= 0 && ! $job->runs_without_user() ) || ! user_can( $created_by, $required_cap ) || ! $job->holds_also_required( $created_by ) ) {
 				self::fail_for_good( $job_id, $type, __( 'Permission revoked or dispatching user no longer has access.', 'perflocale' ) );
 				return;
 			}
@@ -623,14 +648,15 @@ final class WorkerRunner {
 				// scheduled again once they are stored and both locks released. Completion and its hook come once,
 				// after the last slice.
 				$unit_stop = ! empty( $result['__perflocale_unit_stop'] );
-				unset( $result['__perflocale_continue'], $result['__perflocale_unit_stop'] );
+				$stop_note = is_string( $result['__perflocale_stop_note'] ?? null ) ? $result['__perflocale_stop_note'] : '';
+				unset( $result['__perflocale_continue'], $result['__perflocale_unit_stop'], $result['__perflocale_stop_note'] );
 
 				$continue_at = self::continue_at( $result );
 				$slice_meta  = $resume_meta;
 
 				// A unit cut by the provider deadline counts like a kill there.
 				if ( $resumes && $unit_stop ) {
-					$slice_meta = JobResume::count_stop( $job_id, $type, $result, $resume_meta, is_int( $result['processed'] ?? null ) ? $result['processed'] : 0, $last_unit, $generation );
+					$slice_meta = JobResume::count_stop( $job_id, $type, $result, $resume_meta, is_int( $result['processed'] ?? null ) ? $result['processed'] : 0, $last_unit, $generation, $stop_note );
 				}
 
 				if ( null !== $slice_meta ) {
@@ -1044,6 +1070,18 @@ final class WorkerRunner {
 	}
 
 	/**
+	 * The id of the job this worker runs when it is of the given type; '' outside a worker run.
+	 *
+	 * @since 1.0.8
+	 *
+	 * @param string $type Job type slug.
+	 * @return string
+	 */
+	public static function current_job_id( string $type ): string {
+		return null === self::$in_execute || $type !== self::$in_execute['type'] ? '' : (string) self::$in_execute['job_id'];
+	}
+
+	/**
 	 * Shutdown function: release the locks of a job whose execute() never returned (a fatal error or an exit) and fail
 	 * it, on its blog. A no-op otherwise; also run from release_before_error_page(), the record cleared on the first
 	 * run. Why: docs-ai/11-code-rationale.md, "WorkerRunner: the shutdown guard".
@@ -1278,36 +1316,51 @@ final class WorkerRunner {
 		}
 
 		try {
-			$next_state = JobState::get_fresh( $next );
-
-			if ( ! $next_state || ( $next_state['type'] ?? null ) !== $type || ! JobState::cancel( $next ) ) {
-				return;
-			}
-
-			$engine = $next_state['engine'] ?? '';
-			JobRunnerFactory::for_engine( is_string( $engine ) ? $engine : '' )->cancel( $next );
-			JobLock::release( $next );
-
-			JobState::append_log(
-				$next,
-				sprintf(
-					/* translators: %s: id of the canceled job that queued this one. */
-					__( 'Canceled because job %s, which queued this one, was canceled.', 'perflocale' ),
-					$job_id
-				)
-			);
-			JobState::append_log(
-				$job_id,
-				sprintf(
-					/* translators: %s: id of the job this one had queued. */
-					__( 'The job it had queued next (%s) was canceled as well.', 'perflocale' ),
-					$next
-				)
-			);
+			// Under its control lock, as a Cancel. Busy: a user's Cancel or Retry of it runs and decides.
+			JobState::control( $next, static fn(): bool => self::cancel_successor_held( $job_id, $next, $type ) );
 		} catch ( \Throwable $e ) {
 			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic: the successor may still be queued.
 			error_log( '[PerfLocale] could not cancel job ' . $next . ' queued by canceled job ' . $job_id . ': ' . self::redact_paths( $e->getMessage() ) );
 		}
+	}
+
+	/**
+	 * cancel_queued_successor() under the successor's control lock.
+	 *
+	 * @param string $job_id Canceled job id.
+	 * @param string $next   Its queued successor.
+	 * @param string $type   Job type.
+	 * @return bool Whether it was canceled.
+	 */
+	private static function cancel_successor_held( string $job_id, string $next, string $type ): bool {
+		$next_state = JobState::get_fresh( $next );
+
+		if ( ! $next_state || ( $next_state['type'] ?? null ) !== $type || ! JobState::cancel( $next ) ) {
+			return false;
+		}
+
+		$engine = $next_state['engine'] ?? '';
+		JobRunnerFactory::for_engine( is_string( $engine ) ? $engine : '' )->cancel( $next );
+		JobLock::release( $next );
+
+		JobState::append_log(
+			$next,
+			sprintf(
+				/* translators: %s: id of the canceled job that queued this one. */
+				__( 'Canceled because job %s, which queued this one, was canceled.', 'perflocale' ),
+				$job_id
+			)
+		);
+		JobState::append_log(
+			$job_id,
+			sprintf(
+				/* translators: %s: id of the job this one had queued. */
+				__( 'The job it had queued next (%s) was canceled as well.', 'perflocale' ),
+				$next
+			)
+		);
+
+		return true;
 	}
 
 	/**

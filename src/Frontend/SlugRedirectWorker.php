@@ -122,6 +122,14 @@ final class SlugRedirectWorker {
 			}
 		}
 
+		// A page, post, term or archive that now lives at this path wins over the retired code (no query: `wp` runs after
+		// the main query, and a term archive's object is cached).
+		$query = $GLOBALS['wp_query'] ?? null;
+
+		if ( $query instanceof \WP_Query && ! $query->is_404() && ( ! empty( $query->posts ) || null !== $query->get_queried_object() ) ) {
+			return;
+		}
+
 		$tail = $m[2] ?? '';
 
 		// A query in the tail would be appended twice.
@@ -150,8 +158,7 @@ final class SlugRedirectWorker {
 
 		$target = $new_path . ( $query_string !== '' ? '?' . $query_string : '' );
 
-		wp_safe_redirect( $target, 301 );
-		exit;
+		\PerfLocale\Router\Redirect\Sender::to( $target, 301, 'renamed_code' );
 	}
 
 	/**

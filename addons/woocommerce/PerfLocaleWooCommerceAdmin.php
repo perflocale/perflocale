@@ -18,6 +18,13 @@ if ( ! defined( 'ABSPATH' ) ) {
 final class PerfLocaleWooCommerceAdmin {
 
 	/**
+	 * Rows the last sanitize_currencies_post() refused, as "slug (CODE)", for the settings notice.
+	 *
+	 * @var array<int, string>
+	 */
+	public static array $refused_rates = [];
+
+	/**
 	 * WC email settings registered as translatable strings, one context per field and email id.
 	 */
 	private const EMAIL_STRING_FIELDS = [ 'subject', 'heading', 'additional_content' ];
@@ -91,7 +98,9 @@ final class PerfLocaleWooCommerceAdmin {
 			return $existing;
 		}
 
-		$out = [];
+		$out                 = [];
+		self::$refused_rates = [];
+		$auto_sync           = isset( $_POST['wc_exchange_rate_auto'] );
 
 		foreach ( wp_unslash( $_POST['wc_currencies'] ) as $slug => $data ) { // phpcs:ignore WordPress.Security.ValidatedSanitizedInput
 			$slug = sanitize_key( (string) $slug );
@@ -111,14 +120,21 @@ final class PerfLocaleWooCommerceAdmin {
 
 			$display  = sanitize_key( (string) ( $data['display'] ?? 'symbol' ) );
 			$position = sanitize_key( (string) ( $data['position'] ?? 'default' ) );
+			$manual   = ! empty( $data['manual_rate'] );
+			$rate     = \PerfLocale\WooCommerce\MultiCurrency::rate_to_store( $data['exchange_rate'] ?? 1.0, $existing[ $slug ] ?? null, $code );
+
+			// No usable rate, and none will come (manual, or auto-sync off): refused; the merge below keeps the stored row.
+			if ( null === $rate && ( $manual || ! $auto_sync ) ) {
+				self::$refused_rates[] = $slug . ' (' . $code . ')';
+				continue;
+			}
 
 			$out[ $slug ] = [
 				'currency_code' => $code,
-				// Not a finite number above zero: refused, the stored rate of
-				// the row stays (rate_to_store()).
-				'exchange_rate' => \PerfLocale\WooCommerce\MultiCurrency::rate_to_store( $data['exchange_rate'] ?? 1.0, $existing[ $slug ] ?? null, $code ),
+				// The 1.0 placeholder is never priced while auto-sync has no rate for it (MultiCurrency::load_currencies()).
+				'exchange_rate' => $rate ?? 1.0,
 				// Carry the manual-rate pin, or auto-sync overwrites a user-entered rate.
-				'manual_rate'   => ! empty( $data['manual_rate'] ),
+				'manual_rate'   => $manual,
 				'display'       => in_array( $display, [ 'symbol', 'code' ], true ) ? $display : 'symbol',
 				'position'      => in_array( $position, [ 'default', 'left', 'left_space', 'right', 'right_space' ], true ) ? $position : 'default',
 			];

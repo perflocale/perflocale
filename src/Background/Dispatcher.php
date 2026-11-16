@@ -44,11 +44,11 @@ final class Dispatcher {
 	 *
 	 * @param AbstractJob          $job  Job descriptor.
 	 * @param array<string, mixed> $args Worker args.
-	 * @return array{mode: string, job_id?: string, duplicate?: bool, status?: string, updated_at?: int, replaced?: string, result?: array<string,mixed>, error?: string}
+	 * @return array{mode: string, job_id?: string, duplicate?: bool, status?: string, updated_at?: int, replaced?: string, result?: array<string,mixed>, error?: string, busy?: bool, elsewhere?: bool}
 	 */
 	public static function dispatch( AbstractJob $job, array $args ): array {
 		// The worker re-checks as the stored `created_by`; failing here returns a clean error without enqueueing.
-		if ( ! current_user_can( $job->get_required_capability() ) ) {
+		if ( ! current_user_can( $job->required_capability_for( $args ) ) || ! $job->holds_also_required() ) {
 			return [
 				'mode'  => 'denied',
 				'error' => __( 'You do not have permission to run this job.', 'perflocale' ),
@@ -91,24 +91,25 @@ final class Dispatcher {
 	}
 
 	/**
-	 * Force-enqueue a job for async execution, bypassing the sync/async decision.
-	 *
-	 * An identical job still queued or running on this blog is returned instead (`duplicate`), unless its worker is gone
-	 * ({@see JobState::fail_if_worker_gone()}): then that job is marked failed and the result names it in `replaced`.
-	 *
-	 * @param AbstractJob          $job  Job descriptor.
-	 * @param array<string, mixed> $args Worker args.
-	 * @return array{mode: string, job_id: string, duplicate?: bool, status?: string, updated_at?: int, replaced?: string}|array{mode: string, error: string}
-	 */
-	/**
 	 * Maximum JSON size of `$args` for an async dispatch, so the job row does not become a data sink.
 	 *
 	 * Filterable via `perflocale/jobs/max_args_bytes`.
 	 */
 	public const MAX_ARGS_BYTES = 102400;
 
+	/**
+	 * Force-enqueue a job for async execution, bypassing the sync/async decision.
+	 *
+	 * An identical job still queued or running on this blog is returned instead (`duplicate`), unless its worker is gone
+	 * ({@see JobState::fail_if_worker_gone()}): then that job is marked failed and the result names it in `replaced`.
+	 * Another user's twin the caller may not handle is never named: `busy`, or `elsewhere` (joins_hidden_twin()).
+	 *
+	 * @param AbstractJob          $job  Job descriptor.
+	 * @param array<string, mixed> $args Worker args.
+	 * @return array{mode: string, job_id: string, duplicate?: bool, status?: string, updated_at?: int, replaced?: string, elsewhere?: bool}|array{mode: string, error: string, busy?: bool}
+	 */
 	public static function enqueue( AbstractJob $job, array $args ): array {
-		if ( ! current_user_can( $job->get_required_capability() ) ) {
+		if ( ! current_user_can( $job->required_capability_for( $args ) ) || ! $job->holds_also_required() ) {
 			return [
 				'mode'  => 'denied',
 				'error' => __( 'You do not have permission to run this job.', 'perflocale' ),
@@ -163,7 +164,33 @@ final class Dispatcher {
 
 		try {
 			if ( $dedupe ) {
-				$in_flight = JobState::find_active_duplicate( $job->get_type(), $args );
+				// A job narrowed to its requester's rights (an MT hand-off) joins only that user's twin.
+				$owner     = $job->required_capability_for( $args ) === $job->get_required_capability() ? -1 : (int) get_current_user_id();
+				$in_flight = JobState::find_active_duplicate( $job->get_type(), $args, $owner );
+
+				// A twin the caller may not handle is never joined, named or changed (a dead one is the watchdog's,
+				// JobState::watchdog()): the caller's own twin is joined, else the dispatch is refused.
+				if ( null !== $in_flight && $owner < 0 && ! self::may_join( $in_flight ) ) {
+					$in_flight = JobState::find_active_duplicate( $job->get_type(), $args, (int) get_current_user_id() );
+
+					if ( null === $in_flight ) {
+						// A job whose twin does the same work for the caller (translate on save) reads as queued.
+						if ( $job->joins_hidden_twin() ) {
+							return [
+								'mode'      => 'async',
+								'job_id'    => '',
+								'duplicate' => true,
+								'elsewhere' => true,
+							];
+						}
+
+						return [
+							'mode'  => 'error',
+							'busy'  => true,
+							'error' => __( 'An identical job is already queued or running.', 'perflocale' ),
+						];
+					}
+				}
 
 				// A twin whose worker was killed is failed, not joined: nothing would ever run it.
 				if ( $in_flight !== null && JobState::fail_if_worker_gone( $in_flight ) ) {
@@ -283,6 +310,25 @@ final class Dispatcher {
 			'mode'   => 'async',
 			'job_id' => $job_id,
 		];
+	}
+
+	/**
+	 * Whether the current user may join this in-flight job: their own (also a system job for a system dispatch) or one
+	 * JobAccess lets them handle. A failed read joins nothing.
+	 *
+	 * @param string $job_id Twin's UUID.
+	 * @return bool
+	 */
+	private static function may_join( string $job_id ): bool {
+		$twin = JobState::get( $job_id );
+
+		if ( ! is_array( $twin ) ) {
+			return false;
+		}
+
+		$created_by = $twin['created_by'] ?? null;
+
+		return ( is_int( $created_by ) && $created_by === (int) get_current_user_id() ) || JobAccess::may_handle( $twin );
 	}
 
 	/**

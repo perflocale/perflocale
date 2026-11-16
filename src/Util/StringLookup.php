@@ -29,7 +29,7 @@ final class StringLookup {
 	private const MAX = 500;
 
 	/**
-	 * Per-request memo: "blog|language id|domain|context|text" => translation, '' when none.
+	 * Per-request memo: "blog|language id|domain|context\x04text" => translation (gettext's separator ends the context), '' when none.
 	 *
 	 * @var array<string, string>
 	 */
@@ -72,7 +72,7 @@ final class StringLookup {
 		}
 
 		$id  = self::int( $language->id ?? 0 );
-		$key = get_current_blog_id() . '|' . $id . '|' . $domain . '|' . $context . '|' . $text;
+		$key = get_current_blog_id() . '|' . $id . '|' . $domain . '|' . $context . "\x04" . $text;
 
 		if ( ! isset( self::$memo[ $key ] ) ) {
 			// Only a new key starts a full memo over: a held one is still answered.

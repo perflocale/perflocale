@@ -29,6 +29,22 @@ final class AddonUninstaller {
 	 */
 	public const JOURNAL_ERROR = 'deferred network targets not stored; the manifest is kept for the next pass';
 
+	/**
+	 * Add-on ids of the running uninstall pass (set_pass_ids()), siblings for each other's purge.
+	 *
+	 * @var list<string>
+	 */
+	private static array $pass_ids = [];
+
+	/** The registered add-ons could not be read: nothing is purged, the manifest stays for the next pass. */
+	public const CLAIMS_ERROR = 'the registered add-ons could not be read; nothing purged, the manifest is kept for the next pass';
+
+	/** The delete-data setting could not be read: nothing is purged, the manifest stays for the next pass. */
+	public const SETTING_ERROR = 'the delete-data setting could not be read; nothing purged, the manifest is kept for the next pass';
+
+	/** The database refused a DROP or DELETE: what is left stays listed in the manifest for the next pass. */
+	public const LEFT_ERROR = 'the database refused a DROP or DELETE; the manifest is kept for the next pass';
+
 	/** Hard prefix for capability names. */
 	private const CAP_PREFIX = 'perflocale_';
 
@@ -48,9 +64,13 @@ final class AddonUninstaller {
 	 * @param AddonInterface|null $addon Live addon instance if known, null if absent.
 	 * @param bool                $single_site_teardown True when ONE subsite is being deleted: `site_options`
 	 *     and `user` meta are network-wide and stay for the surviving sites.
+	 * @param bool|null           $unread Set to true when the manifest read failed (the plan is then empty).
+	 * @param-out bool           $unread
 	 * @return PurgePlan
 	 */
-	public static function plan( string $addon_id, ?AddonInterface $addon = null, bool $single_site_teardown = false ): PurgePlan {
+	public static function plan( string $addon_id, ?AddonInterface $addon = null, bool $single_site_teardown = false, ?bool &$unread = null ): PurgePlan {
+		$unread = false;
+
 		if ( ! AddonSchemaManager::validate_addon_id( $addon_id ) ) {
 			return PurgePlan::empty( $addon_id );
 		}
@@ -60,8 +80,9 @@ final class AddonUninstaller {
 			AddonManifestWriter::refresh( $addon );
 		}
 
-		$manifest = AddonManifestWriter::read( $addon_id );
-		if ( null === $manifest ) {
+		$manifest = self::manifest_row( $addon_id );
+		$unread   = false === $manifest;
+		if ( ! is_array( $manifest ) ) {
 			// No manifest: only a live custom uninstall can still run.
 			if ( $addon instanceof HasCustomUninstall ) {
 				return new PurgePlan( $addon_id, [], [], [], [], [], [], [], 0, true );
@@ -139,10 +160,12 @@ final class AddonUninstaller {
 	public static function purge( string $addon_id, ?AddonInterface $addon = null, bool $single_site_teardown = false, bool $defer_shared = false, array &$shared = [], ?callable $journal = null ): PurgeResult {
 		// Narrowed in the plan, so the actions and before_uninstall() get the plan that runs.
 		$t_start  = microtime( true );
-		$plan     = self::plan( $addon_id, $addon, $single_site_teardown || $defer_shared );
+		$unread   = false;
+		$plan     = self::plan( $addon_id, $addon, $single_site_teardown || $defer_shared, $unread );
 		$errors   = [];
 		$shared   = [];
-		$deferred = $defer_shared ? self::shared_targets( $addon_id ) : [];
+		$claims   = self::others_claims( $addon_id );
+		$deferred = $defer_shared ? self::shared_targets( $addon_id, $claims ) : [];
 
 		/** @hook perflocale/addon/before_uninstall */
 		do_action( 'perflocale/addon/before_uninstall', $addon_id, $plan );
@@ -156,9 +179,25 @@ final class AddonUninstaller {
 		 * @param string $addon_id Addon identifier.
 		 * @param PurgePlan $plan The plan that would be executed.
 		 */
-		// The raw option first: uninstall.php runs without a booted Settings service, whose default could win.
+		// The stored row first, past every cache: uninstall.php runs without a booted Settings service, whose default could win.
 		$plugin_setting = true;
-		$raw_settings   = get_option( 'perflocale_settings', null );
+		$settings_row   = \PerfLocale\Database\OptionRead::of( 'perflocale_settings' );
+
+		// A failed read never grants: nothing is purged.
+		if ( $settings_row->failed ) {
+			$result = new PurgeResult( $plan, 0, 0, 0, 0, [], 0, 0, ( microtime( true ) - $t_start ) * 1000, [ self::SETTING_ERROR ], false, null );
+
+			/**
+			 * Fires after the refused purge.
+			 *
+			 * @hook perflocale/addon/uninstalled
+			 */
+			do_action( 'perflocale/addon/uninstalled', $addon_id, $result );
+
+			return $result;
+		}
+
+		$raw_settings = null !== $settings_row->bytes ? maybe_unserialize( $settings_row->bytes ) : null;
 		if ( is_array( $raw_settings ) && array_key_exists( 'delete_data_on_uninstall', $raw_settings ) ) {
 			$plugin_setting = (bool) $raw_settings['delete_data_on_uninstall'];
 		} elseif ( function_exists( 'perflocale' ) && class_exists( \PerfLocale\Plugin::class ) ) {
@@ -178,8 +217,8 @@ final class AddonUninstaller {
 			// Short-circuit: no data touched, no manifest cleared.
 			$skip_errors = [ 'skipped_by_filter' ];
 			if ( $defer_shared ) {
-				$shared = $deferred + [ 'kept' => true ];
-				if ( null !== $journal && ! $journal( $shared ) ) {
+				$shared = ( $deferred ?? [] ) + [ 'kept' => true ];
+				if ( null === $deferred || ( null !== $journal && ! $journal( $shared ) ) ) {
 					$skip_errors[] = self::JOURNAL_ERROR;
 				}
 			}
@@ -207,11 +246,22 @@ final class AddonUninstaller {
 			return $result;
 		}
 
+		// A failed read never grants: without the other add-ons' names or this add-on's manifest nothing is purged.
+		if ( null === $claims || $unread || null === $deferred ) {
+			$result = new PurgeResult( $plan, 0, 0, 0, 0, [], 0, 0, ( microtime( true ) - $t_start ) * 1000, [ self::CLAIMS_ERROR ], false, null );
+
+			/** @hook perflocale/addon/uninstalled */
+			do_action( 'perflocale/addon/uninstalled', $addon_id, $result );
+
+			return $result;
+		}
+
 		// A hard target outside the namespace could wipe core data.
 		try {
 			self::validate_hard_prefixes( $addon_id, $plan );
 		} catch ( \InvalidArgumentException $e ) {
-			AddonMigrationErrors::record( $addon_id, 'purge_validation', 'hard', $e->getMessage() );
+			$cause = \PerfLocale\Database\UpgradeRunner::describe( $e );
+			AddonMigrationErrors::record( $addon_id, 'purge_validation', 'hard', $cause );
 			// Fail closed - do not touch anything.
 			$result = new PurgeResult(
 				$plan,
@@ -223,7 +273,7 @@ final class AddonUninstaller {
 				0,
 				0,
 				( microtime( true ) - $t_start ) * 1000,
-				[ $e->getMessage() ],
+				[ $cause ],
 				false,
 				null
 			);
@@ -243,8 +293,9 @@ final class AddonUninstaller {
 				$addon->before_uninstall( $plan );
 				$custom_ran = true;
 			} catch ( \Throwable $e ) {
-				$custom_err = $e->getMessage();
-				AddonMigrationErrors::record( $addon_id, 'custom_uninstall', 'run', $custom_err );
+				// The class and place, never the add-on's message.
+				$custom_err = \PerfLocale\Database\UpgradeRunner::describe( $e );
+				AddonMigrationErrors::record( $addon_id, 'custom_uninstall', 'run', \PerfLocale\Database\UpgradeRunner::describe( $e ) );
 			}
 		} elseif ( $plan->had_custom_uninstall ) {
 			// Custom cleanup cannot run without the class: tell the admin.
@@ -257,17 +308,33 @@ final class AddonUninstaller {
 			);
 		}
 
+		// A name another component owns is never this add-on's: skipped with an error, the rest purges.
+		$claim_errors = [];
+		$meta         = [];
+
+		foreach ( $plan->meta as $type => $keys ) {
+			$meta[ $type ] = self::own_names( $addon_id, (array) $keys, $type . ' meta key', $claims, false, $claim_errors );
+		}
+
+		$options    = self::own_names( $addon_id, $plan->options, 'option', $claims, false, $claim_errors );
+		$site_opts  = self::own_names( $addon_id, $plan->site_options, 'site_option', $claims, false, $claim_errors );
+		$transients = self::own_names( $addon_id, $plan->transient_prefixes, 'transient prefix', $claims, true, $claim_errors );
+		$caps       = self::own_names( $addon_id, $plan->capabilities, 'capability', $claims, false, $claim_errors );
+		$crons      = self::own_names( $addon_id, $plan->cron_hooks, 'cron hook', $claims, false, $claim_errors );
+
 		// One failed target does not stop the rest.
-		[ $tables_dropped, $table_errors ]        = self::drop_tables( $plan->tables );
-		[ $options_deleted ]                      = self::delete_options( $plan->options );
-		[ $site_options_deleted ]                 = self::delete_site_options( $plan->site_options );
-		[ $transient_deleted, $transient_errors ] = self::delete_transients( $plan->transient_prefixes );
-		[ $meta_deleted, $meta_errors ]           = self::delete_meta( $plan->meta );
-		[ $caps_removed, $cap_errors ]            = self::remove_capabilities( $plan->capabilities );
-		[ $cron_unscheduled ]                     = self::unschedule_crons( $plan->cron_hooks );
+		[ $tables_dropped, $table_errors, $tables_refused ]           = self::drop_tables( $plan->tables );
+		[ $options_deleted ]                                          = self::delete_options( $options );
+		[ $site_options_deleted, $site_errors, $site_refused ]        = self::delete_site_options( $site_opts );
+		[ $transient_deleted, $transient_errors, $transient_refused ] = self::delete_transients( $transients );
+		[ $meta_deleted, $meta_errors, $meta_refused ]                = self::delete_meta( $meta );
+		[ $caps_removed, $cap_errors ]                                = self::remove_capabilities( $caps );
+		[ $cron_unscheduled ]                                         = self::unschedule_crons( $crons );
 
 		$errors = array_merge(
+			$claim_errors,
 			$table_errors,
+			$site_errors,
 			$transient_errors,
 			$meta_errors,
 			$cap_errors
@@ -280,6 +347,9 @@ final class AddonUninstaller {
 		// Drop manifest + stored schema version, once the deferred targets are stored: the manifest is their only source.
 		if ( $defer_shared && null !== $journal && ! $journal( $shared ) ) {
 			$errors[] = self::JOURNAL_ERROR;
+		} elseif ( $tables_refused + $site_refused + $transient_refused + $meta_refused > 0 ) {
+			// Without the manifest nothing could find what is left; every step is a no-op when it runs again.
+			$errors[] = self::LEFT_ERROR;
 		} else {
 			AddonManifestWriter::forget( $addon_id );
 			AddonSchemaManager::forget( $addon_id );
@@ -290,20 +360,7 @@ final class AddonUninstaller {
 		if ( ! $single_site_teardown && ( [] !== $plan->transient_prefixes || [] !== $plan->options ) ) {
 			wp_cache_flush_group( 'options' );
 		}
-		// With a persistent cache transients live in their own groups, which the raw DELETE misses.
-		if ( ! $single_site_teardown && [] !== $plan->transient_prefixes && wp_using_ext_object_cache() ) {
-			// Probe: some backends ignore the group flush while claiming support (Redis Object Cache with Predis).
-			wp_cache_set( 'perflocale_purge_probe', 1, 'transient', 60 );
-			wp_cache_flush_group( 'transient' );
-			wp_cache_flush_group( 'site-transient' );
-			if ( false !== wp_cache_get( 'perflocale_purge_probe', 'transient' ) ) {
-				wp_cache_delete( 'perflocale_purge_probe', 'transient' );
-				$errors[] = sprintf(
-					"Object-cache group flush had no effect on this backend - external-cache transients for prefix(es) '%s' may persist until they expire or the cache is flushed manually",
-					implode( "', '", array_filter( $plan->transient_prefixes, 'is_string' ) )
-				);
-			}
-		}
+		// Never the shared 'transient' groups of a persistent cache: every plugin's transients live there; the add-on's expire.
 		foreach ( [
 			'post'    => 'post_meta',
 			'user'    => 'user_meta',
@@ -337,20 +394,155 @@ final class AddonUninstaller {
 	}
 
 	/**
+	 * The add-on ids a SiteCleanup pass read before purging any of them: they stay siblings after their manifests go.
+	 *
+	 * @param array<array-key, string> $ids Add-on ids.
+	 * @return void
+	 */
+	public static function set_pass_ids( array $ids ): void {
+		self::$pass_ids = array_values( array_filter( $ids, static fn( $id ): bool => '' !== $id ) );
+	}
+
+	/**
 	 * An addon's network-global targets from its manifest: network options and
 	 * user meta keys, each within the namespace the purge enforces.
 	 *
-	 * @param string $addon_id Addon identifier.
-	 * @return array{site_options: array<int, string>, user: array<int, string>}
+	 * @param string                                                  $addon_id Addon identifier.
+	 * @param array{exact: list<string>, prefixes: list<string>}|null $claims   others_claims(); null: unfiltered.
+	 * @return array{site_options: array<int, string>, user: array<int, string>}|null Null when the manifest read failed.
 	 */
-	private static function shared_targets( string $addon_id ): array {
-		$manifest = AddonManifestWriter::read( $addon_id ) ?? [];
+	private static function shared_targets( string $addon_id, ?array $claims ): ?array {
+		$manifest = self::manifest_row( $addon_id );
+
+		if ( false === $manifest ) {
+			return null;
+		}
+
+		$manifest = $manifest ?? [];
 		$meta     = is_array( $manifest['meta'] ?? null ) ? $manifest['meta'] : [];
+		$errors   = [];
+		$site     = array_values( array_filter( (array) ( $manifest['site_options'] ?? [] ), static fn( $o ): bool => is_string( $o ) && str_starts_with( $o, self::OPTION_PREFIX ) ) );
+		$user     = array_values( array_filter( (array) ( $meta['user'] ?? [] ), static fn( $k ): bool => is_string( $k ) && ( str_starts_with( $k, 'perflocale_' ) || str_starts_with( $k, '_perflocale_' ) ) ) );
+
+		// Unknown claims (failed read): the names stay as declared, only ever kept (the purge itself fails closed).
+		return null === $claims ? [
+			'site_options' => $site,
+			'user'         => $user,
+		] : [
+			'site_options' => self::own_names( $addon_id, $site, 'site_option', $claims, false, $errors ),
+			'user'         => self::own_names( $addon_id, $user, 'user meta key', $claims, false, $errors ),
+		];
+	}
+
+	/**
+	 * The stored manifest past every cache: a cached absence or a failed read never looks like "no manifest".
+	 *
+	 * @param string $addon_id Addon identifier.
+	 * @return array<mixed>|false|null Null when absent or not an array, false when the read failed.
+	 */
+	private static function manifest_row( string $addon_id ): array|false|null {
+		$row = \PerfLocale\Database\OptionRead::of( AddonManifestWriter::option_name( $addon_id ) );
+
+		if ( $row->failed ) {
+			return false;
+		}
+
+		$manifest = null !== $row->bytes ? maybe_unserialize( $row->bytes ) : null;
+
+		return is_array( $manifest ) ? $manifest : null;
+	}
+
+	/**
+	 * What other components own, lowercase without leading underscores: the core registry's names and name prefixes (not
+	 * its namespace-wide entries), core's capabilities, and the prefixes of Pro and of every other registered add-on.
+	 *
+	 * @param string $addon_id The add-on being purged.
+	 * @return array{exact: list<string>, prefixes: list<string>}|null Null when the stored manifests or schema versions could not be read.
+	 */
+	private static function others_claims( string $addon_id ): ?array {
+		global $wpdb;
+
+		[ 'exact' => $exact, 'prefixes' => $prefixes ] = \PerfLocale\Database\SiteCleanup::core_claims();
+
+		$dir = dirname( __DIR__, 2 ) . '/addons';
+		$ids = array_merge( AddonManifestWriter::list_ids(), self::$pass_ids );
+
+		// list_ids() answers [] for a failed read too; its query is the last one.
+		if ( ! $wpdb instanceof \wpdb || '' !== $wpdb->last_error ) {
+			return null;
+		}
+
+		foreach ( is_dir( $dir ) ? (array) scandir( $dir ) : [] as $entry ) {
+			if ( is_string( $entry ) && '' !== $entry && '.' !== $entry[0] && is_dir( $dir . '/' . $entry ) ) {
+				$ids[] = $entry;
+			}
+		}
+
+		$versions = \PerfLocale\Database\OptionRead::of( AddonSchemaManager::VERSIONS_OPTION );
+
+		if ( $versions->failed ) {
+			return null;
+		}
+
+		$versions = null !== $versions->bytes ? maybe_unserialize( $versions->bytes ) : null;
+		$ids      = array_merge( $ids, is_array( $versions ) ? array_map( 'strval', array_keys( $versions ) ) : [] );
+
+		foreach ( array_diff( array_unique( $ids ), [ $addon_id ] ) as $id ) {
+			$prefixes[] = 'perflocale_' . str_replace( '-', '_', $id ) . '_';
+		}
+
+		$bare = static fn( string $n ): string => strtolower( ltrim( $n, '_' ) );
 
 		return [
-			'site_options' => array_values( array_filter( (array) ( $manifest['site_options'] ?? [] ), static fn( $o ): bool => is_string( $o ) && str_starts_with( $o, self::OPTION_PREFIX ) ) ),
-			'user'         => array_values( array_filter( (array) ( $meta['user'] ?? [] ), static fn( $k ): bool => is_string( $k ) && ( str_starts_with( $k, 'perflocale_' ) || str_starts_with( $k, '_perflocale_' ) ) ) ),
+			'exact'    => array_values( array_unique( array_map( $bare, $exact ) ) ),
+			'prefixes' => array_values( array_unique( array_filter( array_map( $bare, $prefixes ), static fn( string $p ): bool => strlen( $p ) > strlen( 'perflocale_' ) ) ) ),
 		];
+	}
+
+	/**
+	 * $names without those another component may own (others_claims()): under a sibling's prefix is refused even when it
+	 * is also under this add-on's longer one (ids `foo` and `foo_bar`): ownership is unproven.
+	 * A transient prefix ($prefix) is also refused when it would cover another's name.
+	 *
+	 * @param string                                             $addon_id Add-on id.
+	 * @param array<int, mixed>                                  $names    Declared names.
+	 * @param string                                             $kind     Target kind, for the error.
+	 * @param array{exact: list<string>, prefixes: list<string>} $claims   Others' names.
+	 * @param bool                                               $prefix   Whether each name is a transient prefix.
+	 * @param array<int, string>                                 $errors   Gets one error per refused name.
+	 * @return array<int, string>
+	 */
+	private static function own_names( string $addon_id, array $names, string $kind, array $claims, bool $prefix, array &$errors ): array {
+		$out = [];
+
+		foreach ( $names as $name ) {
+			if ( ! is_string( $name ) ) {
+				continue;
+			}
+
+			$bare    = strtolower( ltrim( $name, '_' ) );
+			$claimed = in_array( $bare, $claims['exact'], true ) || ( $prefix && strlen( $bare ) <= strlen( 'perflocale_' ) );
+
+			foreach ( $claims['prefixes'] as $p ) {
+				if ( str_starts_with( $bare, $p ) || ( $prefix && str_starts_with( $p, $bare ) ) ) {
+					$claimed = true;
+					break;
+				}
+			}
+
+			foreach ( $prefix ? $claims['exact'] : [] as $other ) {
+				$claimed = $claimed || str_starts_with( $other, $bare );
+			}
+
+			if ( $claimed ) {
+				$errors[] = "Addon '{$addon_id}' {$kind} '{$name}' belongs to another component (skipped)";
+				continue;
+			}
+
+			$out[] = $name;
+		}
+
+		return $out;
 	}
 
 	/**
@@ -368,11 +560,13 @@ final class AddonUninstaller {
 				$by_network[ (int) $m[1] ][] = $m[2];
 			}
 		}
+		$errors = [];
 		foreach ( $by_network as $network_id => $names ) {
-			self::delete_site_options( $names, $network_id );
+			$errors = array_merge( $errors, self::delete_site_options( $names, $network_id )[1] );
 		}
 
-		[ $deleted, $errors ] = self::delete_meta( [ 'user' => array_values( $user_keys ) ] );
+		[ $deleted, $meta_errors ] = self::delete_meta( [ 'user' => array_values( $user_keys ) ] );
+		$errors                    = array_merge( $errors, $meta_errors );
 
 		if ( ( $deleted['user'] ?? 0 ) > 0 ) {
 			wp_cache_flush_group( 'user_meta' );
@@ -397,7 +591,8 @@ final class AddonUninstaller {
 			if ( ! is_string( $table ) || ! str_starts_with( $table, $expected_table_prefix ) ) {
 				// Escaped in case wp_die() renders the message.
 				throw new \InvalidArgumentException(
-					esc_html( "Addon '{$addon_id}' target table '{$table}' is outside its namespace {$expected_table_prefix}*" )
+					esc_html( "Addon '{$addon_id}' target table '{$table}' is outside its namespace {$expected_table_prefix}*" ),
+					(int) \PerfLocale\Database\UpgradeRunner::OWN_ERROR
 				);
 			}
 		}
@@ -405,7 +600,8 @@ final class AddonUninstaller {
 		foreach ( $plan->options as $option ) {
 			if ( ! is_string( $option ) || ! str_starts_with( $option, self::OPTION_PREFIX ) ) {
 				throw new \InvalidArgumentException(
-					esc_html( "Addon '{$addon_id}' target option '{$option}' must start with " . self::OPTION_PREFIX )
+					esc_html( "Addon '{$addon_id}' target option '{$option}' must start with " . self::OPTION_PREFIX ),
+					(int) \PerfLocale\Database\UpgradeRunner::OWN_ERROR
 				);
 			}
 		}
@@ -413,7 +609,8 @@ final class AddonUninstaller {
 		foreach ( $plan->site_options as $option ) {
 			if ( ! is_string( $option ) || ! str_starts_with( $option, self::OPTION_PREFIX ) ) {
 				throw new \InvalidArgumentException(
-					esc_html( "Addon '{$addon_id}' target site_option '{$option}' must start with " . self::OPTION_PREFIX )
+					esc_html( "Addon '{$addon_id}' target site_option '{$option}' must start with " . self::OPTION_PREFIX ),
+					(int) \PerfLocale\Database\UpgradeRunner::OWN_ERROR
 				);
 			}
 		}
@@ -421,7 +618,8 @@ final class AddonUninstaller {
 		foreach ( $plan->capabilities as $cap ) {
 			if ( ! is_string( $cap ) || ! str_starts_with( $cap, self::CAP_PREFIX ) ) {
 				throw new \InvalidArgumentException(
-					esc_html( "Addon '{$addon_id}' target capability '{$cap}' must start with " . self::CAP_PREFIX )
+					esc_html( "Addon '{$addon_id}' target capability '{$cap}' must start with " . self::CAP_PREFIX ),
+					(int) \PerfLocale\Database\UpgradeRunner::OWN_ERROR
 				);
 			}
 		}
@@ -431,12 +629,13 @@ final class AddonUninstaller {
 	 * Drop declared tables.
 	 *
 	 * @param array<int, string> $tables Full table names with prefix.
-	 * @return array{0:int,1:array<int,string>}
+	 * @return array{0:int,1:array<int,string>,2:int} Dropped, errors, DROPs the database refused.
 	 */
 	private static function drop_tables( array $tables ): array {
 		global $wpdb;
 		$dropped = 0;
 		$errors  = [];
+		$refused = 0;
 		foreach ( $tables as $t ) {
 			if ( ! is_string( $t ) || '' === $t ) {
 				continue;
@@ -456,12 +655,13 @@ final class AddonUninstaller {
 			);
 			// phpcs:enable WordPress.DB.DirectDatabaseQuery.SchemaChange, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 			if ( false === $ok ) {
-				$errors[] = "DROP TABLE {$safe} failed: " . $wpdb->last_error;
+				$errors[] = "DROP TABLE {$safe} failed: " . \PerfLocale\Util\DbErrorCode::of( \PerfLocale\Admin\Typed::str( $wpdb->last_error ) );
+				++$refused;
 				continue;
 			}
 			++$dropped;
 		}
-		return [ $dropped, $errors ];
+		return [ $dropped, $errors, $refused ];
 	}
 
 	/**
@@ -484,23 +684,29 @@ final class AddonUninstaller {
 	}
 
 	/**
-	 * Delete declared site options (multisite).
+	 * Delete declared site options (multisite); a row still there or unreadable after a false is an error.
 	 *
 	 * @param array<int, string> $options    Option names.
 	 * @param int|null           $network_id Network; null: the current one.
-	 * @return array{0:int}
+	 * @return array{0:int,1:array<int,string>,2:int} Deleted, errors, rows left.
 	 */
 	private static function delete_site_options( array $options, ?int $network_id = null ): array {
-		$count = 0;
+		$count   = 0;
+		$errors  = [];
+		$refused = 0;
+		$network = $network_id ?? get_current_network_id();
 		foreach ( $options as $name ) {
 			if ( ! is_string( $name ) || ! str_starts_with( $name, self::OPTION_PREFIX ) ) {
 				continue;
 			}
-			if ( delete_network_option( $network_id, $name ) ) {
+			if ( delete_network_option( $network, $name ) ) {
 				++$count;
+			} elseif ( ! \PerfLocale\Database\SiteCleanup::network_option_gone( $network, $name ) ) {
+				$errors[] = "Network option {$name} on network {$network} was not deleted";
+				++$refused;
 			}
 		}
-		return [ $count ];
+		return [ $count, $errors, $refused ];
 	}
 
 	/**
@@ -508,12 +714,13 @@ final class AddonUninstaller {
 	 * _transient_{$prefix} or _transient_timeout_{$prefix}).
 	 *
 	 * @param array<int, string> $prefixes Transient prefixes.
-	 * @return array{0:int,1:array<int,string>}
+	 * @return array{0:int,1:array<int,string>,2:int} Deleted, errors, DELETEs the database refused.
 	 */
 	private static function delete_transients( array $prefixes ): array {
 		global $wpdb;
-		$total  = 0;
-		$errors = [];
+		$total   = 0;
+		$errors  = [];
+		$refused = 0;
 		foreach ( $prefixes as $prefix ) {
 			if ( ! is_string( $prefix ) || ! str_starts_with( $prefix, self::TRANSIENT_PREFIX ) ) {
 				$errors[] = "Transient prefix '{$prefix}' does not start with " . self::TRANSIENT_PREFIX . ' (skipped)';
@@ -531,24 +738,26 @@ final class AddonUninstaller {
 				)
 			);
 			if ( false === $deleted ) {
-				$errors[] = "Transient purge for prefix '{$prefix}' failed: " . $wpdb->last_error;
+				$errors[] = "Transient purge for prefix '{$prefix}' failed: " . \PerfLocale\Util\DbErrorCode::of( \PerfLocale\Admin\Typed::str( $wpdb->last_error ) );
+				++$refused;
 				continue;
 			}
 			$total += (int) $deleted;
 		}
-		return [ $total, $errors ];
+		return [ $total, $errors, $refused ];
 	}
 
 	/**
 	 * Delete object meta rows, batched per object type.
 	 *
 	 * @param array<string, array<int, string>> $meta object_type => meta keys.
-	 * @return array{0:array<string,int>,1:array<int,string>}
+	 * @return array{0:array<string,int>,1:array<int,string>,2:int} Deleted per type, errors, DELETEs the database refused.
 	 */
 	private static function delete_meta( array $meta ): array {
 		global $wpdb;
-		$counts = [];
-		$errors = [];
+		$counts  = [];
+		$errors  = [];
+		$refused = 0;
 
 		$tables = [
 			'post'    => $wpdb->postmeta,
@@ -591,7 +800,8 @@ final class AddonUninstaller {
 					)
 				);
 				if ( false === $deleted ) {
-					$errors[] = "DELETE from {$table} failed: " . $wpdb->last_error;
+					$errors[] = "DELETE from {$table} failed: " . \PerfLocale\Util\DbErrorCode::of( \PerfLocale\Admin\Typed::str( $wpdb->last_error ) );
+					++$refused;
 					break;
 				}
 				$total += (int) $deleted;
@@ -603,7 +813,7 @@ final class AddonUninstaller {
 			$counts[ $type ] = $total;
 		}
 
-		return [ $counts, $errors ];
+		return [ $counts, $errors, $refused ];
 	}
 
 	/**

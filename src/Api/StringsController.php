@@ -158,6 +158,8 @@ final class StringsController extends RestController {
 			'target_lang_ids' => $target_lang_ids,
 			'provider_id'     => sanitize_key( (string) ( $request->get_param( 'provider_id' ) ?? '' ) ),
 			'skip_existing'   => ! ( $request->get_param( 'overwrite' ) === '1' || $request->get_param( 'overwrite' ) === true ),
+			// Domains the dispatching user may not send to a provider; the job honours the list in every selection mode.
+			'exclude_domains' => \PerfLocale\Strings\Domains::restricted_for_current_user(),
 		];
 
 		if ( $mode === 'ids' ) {
@@ -208,6 +210,8 @@ final class StringsController extends RestController {
 
 		if ( 'denied' === $mode ) {
 			$response->set_status( rest_authorization_required_code() );
+		} elseif ( ! empty( $result['busy'] ) ) {
+			$response->set_status( 409 );
 		} elseif ( 'error' === $mode || ( 'sync' === $mode && isset( $result['error'] ) ) ) {
 			$response->set_status( 500 );
 		}
@@ -229,13 +233,19 @@ final class StringsController extends RestController {
 		$per_page = min( max( 1, absint( $request->get_param( 'per_page' ) ?? 50 ) ), 100 );
 
 		$args = [
-			'domain' => sanitize_text_field( $request->get_param( 'domain' ) ?? '' ),
-			'limit'  => $per_page,
-			'offset' => absint( $request->get_param( 'offset' ) ?? 0 ),
+			'domain'          => sanitize_text_field( $request->get_param( 'domain' ) ?? '' ),
+			'limit'           => $per_page,
+			'offset'          => absint( $request->get_param( 'offset' ) ?? 0 ),
+			'exclude_domains' => \PerfLocale\Strings\Domains::restricted_for_current_user(),
 		];
 
 		$strings = $repo->find_all( $args );
-		$total   = $repo->count( [ 'domain' => $args['domain'] ] );
+		$total   = $repo->count(
+			[
+				'domain'          => $args['domain'],
+				'exclude_domains' => $args['exclude_domains'],
+			]
+		);
 
 		return $this->paginated( $strings, $total, $per_page );
 	}

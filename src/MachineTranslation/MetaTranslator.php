@@ -30,6 +30,9 @@ final class MetaTranslator {
 	 */
 	public const ERRORS_META_KEY = '_perflocale_meta_mt_errors';
 
+	/** The meta_key_format of a field that stores code: copied from the source, never sent. */
+	public const FORMAT_COPY = 'copy';
+
 	/**
 	 * Plugin settings.
 	 *
@@ -68,10 +71,14 @@ final class MetaTranslator {
 	 * @return string[]
 	 */
 	public function get_mt_meta_keys( string $post_type, int $post_id = 0, int $translation_id = 0 ): array {
+		// Switched to another blog, no meta key is known to be text there (the job reports the skip).
+		if ( \PerfLocale\Translation\Fields\FieldMap::definitions_unavailable() ) {
+			return [];
+		}
+
 		/**
 		 * The machine-translatable meta keys: leaf text a translator would rewrite (text, textarea, rich text). Never
-		 * structural keys, URLs, emails, serialized values or SEO focus keywords (those go on
-		 * perflocale/translatable_meta_keys).
+		 * structural keys, URLs, emails or serialized values (those go on perflocale/translatable_meta_keys).
 		 *
 		 * @hook perflocale/mt/translatable_meta_keys
 		 *
@@ -81,7 +88,16 @@ final class MetaTranslator {
 		 * @param int      $translation_id Translation post ID the values are
 		 *                                 written to (0 when unknown).
 		 */
-		$keys = (array) apply_filters( 'perflocale/mt/translatable_meta_keys', [], $post_type, $post_id, $translation_id );
+		// The field addons' map builds under this filter share one answer of the copy patterns.
+		$window = \PerfLocale\Translation\PostTranslationWrites::open_patterns_window();
+
+		try {
+			$keys = (array) apply_filters( 'perflocale/mt/translatable_meta_keys', [], $post_type, $post_id, $translation_id );
+		} finally {
+			if ( $window ) {
+				\PerfLocale\Translation\PostTranslationWrites::close_patterns_window();
+			}
+		}
 
 		// Non-empty strings only: a sloppy filter's ints or bools would become junk keys, an array a warning.
 		$keys = array_values( array_unique( array_filter( $keys, static fn( $k ): bool => is_string( $k ) && trim( $k ) !== '' ) ) );
@@ -112,10 +128,11 @@ final class MetaTranslator {
 	 * @param string $source_lang    Source language slug.
 	 * @param string $target_lang    Target language slug.
 	 * @param string $provider_id    Provider override ('' = configured default).
+	 * @param bool   $equal_only     Back-fill: only keys whose one row on the translation is the source's value byte for byte.
 	 * @return array{translated:int, skipped:int, failed:int, errors:array<int,string>}
 	 * @throws DeadlineReachedException When a call does not fit the slice's deadline (nothing written).
 	 */
-	public function translate_post_meta( int $source_id, int $translation_id, string $source_lang, string $target_lang, string $provider_id = '' ): array {
+	public function translate_post_meta( int $source_id, int $translation_id, string $source_lang, string $target_lang, string $provider_id = '', bool $equal_only = false ): array {
 		$result = [
 			'translated' => 0,
 			'skipped'    => 0,
@@ -130,6 +147,11 @@ final class MetaTranslator {
 		}
 
 		$keys = $this->get_mt_meta_keys( $post_type, $source_id, $translation_id );
+
+		// The ReSync capture of a started machine translation takes these keys; without a capture the class is not loaded.
+		if ( class_exists( \PerfLocale\Resync\SyncRecorder::class, false ) ) {
+			\PerfLocale\Resync\SyncRecorder::note_mt_keys( $source_id, $translation_id, $keys );
+		}
 
 		// A key listed for the source but not for this translation counts as skipped.
 		$result['skipped'] += count( array_diff( $this->get_mt_meta_keys( $post_type, $source_id ), $keys ) );
@@ -164,7 +186,7 @@ final class MetaTranslator {
 			// The key's rows on the target from the primed cache: the snapshot the write may replace ([] when absent).
 			$rows = array_values( (array) get_metadata_raw( 'post', $translation_id, $key, false ) );
 
-			if ( count( $rows ) > 1 || ( is_string( $target_val ) && $target_val !== '' && $target_val !== $source_val ) ) {
+			if ( count( $rows ) > 1 || ( is_string( $target_val ) && $target_val !== '' && $target_val !== $source_val ) || ( $equal_only && $target_val !== $source_val ) ) {
 				// Translator-owned, or several rows: never overwritten.
 				++$result['skipped'];
 				continue;
@@ -181,14 +203,41 @@ final class MetaTranslator {
 			return $result;
 		}
 
-		// Mask placeholders (SEO tags, printf tokens, {vars}); a value with no letter outside them is copied, never sent.
+		// Least trust: a source an author or last editor without unfiltered_html wrote keeps only what such a user may
+		// save (core never filters meta), before anything is sent, copied or kept.
+		require_once __DIR__ . '/../Translation/SourceTrust.php';
+
+		if ( ! \PerfLocale\Translation\SourceTrust::trusted( $source_id ) ) {
+			$to_translate = array_map( [ \PerfLocale\Translation\SourceTrust::class, 'mt_source' ], $to_translate );
+		}
+
+		// Mask placeholders (SEO tags, printf tokens, {vars}); a value with no letter outside them (and, in html, outside
+		// the shortcode tags the service holds back) is copied, never sent, unless perflocale/mt/translate_letterless sends
+		// it (TranslationService::sends_item()). A 'copy' key is copied as the acting user saves it.
 		$masked_by_key = [];
 		$verbatim      = [];
+		$formats       = [];
+		$copy          = [];
 		foreach ( $to_translate as $key => $val ) {
 			// mask() returns [masked_text, placeholders].
 			$masked_by_key[ $key ] = PlaceholderMasker::mask( $val );
+			$formats[ $key ]       = $this->meta_format( (string) $key, $post_type, $source_id );
 
-			if ( ! self::has_translatable_letter( $masked_by_key[ $key ][0], count( $masked_by_key[ $key ][1] ) ) ) {
+			if ( self::FORMAT_COPY === $formats[ $key ] ) {
+				$copy[ $key ]     = true;
+				$verbatim[ $key ] = true;
+				continue;
+			}
+
+			$masked = $masked_by_key[ $key ][0];
+
+			if ( 'html' === $formats[ $key ] && str_contains( $masked, '[' ) && self::has_translatable_letter( $masked, count( $masked_by_key[ $key ][1] ) ) ) {
+				$masked = ShortcodeMask::bare( $masked );
+			}
+
+			$count = count( $masked_by_key[ $key ][1] );
+
+			if ( ! self::has_translatable_letter( $masked, $count ) && ! TranslationService::sends_item( self::without_placeholders( $masked, $count ), 'meta', $target_lang, false, $val ) ) {
 				$verbatim[ $key ] = true;
 			}
 		}
@@ -197,7 +246,7 @@ final class MetaTranslator {
 		$estimated = 0;
 		foreach ( $to_translate as $key => $v ) {
 			if ( ! isset( $verbatim[ $key ] ) ) {
-				$estimated += mb_strlen( $v );
+				$estimated += \PerfLocale\Util\Utf8::length( $v );
 			}
 		}
 
@@ -219,25 +268,20 @@ final class MetaTranslator {
 		// Batch per destination format: a key an add-on declares 'text' uses the provider's text mode and text
 		// sanitising; every other key stays 'html' with the allowlist sanitiser.
 		$keys_by_format = [];
+		$pieces         = [];
 		foreach ( $ordered_keys as $key ) {
 			if ( isset( $verbatim[ $key ] ) ) {
 				continue;
 			}
 
-			/**
-			 * Filter a meta key's machine-translation format: 'text' for plain-text meta (provider text mode, no entity
-			 * escaping), 'html' (default) for markup.
-			 *
-			 * @hook perflocale/mt/meta_key_format
-			 * @param string $format    'html' (default) or 'text'.
-			 * @param string $key       Meta key.
-			 * @param string $post_type Source post type.
-			 * @param int    $source_id Source post ID.
-			 */
-			$fmt = apply_filters( 'perflocale/mt/meta_key_format', 'html', $key, $post_type, $source_id );
-			$fmt = ( 'text' === $fmt ) ? 'text' : 'html';
+			if ( KeywordList::FORMAT === $formats[ $key ] ) {
+				// Masked first, so a placeholder's own comma never splits a keyword.
+				$pieces[ $key ]           = KeywordList::split( $masked_by_key[ $key ][0] );
+				$keys_by_format['text'][] = $key;
+				continue;
+			}
 
-			$keys_by_format[ $fmt ][] = $key;
+			$keys_by_format[ $formats[ $key ] ][] = $key;
 		}
 
 		// One provider call per format; results go back by index into $ordered_keys.
@@ -247,23 +291,39 @@ final class MetaTranslator {
 		try {
 			foreach ( $keys_by_format as $fmt => $group_keys ) {
 				$group_batch = [];
+				$labels      = [];
 				foreach ( $group_keys as $key ) {
-					$group_batch[] = $masked_by_key[ $key ][0];
+					/* translators: %s: meta key */
+					$label = sprintf( __( 'meta key %s', 'perflocale' ), (string) $key );
+					foreach ( $pieces[ $key ] ?? [ $masked_by_key[ $key ][0] ] as $text ) {
+						$group_batch[] = $text;
+						$labels[]      = $label;
+					}
 				}
 
 				// Brings the monthly cap, the count-mismatch failure and the format's sanitising.
-				/* translators: %s: meta key */
-				$labels    = array_map( static fn( $key ): string => sprintf( __( 'meta key %s', 'perflocale' ), (string) $key ), $group_keys );
 				$group_out = $this->service->translate_batch_texts( $group_batch, $source_lang, $target_lang, $provider_id, false, $fmt, $labels );
+				$at        = 0;
 
-				foreach ( $group_keys as $gi => $key ) {
-					$translated[ $key_index[ $key ] ] = $group_out[ $gi ] ?? '';
+				foreach ( $group_keys as $key ) {
+					if ( isset( $pieces[ $key ] ) ) {
+						// An unusable keyword leaves '' here: the failure below keeps the whole existing value.
+						$n                                = count( $pieces[ $key ] );
+						$translated[ $key_index[ $key ] ] = (string) KeywordList::join( array_slice( $group_out, $at, $n ), $n );
+						$at                              += $n;
+						continue;
+					}
+
+					$translated[ $key_index[ $key ] ] = $group_out[ $at ] ?? '';
+					++$at;
 				}
 			}
-		} catch ( DeadlineReachedException $e ) {
-			// The bulk slice stops and redoes the post, still marked pending, in its next run.
-			throw $e;
 		} catch ( \Throwable $e ) {
+			// In a job slice a stop redoes the post, still marked pending, in its next run; elsewhere it is a meta failure.
+			if ( $e instanceof DeadlineReachedException && $this->service->in_job() ) {
+				throw $e;
+			}
+
 			$result['failed']   = count( $to_translate ) - count( $verbatim );
 			$result['skipped'] += count( $verbatim );
 			$result['errors'][] = $e->getMessage();
@@ -301,8 +361,9 @@ final class MetaTranslator {
 			}
 
 			if ( isset( $verbatim[ $ordered_key ] ) ) {
-				// Placeholders only: the source value as it is.
-				$state = $this->write( $translation_id, $key, $to_translate[ $ordered_key ], $target_rows[ $ordered_key ], $snapshot );
+				// Placeholders only, or a 'copy' key: the source value as the acting user would save it.
+				$copied = \PerfLocale\Resync\SaveProbe::as_user( $to_translate[ $ordered_key ] );
+				$state  = $this->write( $translation_id, $key, $copied, $target_rows[ $ordered_key ], $snapshot );
 
 				if ( 'failed' === $state ) {
 					++$result['failed'];
@@ -326,7 +387,9 @@ final class MetaTranslator {
 				continue;
 			}
 
-			$restored = PlaceholderMasker::restore( $out, $masked_by_key[ $key ][1] );
+			// The MT allowlist with the placeholders back; the source's own held elements kept where they are text.
+			$kept     = false;
+			$restored = TranslationService::sanitize_mt_value_kept( PlaceholderMasker::restore( $out, $masked_by_key[ $key ][1] ), $to_translate[ $key ], $kept );
 
 			// A result that dropped a placeholder would break an SEO template or format string: keep the source.
 			if ( ! PlaceholderMasker::preserves_placeholders( $to_translate[ $key ], $restored ) ) {
@@ -335,7 +398,8 @@ final class MetaTranslator {
 				continue;
 			}
 
-			$state = $this->write( $translation_id, $key, $restored, $target_rows[ $key ], $snapshot );
+			// Kept source markup under the acting user's rules (KSES without unfiltered_html), as 'copy' saves it.
+			$state = $this->write( $translation_id, $key, $kept ? \PerfLocale\Resync\SaveProbe::as_user( $restored ) : $restored, $target_rows[ $key ], $snapshot );
 
 			if ( 'conflict' === $state ) {
 				++$result['skipped'];
@@ -395,6 +459,34 @@ final class MetaTranslator {
 	}
 
 	/**
+	 * A meta key's machine-translation format.
+	 *
+	 * @param string $key       Meta key.
+	 * @param string $post_type Source post type.
+	 * @param int    $source_id Source post ID.
+	 * @return string 'html', 'text', 'copy' or 'keywords'.
+	 */
+	private function meta_format( string $key, string $post_type, int $source_id ): string {
+		/**
+		 * Filter a meta key's machine-translation format: 'text' for plain-text meta (provider text mode, no entity
+		 * escaping), 'html' (default) for markup, 'copy' for a field that stores code: the source value, never sent,
+		 * saved under the acting user's HTML rules.
+		 *
+		 * @hook perflocale/mt/meta_key_format
+		 * @param string $format    'html' (default), 'text', 'copy' or 'keywords' (a "kw1,kw2" list, each keyword sent alone).
+		 * @param string $key       Meta key.
+		 * @param string $post_type Source post type.
+		 * @param int    $source_id Source post ID.
+		 */
+		$fmt = apply_filters( 'perflocale/mt/meta_key_format', 'html', $key, $post_type, $source_id );
+
+		return match ( $fmt ) {
+			'text', self::FORMAT_COPY, KeywordList::FORMAT => $fmt,
+			default                   => 'html',
+		};
+	}
+
+	/**
 	 * Whether masked text keeps a letter without its placeholder sentinels (anything to translate).
 	 *
 	 * @param string $masked Text returned by PlaceholderMasker::mask().
@@ -402,12 +494,23 @@ final class MetaTranslator {
 	 * @return bool
 	 */
 	private static function has_translatable_letter( string $masked, int $count ): bool {
+		// Invalid UTF-8 (preg_match() false) is sent.
+		return 0 !== preg_match( '/\p{L}/u', self::without_placeholders( $masked, $count ) );
+	}
+
+	/**
+	 * Masked text without its placeholder sentinels.
+	 *
+	 * @param string $masked Text returned by PlaceholderMasker::mask().
+	 * @param int    $count  Number of placeholders mask() replaced.
+	 * @return string
+	 */
+	private static function without_placeholders( string $masked, int $count ): string {
 		for ( $n = 0; $n < $count; $n++ ) {
 			$masked = str_replace( '[[PFL_PH_' . $n . ']]', '', $masked );
 		}
 
-		// Invalid UTF-8 (preg_match() false) is sent.
-		return 0 !== preg_match( '/\p{L}/u', $masked );
+		return $masked;
 	}
 
 	/**

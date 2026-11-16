@@ -158,7 +158,7 @@ final class AbilitiesRegistrar {
 			return null;
 		}
 
-		if ( ! current_user_can( 'edit_post', $object_id ) ) {
+		if ( ! \PerfLocale\Util\ObjectPermission::edit_narrowed( $object_id ) ) {
 			return new \WP_Error(
 				'cannot_access_post',
 				__( 'You cannot access this post.', 'perflocale' ),
@@ -317,8 +317,8 @@ final class AbilitiesRegistrar {
 						'translations' => [
 							'type'                 => 'object',
 							'title'                => 'Translations',
-							'description'          => 'Map of language slug to the translated object\'s ID. The queried object itself is included under its own language. A translated post the caller may neither read nor edit, or a translated term the caller may not edit, is listed with null.',
-							'additionalProperties' => [ 'type' => [ 'integer', 'null' ] ],
+							'description'          => 'Map of language slug to the translated object\'s ID. The queried object itself is included under its own language. A translated post the caller may neither read nor edit, or a translated term the caller may not edit, is left out, as a missing translation.',
+							'additionalProperties' => [ 'type' => 'integer' ],
 						],
 					],
 				],
@@ -349,7 +349,7 @@ final class AbilitiesRegistrar {
 						}
 					}
 
-					// A sibling the caller may not see (post: read or edit; term: edit_term) is null, as in the REST map.
+					// A sibling the caller may not see (post: read or edit; term: edit_term) is left out, as a missing one.
 					if ( $type === Enum\ObjectType::Post ) {
 						_prime_post_caches( array_values( $map ), false, false );
 					} else {
@@ -366,7 +366,7 @@ final class AbilitiesRegistrar {
 							: current_user_can( 'edit_term', $sibling_id );
 
 						if ( ! $visible ) {
-							$map[ $slug ] = null;
+							unset( $map[ $slug ] );
 						}
 					}
 
@@ -550,8 +550,13 @@ final class AbilitiesRegistrar {
 						return new \WP_Error( 'missing_params', __( 'URL and target_language are required.', 'perflocale' ) );
 					}
 
+					// Before the cap: without mbstring, WordPress before 6.9 counts invalid UTF-8 as 0 characters.
+					if ( is_string( $url ) && ! \PerfLocale\Util\Utf8::valid( $url ) ) {
+						return new \WP_Error( 'url_not_utf8', __( 'The URL is not valid UTF-8. Send it percent-encoded.', 'perflocale' ), [ 'status' => 400 ] );
+					}
+
 					// Holds when the schema's maxLength validation is filtered away.
-					if ( is_string( $url ) && mb_strlen( $url ) > self::CONVERT_URL_MAX_LENGTH ) {
+					if ( is_string( $url ) && \PerfLocale\Util\Utf8::length( $url ) > self::CONVERT_URL_MAX_LENGTH ) {
 						return new \WP_Error( 'url_too_long', __( 'The URL is too long.', 'perflocale' ), [ 'status' => 400 ] );
 					}
 
@@ -590,7 +595,7 @@ final class AbilitiesRegistrar {
 	}
 
 	/**
-	 * Target-side guards, rate limit and mt_enabled() for translate-post, in MachineTranslateController's order.
+	 * Source and target guards, rate limit and mt_enabled() for translate-post, in MachineTranslateController's order.
 	 *
 	 * Order matters: admit() counts when it allows, so it runs after the target guards and before mt_enabled().
 	 *
@@ -599,6 +604,11 @@ final class AbilitiesRegistrar {
 	 * @return \WP_Error|null     WP_Error on denial, null when allowed.
 	 */
 	private function authorize_mt( int $post_id, string $target_slug ): ?\WP_Error {
+		// The post sent: edit and read on it, also into an existing translation.
+		if ( ! Helper::user_can_copy_translation_source( $post_id ) ) {
+			return \PerfLocale\Api\TranslationsController::source_refusal( $post_id, $target_slug );
+		}
+
 		$cache    = $this->plugin->get( 'cache' );
 		$settings = $this->plugin->get( 'settings' );
 
@@ -606,7 +616,12 @@ final class AbilitiesRegistrar {
 		$manager  = new Translation\PostTranslationManager( $cache, $settings );
 		$existing = (int) $manager->get_translation_id( $post_id, $target_slug );
 
-		if ( $existing > 0 && $existing !== $post_id && ! current_user_can( 'edit_post', $existing ) ) {
+		// A translation the caller may not view: refused as by the REST create route, naming none.
+		if ( \PerfLocale\Api\TranslationsController::hidden_translation( $post_id, $existing ) ) {
+			return \PerfLocale\Api\TranslationsController::unavailable( $target_slug );
+		}
+
+		if ( $existing > 0 && $existing !== $post_id && ! \PerfLocale\Util\ObjectPermission::edit_narrowed( $existing ) ) {
 			return new \WP_Error(
 				'cannot_overwrite_translation',
 				__( 'You cannot overwrite this translation.', 'perflocale' ),
@@ -617,12 +632,8 @@ final class AbilitiesRegistrar {
 		// A new translation copies shell, slug, meta and terms from the group's default-language post.
 		$copy_from = $manager->get_copy_source_id( $post_id, $target_slug );
 
-		if ( $copy_from > 0 && $copy_from !== $post_id && ! Helper::user_can_copy_translation_source( $copy_from ) ) {
-			return new \WP_Error(
-				'source_forbidden',
-				__( 'You cannot edit the original this translation is copied from.', 'perflocale' ),
-				[ 'status' => 403 ]
-			);
+		if ( $copy_from > 0 && ! Helper::user_can_copy_translation_source( $copy_from ) ) {
+			return \PerfLocale\Api\TranslationsController::source_refusal( $copy_from, $target_slug );
 		}
 
 		// wp_insert_post() checks no capability: apply the copy source type's create gate.
@@ -718,7 +729,7 @@ final class AbilitiesRegistrar {
 					}
 
 					// The permission_callback checks only the broad capability; edit rights on this post are checked here.
-					if ( ! current_user_can( 'edit_post', $post_id ) ) {
+					if ( ! \PerfLocale\Util\ObjectPermission::edit_narrowed( $post_id ) ) {
 						return new \WP_Error(
 							'cannot_edit_post',
 							__( 'You do not have permission to translate this post.', 'perflocale' ),
@@ -732,7 +743,8 @@ final class AbilitiesRegistrar {
 					}
 
 					// The controller's remaining gates, in its order.
-					$denied = $this->authorize_mt( $post_id, (string) $slug );
+					$lang   = (string) $slug;
+					$denied = $this->authorize_mt( $post_id, $lang );
 
 					if ( $denied instanceof \WP_Error ) {
 						return $denied;
@@ -743,7 +755,7 @@ final class AbilitiesRegistrar {
 						$settings = $this->plugin->get( 'settings' );
 						$service  = new MachineTranslation\TranslationService( $settings, $cache );
 
-						$result        = $service->translate_post( $post_id, $slug, '', false );
+						$result        = $service->translate_post( $post_id, $slug, '', false, MachineTranslation\TranslationService::include_meta( true, 'abilities', $post_id, $lang ) );
 						$translated_id = isset( $result['post_id'] ) ? (int) $result['post_id'] : 0;
 
 						if ( $translated_id <= 0 ) {
@@ -760,7 +772,8 @@ final class AbilitiesRegistrar {
 					}
 				},
 				'permission_callback' => function () {
-					return current_user_can( 'perflocale_use_mt' ) && $this->write_abilities_enabled();
+					// perflocale_translate too, as every other path that creates or overwrites a translation.
+					return current_user_can( 'perflocale_use_mt' ) && current_user_can( 'perflocale_translate' ) && $this->write_abilities_enabled();
 				},
 				'meta'                => [
 					'annotations'  => [
@@ -858,7 +871,7 @@ final class AbilitiesRegistrar {
 					if ( ! Helper::user_can_copy_translation_source( $source_id ) ) {
 						return new \WP_Error(
 							'cannot_edit_source',
-							__( 'You cannot edit this post.', 'perflocale' ),
+							__( 'You need read and edit rights on this post.', 'perflocale' ),
 							[ 'status' => 403 ]
 						);
 					}
@@ -867,15 +880,18 @@ final class AbilitiesRegistrar {
 					$settings = $this->plugin->get( 'settings' );
 					$manager  = new Translation\PostTranslationManager( $cache, $settings );
 
+					// A translation the caller may not view: refused as by the REST create route, naming none.
+					$lang_slug = \PerfLocale\Util\Scalar::str( $slug );
+
+					if ( \PerfLocale\Api\TranslationsController::hidden_translation( $source_id, $manager->get_translation_id( $source_id, $lang_slug ) ) ) {
+						return \PerfLocale\Api\TranslationsController::unavailable( $lang_slug );
+					}
+
 					// The copied default-language post can differ from source_id and needs the same rights.
 					$copy_from = $manager->get_copy_source_id( $source_id, (string) $slug );
 
-					if ( $copy_from > 0 && $copy_from !== $source_id && ! Helper::user_can_copy_translation_source( $copy_from ) ) {
-						return new \WP_Error(
-							'source_forbidden',
-							__( 'You cannot edit the original this translation is copied from.', 'perflocale' ),
-							[ 'status' => 403 ]
-						);
+					if ( $copy_from > 0 && ! Helper::user_can_copy_translation_source( $copy_from ) ) {
+						return \PerfLocale\Api\TranslationsController::source_refusal( $copy_from, $lang_slug );
 					}
 
 					// wp_insert_post() checks no capability: apply the copy source type's create gate.

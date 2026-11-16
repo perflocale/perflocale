@@ -473,7 +473,6 @@ function perflocale_stock_drift( array $args = [] ): array|WP_Error {
  * Set the stock of each differing language copy to the reference value. Dry run by default.
  *
  * Same as perflocale()->woocommerce()->align_stock(): checks no user capability, like WooCommerce's own stock functions.
- * In this version it always returns a WP_Error (`perflocale_stock_align_off`).
  *
  * @since 1.0.7.4
  *

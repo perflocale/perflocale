@@ -38,6 +38,26 @@ final class StoreApiNoStore {
 		self::$marked = true;
 		add_filter( 'rest_send_nocache_headers', [ self::class, 'send_nocache' ] );
 		add_filter( 'nocache_headers', [ self::class, 'cache_control' ], PHP_INT_MAX );
+		add_filter( 'rest_pre_serve_request', [ self::class, 'seal' ], PHP_INT_MAX );
+	}
+
+	/**
+	 * Merge no-store into every cache header queued for a Store API response (CDN, surrogate, nginx included).
+	 *
+	 * Runs after the REST server queued its own and the response's headers, before the body.
+	 *
+	 * @since 1.0.8
+	 *
+	 * @param mixed $served Whether the request has already been served.
+	 * @return mixed $served, unchanged.
+	 */
+	public static function seal( mixed $served ): mixed {
+		// Core sent its no-cache headers on this route already (send_nocache()): merge only, no second filter pass.
+		if ( ! $served && self::store_route() ) {
+			Redirect\CacheHeaders::seal();
+		}
+
+		return $served;
 	}
 
 	/**

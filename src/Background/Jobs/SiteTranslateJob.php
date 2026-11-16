@@ -43,6 +43,14 @@ final class SiteTranslateJob extends AbstractJob {
 	private const CHUNK_MAX_PAIRS = 500;
 
 	/**
+	 * A chunk's result keys this job's result carries as they are: notes about pairs an earlier stopped run left.
+	 */
+	private const NOTE_KEYS = [
+		'redo_notes'      => true,
+		'redo_notes_more' => true,
+	];
+
+	/**
 	 * Job type id.
 	 *
 	 * @return string
@@ -295,7 +303,7 @@ final class SiteTranslateJob extends AbstractJob {
 				'cursor'        => $cursor,
 				'done'          => true,
 				'error'         => __( 'Stopped: monthly machine-translation character limit reached. Re-run after raising the limit to resume from this cursor.', 'perflocale' ),
-			];
+			] + array_intersect_key( $chunk_result, self::NOTE_KEYS );
 		}
 
 		// Chain the next chunk. A cancel after the last tick reaches here: the worker then cancels the chunk queued
@@ -325,7 +333,7 @@ final class SiteTranslateJob extends AbstractJob {
 			'done'           => false,
 			'next_job'       => $next['job_id'] ?? null,
 			'next_duplicate' => ! empty( $next['duplicate'] ),
-			'next'           => $next['mode'] ?? 'unknown',
-		];
+			'next'           => $next['mode'],
+		] + array_intersect_key( $chunk_result, self::NOTE_KEYS );
 	}
 }

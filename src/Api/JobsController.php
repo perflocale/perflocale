@@ -20,8 +20,8 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 /**
  * `perflocale/v1`: GET /jobs, GET /jobs/{id}, POST /jobs/{id}/cancel, POST /jobs/{id}/retry, DELETE /jobs/{id}
- * (finished jobs only). Every route needs `perflocale_translate`; one job follows JobAccess::may_handle(). A retry
- * by another user also needs the job's capability and makes them its owner, so the worker runs with their rights.
+ * (finished jobs only). Every route needs `perflocale_translate`; the list and each job follow JobAccess::may_handle().
+ * A retry by another user also needs the job's capability and makes them its owner, so the worker runs with their rights.
  */
 final class JobsController extends RestController {
 
@@ -114,6 +114,17 @@ final class JobsController extends RestController {
 				'methods'             => \WP_REST_Server::READABLE,
 				'callback'            => [ $this, 'list_jobs' ],
 				'permission_callback' => [ $this, 'read_permissions_check' ],
+				'args'                => [
+					'include' => [
+						'description' => __( 'Only these job IDs (the Jobs screen polls its running rows).', 'perflocale' ),
+						'type'        => 'array',
+						'items'       => [
+							'type'    => 'string',
+							'pattern' => '^[a-z0-9-]{8,64}$',
+						],
+						'maxItems'    => 50,
+					],
+				],
 			]
 		);
 
@@ -156,27 +167,29 @@ final class JobsController extends RestController {
 	}
 
 	/**
-	 * GET /jobs: the active jobs, newest first, as summaries; `/jobs/{id}` gives one job's detail.
+	 * GET /jobs: the active jobs, newest first, as summaries; `include` limits them to those ids. `/jobs/{id}` gives one
+	 * job's detail.
 	 *
+	 * @param \WP_REST_Request|null $request The request.
 	 * @return \WP_REST_Response
 	 */
-	public function list_jobs(): \WP_REST_Response {
-		$jobs        = [];
-		$current_uid = (int) get_current_user_id();
-		$allowed     = [ [], [] ];
+	public function list_jobs( ?\WP_REST_Request $request = null ): \WP_REST_Response {
+		$jobs    = [];
+		$include = null === $request ? null : $request->get_param( 'include' );
+		$ids     = is_array( $include ) ? array_values( array_unique( array_filter( $include, 'is_string' ) ) ) : [];
 
-		// Summary rows: no args, result or log columns on a client polling every 5 s.
-		foreach ( JobState::list_active_summary() as $job_id => $row ) {
-			// JobAccess per type and owner kind, asked once each; status fields only, so no content check.
-			$type = is_string( $row['type'] ?? null ) ? $row['type'] : '';
-			$mine = $current_uid > 0 && (int) ( $row['created_by'] ?? 0 ) === $current_uid ? 1 : 0;
+		// An include that names nothing lists nothing (not the whole window).
+		if ( is_array( $include ) && [] === $ids ) {
+			return rest_ensure_response(
+				[
+					'jobs'   => [],
+					'engine' => JobRunnerFactory::pick()->get_engine_name(),
+				]
+			);
+		}
 
-			$allowed[ $mine ][ $type ] ??= $mine ? JobAccess::may_handle_own( $type ) : JobAccess::may_handle_others( $type );
-
-			if ( ! $allowed[ $mine ][ $type ] ) {
-				continue;
-			}
-
+		// Summary rows (no args, result or log columns on a client polling every 5 s), only those the user may open.
+		foreach ( JobAccess::visible( JobState::list_active_summary( $ids ) ) as $job_id => $row ) {
 			$jobs[] = [
 				'id'         => $job_id,
 				'type'       => (string) ( $row['type'] ?? '' ),
@@ -227,6 +240,24 @@ final class JobsController extends RestController {
 		$state = $this->get_job_state( $id );
 
 		// 404 for missing and not yours alike.
+		if ( ! $state || ! $this->user_can_mutate( $state ) ) {
+			return new \WP_Error( 'rest_not_found', __( 'Job not found.', 'perflocale' ), [ 'status' => 404 ] );
+		}
+
+		// A Retry cannot land between this status write and its cleanup (its event would go).
+		return JobState::control( $id, fn() => $this->cancel_held( $id ) ) ?? self::busy();
+	}
+
+	/**
+	 * Cancel under the job's control lock: the row read again there.
+	 *
+	 * @param string $id Job UUID.
+	 * @return \WP_REST_Response|\WP_Error
+	 */
+	private function cancel_held( string $id ): \WP_REST_Response|\WP_Error {
+		$this->forget_job_state( $id );
+		$state = $this->get_job_state( $id );
+
 		if ( ! $state || ! $this->user_can_mutate( $state ) ) {
 			return new \WP_Error( 'rest_not_found', __( 'Job not found.', 'perflocale' ), [ 'status' => 404 ] );
 		}
@@ -314,16 +345,25 @@ final class JobsController extends RestController {
 		$type    = (string) $state['type'];
 		$current = (int) get_current_user_id();
 		$owner   = (int) ( $state['created_by'] ?? 0 ) === $current ? -1 : $current;
+
+		if ( 'content_resync' === $type && ! \PerfLocale\Util\ResyncSwitch::on() ) {
+			return new \WP_Error( 'perflocale_resync_off', \PerfLocale\Util\ResyncOff::refused_text(), [ 'status' => 409 ] );
+		}
+
+		// REST requests bind no job listeners; the ReSync workers are bound here so their factory is found.
+		\PerfLocale\BootstrapWrites::bind_resync_workers();
 		$factory = \PerfLocale\Background\WorkerRegistry::factory_for_type( $type );
 
 		// A type whose worker is not registered here (stock jobs) is checked against JobAccess's capability for it.
 		$required_cap = JobAccess::type_capability( $type );
+		$also_held    = true;
 
 		if ( is_callable( $factory ) ) {
 			try {
 				$probe_job = $factory();
 				if ( $probe_job instanceof \PerfLocale\Background\AbstractJob ) {
-					$required_cap = $probe_job->get_required_capability();
+					$required_cap = $probe_job->required_capability_for( is_array( $state['args'] ?? null ) ? $state['args'] : [] );
+					$also_held    = $probe_job->holds_also_required();
 				}
 			} catch ( \Throwable $e ) {
 				// The factory failed; the worker marks the job failed.
@@ -332,7 +372,7 @@ final class JobsController extends RestController {
 			}
 		}
 
-		if ( '' !== $required_cap && ! current_user_can( $required_cap ) ) {
+		if ( ( '' !== $required_cap && ! current_user_can( $required_cap ) ) || ! $also_held ) {
 			return new \WP_Error(
 				'rest_forbidden',
 				__( 'You do not have permission to run this job.', 'perflocale' ),
@@ -347,25 +387,38 @@ final class JobsController extends RestController {
 			$blog_id
 		);
 
+		// Reset and enqueue as one step against a Cancel (cancel_job()).
+		return JobState::control( $id, fn() => $this->retry_held( $id, $state, $owner, $worker_args ) ) ?? self::busy();
+	}
+
+	/**
+	 * Retry's reset and enqueue under the job's control lock.
+	 *
+	 * @param string               $id          Job UUID.
+	 * @param array<string, mixed> $state       The row checked; only its version is reset.
+	 * @param int                  $owner       New owner, or -1.
+	 * @param array<string, mixed> $worker_args Worker args with the blog sentinel.
+	 * @return \WP_REST_Response|\WP_Error
+	 */
+	private function retry_held( string $id, array $state, int $owner, array $worker_args ): \WP_REST_Response|\WP_Error {
 		// Only the row version checked above is reset: a racing retry gets the 409 below.
 		$version = $state['version'] ?? null;
 		$reset   = is_int( $version ) && JobState::reset_for_retry( $id, true, -1, $owner, $version );
 		$this->forget_job_state( $id );
 
 		if ( ! $reset ) {
+			$why = JobState::retry_refused();
+
 			return new \WP_Error(
 				'perflocale_job_retry_failed',
-				__( 'Could not reset the job for retry; its state changed concurrently.', 'perflocale' ),
+				'' !== $why ? $why : __( 'Could not reset the job for retry; its state changed concurrently.', 'perflocale' ),
 				[ 'status' => 409 ]
 			);
 		}
 
 		if ( $owner > 0 ) {
-			JobState::append_log(
-				$id,
-				/* translators: %d: user ID. */
-				sprintf( __( 'Retried by user %d; the job now runs with that user\'s permissions.', 'perflocale' ), $owner )
-			);
+			// No user ID: the eraser zeroes `created_by` only, and Created by names the new owner.
+			JobState::append_log( $id, __( 'Retried by another user; the job now runs with that user\'s permissions.', 'perflocale' ) );
 		}
 
 		// Store the engine that queued it (as WorkerRunner::schedule_recording_engine()), so cancel and is_scheduled
@@ -395,6 +448,15 @@ final class JobsController extends RestController {
 	}
 
 	/**
+	 * Another request is cancelling or retrying this job.
+	 *
+	 * @return \WP_Error
+	 */
+	private static function busy(): \WP_Error {
+		return new \WP_Error( 'perflocale_job_busy', __( 'Another request is changing this job. Try again in a moment.', 'perflocale' ), [ 'status' => 409 ] );
+	}
+
+	/**
 	 * DELETE /jobs/{id}: delete the row of a finished job (complete, failed, canceled); cancel a live one first.
 	 *
 	 * @param \WP_REST_Request $request
@@ -409,10 +471,27 @@ final class JobsController extends RestController {
 			return new \WP_Error( 'rest_not_found', __( 'Job not found.', 'perflocale' ), [ 'status' => 404 ] );
 		}
 
-		$deleted = JobState::delete_finished( $id );
+		// Under the control lock (no Retry or Cancel in between); each row read is checked again before it goes.
+		return JobState::control( $id, fn() => $this->delete_held( $id ) ) ?? self::busy();
+	}
+
+	/**
+	 * Delete under the job's control lock: only a row read there that the user may still change.
+	 *
+	 * @param string $id Job UUID.
+	 * @return \WP_REST_Response|\WP_Error
+	 */
+	private function delete_held( string $id ): \WP_REST_Response|\WP_Error {
+		$deleted = JobState::delete_finished( $id, fn( array $row ): bool => $this->user_can_mutate( $row ) );
 		$this->forget_job_state( $id );
 
 		if ( ! $deleted ) {
+			$latest = JobState::get( $id );
+
+			if ( is_array( $latest ) && ! $this->user_can_mutate( $latest ) ) {
+				return new \WP_Error( 'rest_not_found', __( 'Job not found.', 'perflocale' ), [ 'status' => 404 ] );
+			}
+
 			return new \WP_Error(
 				'rest_invalid_state',
 				__( 'Cancel the job before deleting it.', 'perflocale' ),
@@ -583,9 +662,9 @@ final class JobsController extends RestController {
 		$result = (array) ( $state['result'] ?? [] );
 		unset( $result[ JobState::REQUEUES_KEY ] );
 
-		// A bulk translation's `cut`: the pair its next slice redoes, internal.
+		// A bulk translation's `cut` (the pair its next slice redoes), the answers kept for it and its run state: internal.
 		if ( 'bulk_translate' === ( $state['type'] ?? null ) ) {
-			unset( $result['cut'] );
+			unset( $result['cut'], $result['pieces'], $result[ \PerfLocale\Background\JobResume::PARTIAL_KEY ], $result['__perflocale_latency'], $result['__perflocale_paced'] );
 		}
 
 		if ( isset( $result['path'] ) && ! current_user_can( 'perflocale_import_export' ) ) {

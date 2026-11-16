@@ -238,6 +238,19 @@ final class Breaker {
 	}
 
 	/**
+	 * A call the provider paced (Retry-After): no state change, but a HALF_OPEN probe's lease is released, so the next
+	 * caller probes after the wait instead of after the lease TTL.
+	 *
+	 * @param string $key Breaker key.
+	 * @return void
+	 */
+	public static function record_paced( string $key ): void {
+		if ( self::STATE_HALF_OPEN === self::read_state( $key )['state'] ) {
+			self::release_probe( $key );
+		}
+	}
+
+	/**
 	 * Force the breaker closed (the Site Health "Reset" action).
 	 *
 	 * @param string $key Breaker key.

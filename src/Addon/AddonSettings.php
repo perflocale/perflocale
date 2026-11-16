@@ -415,7 +415,7 @@ final class AddonSettings {
 					?>
 					<tr data-perflocale-field-key="<?php echo esc_attr( $field_key ); ?>"
 						<?php if ( ! empty( $field_def['show_if'] ) ) : ?> data-perflocale-show-if="<?php echo esc_attr( (string) wp_json_encode( $field_def['show_if'] ) ); ?>"<?php endif; ?>
-						<?php if ( ! $visible ) : ?> style="display:none;"<?php endif; ?>>
+						<?php if ( ! $visible ) : ?> hidden<?php endif; ?>>
 						<th scope="row">
 							<label for="<?php echo esc_attr( $input_id ); ?>"><?php echo esc_html( $field_label ); ?></label>
 						</th>
@@ -557,7 +557,8 @@ final class AddonSettings {
 					$error              = $wpdb instanceof \wpdb ? (string) $wpdb->last_error : '';
 					self::$cache        = null;
 					self::$last_failure = '' !== $error ? 'database' : 'unchanged';
-					self::log_rejection( 'persist', $addon_id, 'write_refused' . ( '' !== $error && defined( 'WP_DEBUG_LOG' ) && WP_DEBUG_LOG ? ' - ' . $error : '' ) );
+					$code               = '' !== $error ? \PerfLocale\Util\DbErrorCode::of( $error ) : '';
+					self::log_rejection( 'persist', $addon_id, 'write_refused' . ( '' !== $code && defined( 'WP_DEBUG_LOG' ) && WP_DEBUG_LOG ? ' - ' . $code : '' ) );
 					return false;
 				}
 				self::$cache = $next;
@@ -593,10 +594,10 @@ final class AddonSettings {
 	 *
 	 * @param string $op       Method name that rejected the write.
 	 * @param string $addon_id Addon id involved (may be malformed).
-	 * @param string $reason   Short reason code.
+	 * @param string $detail   Short reason code.
 	 * @return void
 	 */
-	private static function log_rejection( string $op, string $addon_id, string $reason ): void {
+	private static function log_rejection( string $op, string $addon_id, string $detail ): void {
 		if ( ! defined( 'WP_DEBUG' ) || ! WP_DEBUG ) {
 			return;
 		}
@@ -606,7 +607,7 @@ final class AddonSettings {
 				'PerfLocale AddonSettings::%s rejected for addon_id=%s - %s',
 				$op,
 				$addon_id === '' ? '(empty)' : substr( $addon_id, 0, 64 ),
-				$reason
+				$detail
 			)
 		);
 	}

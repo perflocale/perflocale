@@ -61,6 +61,7 @@ final class MicrosoftProvider extends AbstractProvider {
 	 */
 	public function translate( string $text, string $source_lang, string $target_lang, bool $fast_fail = false, string $format = 'html' ): string {
 		$text = apply_filters( 'perflocale/machine_translation/text_before_send', $text, 'microsoft', $target_lang );
+		$this->guard_send( \PerfLocale\Util\Utf8::length( \PerfLocale\Util\Scalar::str( $text ) ) );
 
 		// BCP 47 codes, variants kept ('zh-hans', 'sr-latn'); 'en_US' becomes 'en-us'.
 		$url = self::API_URL
@@ -117,7 +118,7 @@ final class MicrosoftProvider extends AbstractProvider {
 	 * @throws \RuntimeException When Microsoft Translator returns an unexpected batch response or all retries fail.
 	 */
 	public function translate_batch( array $texts, string $source_lang, string $target_lang, bool $fast_fail = false, string $format = 'html' ): array {
-		return $this->without_blank( $texts, fn( array $sent ): array => $this->send_batch( $sent, $source_lang, $target_lang, $fast_fail, $format ) );
+		return $this->without_blank( $texts, fn( array $sent ): array => $this->send_batch( $sent, $source_lang, $target_lang, $fast_fail, $format ), $format );
 	}
 
 	/**
@@ -150,6 +151,8 @@ final class MicrosoftProvider extends AbstractProvider {
 			);
 		}
 
+		$this->guard_send( (int) array_sum( array_map( [ \PerfLocale\Util\Utf8::class, 'length' ], $filtered ) ) );
+
 		$url = self::API_URL
 			. '&from=' . rawurlencode( $this->normalize_language_code( $source_lang ) )
 			. '&to=' . rawurlencode( $this->normalize_language_code( $target_lang ) )
@@ -163,7 +166,7 @@ final class MicrosoftProvider extends AbstractProvider {
 		$current_len = 0;
 
 		foreach ( $filtered as $i => $text ) {
-			$len = mb_strlen( $text );
+			$len = \PerfLocale\Util\Utf8::length( $text );
 
 			if ( $current !== [] && ( count( $current ) >= self::BATCH_MAX_ITEMS || ( $current_len + $len ) > self::BATCH_MAX_CHARS ) ) {
 				$chunks[]    = $current;
@@ -182,7 +185,8 @@ final class MicrosoftProvider extends AbstractProvider {
 		$results = [];
 
 		foreach ( $chunks as $chunk ) {
-			$body = [];
+			$body          = [];
+			$this->sending = (int) array_sum( array_map( [ \PerfLocale\Util\Utf8::class, 'length' ], $chunk ) );
 
 			foreach ( $chunk as $text ) {
 				$body[] = [ 'Text' => $text ];
@@ -241,7 +245,7 @@ final class MicrosoftProvider extends AbstractProvider {
 			$chunk_chars = 0;
 
 			foreach ( $chunk as $text ) {
-				$chunk_chars += mb_strlen( $text );
+				$chunk_chars += \PerfLocale\Util\Utf8::length( $text );
 			}
 
 			$this->track_usage_chars( $chunk_chars );

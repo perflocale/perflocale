@@ -40,26 +40,53 @@ final class Bootstrap {
 	];
 
 	/**
-	 * Cron hook names copied so wiring them does not autoload WebhookController and Lock on
-	 * every request. HookNameDriftTest keeps them equal to the owning classes' constants.
+	 * Copied so wiring it does not load Lock on every request (HookNameDriftTest; the webhook cron hook names are
+	 * literals in the add_action() calls for the same reason).
 	 */
-	private const WEBHOOK_DELIVERY_HOOK = 'perflocale_deliver_webhook';
-	private const WEBHOOK_DRAIN_HOOK    = 'perflocale_drain_webhooks';
-	private const WEBHOOK_RETRY_HOOK    = 'perflocale_retry_webhook';
-	public const LOCK_CLEANUP_HOOK      = 'perflocale_lock_cleanup';
+	public const LOCK_CLEANUP_HOOK = 'perflocale_lock_cleanup';
 
 	/**
 	 * Key in `perflocale_settings` set while a dormant boot (conflicting plugin active) has not
 	 * been followed by a normal boot. Not a setting: Settings::DEFAULTS does not list it.
 	 */
-	private const DORMANT_KEY = 'was_dormant';
+	public const DORMANT_KEY = 'was_dormant';
 
 	/**
-	 * One-time job state options, copied so a done job's class is not autoloaded on admin
-	 * pages. BootstrapOneTimeJobGateTest keeps them equal to the jobs' constants.
+	 * Job type => class of the workers bound on every request, in the job-capable write contexts, and after them.
 	 */
-	private const TEMPLATE_REFS_BACKFILL_OPTION = 'perflocale_template_refs_backfill';
-	private const SQLITE_GROUP_REPAIR_OPTION    = 'perflocale_sqlite_string_groups_repair_job';
+	private const WORKERS       = [
+		'data_import' => Background\Jobs\DataImportJob::class,
+		'data_export' => Background\Jobs\DataExportJob::class,
+	];
+	private const WRITE_WORKERS = [
+		'wpml_migration'           => Background\Jobs\WpmlMigrationJob::class,
+		'polylang_migration'       => Background\Jobs\PolylangMigrationJob::class,
+		'translatepress_migration' => Background\Jobs\TranslatePressMigrationJob::class,
+		'template_refs_backfill'   => Background\Jobs\TemplateRefsBackfillJob::class,
+		'template_refs_fanout'     => Background\Jobs\TemplateRefsFanoutJob::class,
+		'xliff_import'             => Background\Jobs\XliffImportJob::class,
+	];
+	private const LATE_WORKERS  = [
+		'string_scan'           => Background\Jobs\StringScanJob::class,
+		'bulk_translate'        => Background\Jobs\BulkTranslateJob::class,
+		'auto_translate'        => Background\Jobs\AutoTranslateJob::class,
+		'bulk_string_translate' => Background\Jobs\BulkStringTranslateJob::class,
+		'site_translate'        => Background\Jobs\SiteTranslateJob::class,
+	];
+
+	/**
+	 * Whether the write-hook services booted up front; null before init() decided it.
+	 *
+	 * @var bool|null
+	 */
+	public static ?bool $writes = null;
+
+	/**
+	 * Whether Util\RestRead found a REST request; it skips the page services.
+	 *
+	 * @var bool
+	 */
+	public static bool $rest = false;
 
 	/**
 	 * Initialize the plugin.
@@ -71,28 +98,7 @@ final class Bootstrap {
 		$conflict = self::detect_conflicting_plugin();
 
 		if ( $conflict !== null ) {
-			$notice = static function () use ( $conflict ): void {
-				printf(
-					'<div class="notice notice-error"><p><strong>PerfLocale</strong>: %1$s %2$s</p></div>',
-					sprintf(
-					/* translators: %s: conflicting plugin name */
-						esc_html__( 'Cannot run while %s is active. Please deactivate one of the two multilingual plugins to avoid conflicts.', 'perflocale' ),
-						esc_html( $conflict )
-					),
-					sprintf(
-					/* translators: %s: conflicting plugin name */
-						esc_html__( 'Your %s translations stay in the database: after deactivating it, import them from Settings &rarr; Export &amp; Import, or with `wp perflocale migrate`.', 'perflocale' ),
-						esc_html( $conflict )
-					)
-				);
-			};
-
-			// Both hooks: core fires admin_notices or network_admin_notices, never both, and a
-			// network-activated conflicting plugin is managed from Network Admin.
-			add_action( 'admin_notices', $notice );
-			add_action( 'network_admin_notices', $notice );
-
-			self::note_dormant_boot();
+			BootstrapRare::dormant_boot( $conflict );
 
 			return;
 		}
@@ -189,6 +195,9 @@ final class Bootstrap {
 			true
 		);
 
+		// URL bases: only when this blog has a compiled map (absent = inactive, nothing loads).
+		self::url_bases( wp_load_alloptions() );
+
 		// GeoIP redirect: redirect visitors based on IP country.
 		if ( (bool) $plugin->get( 'settings' )->get( 'redirect_geo_enabled' ) ) {
 			$plugin->register(
@@ -212,8 +221,11 @@ final class Bootstrap {
 			is_admin() || Helper::is_rest_request() || ( defined( 'WP_CLI' ) && WP_CLI )
 		);
 
-		// Decided once for the service registrations below that depend on it.
-		$write_context = Helper::is_write_context();
+		// Decided once for the service registrations below that depend on it. A REST read boots them on the first
+		// write, as a page view does; RestRead loads only when the URL may be REST.
+		$writer        = Helper::is_write_context();
+		$write_context = $writer && ( ! Helper::is_rest_request() || Util\RestRead::writes() );
+		self::$writes  = $write_context;
 
 		// Content sync: registered whatever this blog's Sync Fields list holds, since a request
 		// can switch blogs and write there. Booted up front in write contexts, else on the first
@@ -260,7 +272,7 @@ final class Bootstrap {
 		// notice hook, so the state change sits behind core's save nonce and capability checks.
 		add_action(
 			'save_post',
-			[ BootstrapWrites::class, 'clear_meta_copy_errors' ],
+			[ Translation\SaveHookGuards::class, 'clear_meta_copy_errors' ],
 			20,
 			2
 		);
@@ -342,25 +354,25 @@ final class Bootstrap {
 			true
 		);
 
-		// Translator role and caps: their hooks fire in admin and CLI only.
+		// Translator role and caps: their hooks fire in admin and CLI only, so not on REST writes (Store API carts).
 		$plugin->register(
 			'translator_role',
 			fn() => new Admin\TranslatorRole(),
-			$write_context
+			$write_context && ! self::$rest
 		);
 
 		// User deletion is not admin-only (front-end account plugins delete users), so wire the
 		// job anonymisation directly. wpmu_delete_user does not fire delete_user; other sites are
 		// reached through remove_user_from_blog.
 		$anonymize_jobs = static function ( $user_id ): void {
-			Background\JobState::anonymize_for_user( (int) $user_id );
+			Util\ResyncSwitch::on_user_deleted( (int) $user_id );
 		};
 
 		add_action( 'delete_user', $anonymize_jobs );
 		add_action( 'wpmu_delete_user', $anonymize_jobs );
 		add_action( 'remove_user_from_blog', [ self::class, 'anonymize_jobs_on_blog' ], 10, 2 );
 
-		// Privacy API exporter, eraser and policy text: privacy admin flows only.
+		// Privacy API exporter, eraser and policy text. REST writes keep it: the exporter/eraser filters are not admin-only.
 		$plugin->register(
 			'privacy_integration',
 			fn( Plugin $p ) => new Admin\PrivacyIntegration( $p->get( 'settings' ) ),
@@ -376,110 +388,11 @@ final class Bootstrap {
 
 		// Theme builder add-ons boot here: the add-on registry boots at init:0, too late for
 		// builder APIs that read their component lists during after_setup_theme.
-		$early_theme_addons = [
-			'blocksy' => 'addons/blocksy/PerfLocaleBlocksy.php',
-			'kadence' => 'addons/kadence/PerfLocaleKadence.php',
-			'neve'    => 'addons/neve/PerfLocaleNeve.php',
-		];
-
 		$current_template = get_template();
 
-		foreach ( $early_theme_addons as $theme_slug => $addon_file ) {
-			if ( $current_template !== $theme_slug ) {
-				continue;
-			}
-
-			$addon_path = PERFLOCALE_DIR . $addon_file;
-
-			if ( ! file_exists( $addon_path ) ) {
-				continue;
-			}
-
-			// The add-on's get_id(): its file loads only once the checks below let it boot.
-			$addon_id = $theme_slug;
-
-			// This path boots ahead of AddonRegistry and marks the add-on booted, so apply the
-			// registry's quarantine gate and perflocale/addon/enabled filter here, in its order.
-			// Both options are autoloaded.
-			$failures  = (array) get_option( 'perflocale_addon_failures', [] );
-			$threshold = (int) apply_filters( 'perflocale/addons/quarantine_threshold', 3 );
-
-			if ( $threshold > 0 && (int) ( $failures[ $addon_id ] ?? 0 ) >= $threshold ) {
-				continue;
-			}
-
-			$default_on = ! in_array( $addon_id, Addon\AddonRegistry::get_disabled(), true );
-
-			/** This filter is documented in src/Addon/AddonRegistry.php */
-			if ( ! (bool) apply_filters( 'perflocale/addon/enabled', $default_on, $addon_id ) ) {
-				// Hand the decision to the registry so it neither boots the add-on nor asks again.
-				add_action(
-					'plugins_loaded',
-					static function () use ( $plugin, $addon_id, $default_on ): void {
-						if ( $plugin->has( 'addon_registry' ) ) {
-							$registry = $plugin->addon_registry();
-							$registry->defer( $addon_id );
-							$registry->mark_filter_off( $addon_id, $default_on );
-						}
-					},
-					15
-				);
-				continue;
-			}
-
-			require_once $addon_path;
-			$class_name = 'PerfLocale' . str_replace( ' ', '', ucwords( str_replace( '-', ' ', $theme_slug ) ) );
-
-			if ( ! class_exists( $class_name ) ) {
-				continue;
-			}
-
-			$theme_addon = new $class_name();
-
-			if ( ! $theme_addon instanceof \PerfLocale\Addon\AddonInterface ) {
-				continue;
-			}
-
-			// Third-party code: catch so a throw feeds the quarantine counter instead of a
-			// sitewide fatal. Mirrors AddonRegistry::boot_addons().
-			try {
-				if ( ! $theme_addon->is_compatible() ) {
-					continue;
-				}
-
-				$theme_addon->boot( $plugin );
-			} catch ( \Throwable $e ) {
-				$failures[ $addon_id ] = (int) ( $failures[ $addon_id ] ?? 0 ) + 1;
-				update_option( 'perflocale_addon_failures', $failures, true );
-				Addon\AddonMigrationErrors::record(
-					$addon_id,
-					'boot',
-					(int) $failures[ $addon_id ],
-					\PerfLocale\Util\PathRedactor::redact( $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine() )
-				);
-				continue;
-			}
-
-			// Booted cleanly: clear the boot failure counter and its admin record (boot stage only,
-			// like AddonRegistry::boot_addons()).
-			if ( isset( $failures[ $addon_id ] ) ) {
-				unset( $failures[ $addon_id ] );
-				update_option( 'perflocale_addon_failures', $failures, true );
-				Addon\AddonMigrationErrors::clear_stage( $addon_id, 'boot' );
-			}
-
-			// Mark as already booted so AddonRegistry doesn't double-boot it.
-			add_action(
-				'plugins_loaded',
-				static function () use ( $plugin, $theme_addon, $addon_id ): void {
-					if ( $plugin->has( 'addon_registry' ) ) {
-						$registry = $plugin->get( 'addon_registry' );
-						$registry->register( $theme_addon );
-						$registry->mark_booted( $addon_id );
-					}
-				},
-				15
-			);
+		if ( 'blocksy' === $current_template || 'kadence' === $current_template || 'neve' === $current_template ) {
+			require_once __DIR__ . '/Addon/ThemeAddonBoot.php';
+			Addon\ThemeAddonBoot::boot( $plugin, $current_template );
 		}
 
 		// Admin bar language switcher - works on both frontend and admin. Core fires admin_bar_init
@@ -652,14 +565,7 @@ final class Bootstrap {
 
 		// Switching string mode to files: regenerate all .l10n.php files in the saving request,
 		// then clear the transient so TranslationFileLoader stops retrying.
-		add_action(
-			'perflocale/strings/regenerate_files',
-			static function ( Cache\CacheManager $cache ): void {
-				$generator = new Strings\TranslationFileGenerator( $cache );
-				$generator->generate_all();
-				delete_transient( 'perflocale_strings_regenerating' );
-			}
-		);
+		add_action( 'perflocale/strings/regenerate_files', [ BootstrapWrites::class, 'regenerate_all_files' ] );
 
 		// Files mode compiles active non-default languages only, so activating one, changing its
 		// locale or changing the default queues one full regeneration at request end.
@@ -673,58 +579,31 @@ final class Bootstrap {
 		add_action( self::FILES_REGENERATE_HOOK, [ self::class, 'regenerate_files_in_background' ], 10, 0 );
 
 		// Webhook delivery runs on WP-Cron so the originating request is not blocked.
-		add_action(
-			self::WEBHOOK_DELIVERY_HOOK,
-			static function ( string $webhook_id, string $event, array $data, string $timestamp ): void {
-				( new Api\WebhookController() )->deliver_webhook( $webhook_id, $event, $data, $timestamp, 1 );
-			},
-			10,
-			4
-		);
+		add_action( 'perflocale_deliver_webhook', [ BootstrapMaintenance::class, 'deliver_webhook' ], 10, 4 );
 
 		// Drains the coalesced delivery queue in bounded batches, so the autoloaded `cron` option
 		// holds one event instead of thousands.
-		add_action(
-			self::WEBHOOK_DRAIN_HOOK,
-			static function (): void {
-				( new Api\WebhookController() )->drain_webhooks();
-			}
-		);
+		add_action( 'perflocale_drain_webhooks', [ BootstrapMaintenance::class, 'drain_webhooks' ] );
 
 		// Retries failed deliveries (attempt 2+) and breaker-deferred re-deliveries.
-		add_action(
-			self::WEBHOOK_RETRY_HOOK,
-			static function ( string $webhook_id, string $event, array $data, string $timestamp, int $attempt, string $delivery_id = '', int $breaker_deferrals = 0 ): void {
-				( new Api\WebhookController() )->deliver_webhook( $webhook_id, $event, $data, $timestamp, $attempt, $delivery_id, $breaker_deferrals );
-			},
-			10,
-			7
-		);
+		add_action( 'perflocale_retry_webhook', [ BootstrapMaintenance::class, 'retry_webhook' ], 10, 7 );
 
 		// Fan out translation events to webhooks, in write contexts only (the events never fire
 		// on a front-end GET). wp_doing_cron() is required: background jobs create translations
 		// in the cron worker.
-		if (
-			is_admin()
-			|| wp_doing_ajax()
-			|| wp_doing_cron()
-			|| Helper::is_rest_request()
-			|| ( defined( 'WP_CLI' ) && WP_CLI )
-		) {
+		if ( $writer ) {
 			add_action(
 				'plugins_loaded',
 				static function (): void {
-					// Single-site only: on multisite an event under a switched blog must reach that
-					// blog's subscribers, so fire_webhook() checks per blog.
-					if ( ! is_multisite() ) {
-						$webhooks = get_option( 'perflocale_webhooks', [] );
-
-						if ( empty( $webhooks ) || ! is_array( $webhooks ) ) {
-							return;
-						}
+					// Multisite: an event under a switched blog must reach that blog's subscribers, so
+					// fire_webhook() checks per blog.
+					if ( is_multisite() || get_option( 'perflocale_webhooks' ) ) {
+						require_once __DIR__ . '/Webhook/Events.php';
+						Webhook\Events::register();
+					} elseif ( ! isset( wp_load_alloptions()['perflocale_webhooks'] ) ) {
+						// An empty list outside alloptions is a query per request: autoload it.
+						Activator::seed_webhooks_row();
 					}
-
-					Api\WebhookController::register_event_dispatchers();
 				},
 				20
 			);
@@ -736,6 +615,9 @@ final class Bootstrap {
 		// reset of it here.
 		if ( is_multisite() ) {
 			add_action( 'switch_blog', [ self::class, 'reset_static_state' ] );
+			// @phpstan-ignore return.void (core discards an action's return; the same callback serves pre_cache_alloptions)
+			add_action( 'switch_blog', [ self::class, 'url_bases' ] );
+			add_filter( 'pre_cache_alloptions', [ self::class, 'url_bases' ] );
 		}
 
 		// Language changes within a request invalidate the slug repo's has_any_slugs memo, as
@@ -768,12 +650,7 @@ final class Bootstrap {
 
 		// Daily reaper for expired lock rows (crashed requests leak them); the wrapper discards
 		// reap_expired()'s return.
-		add_action(
-			self::LOCK_CLEANUP_HOOK,
-			static function (): void {
-				Concurrency\Lock::reap_expired();
-			}
-		);
+		add_action( self::LOCK_CLEANUP_HOOK, [ BootstrapMaintenance::class, 'lock_cleanup' ] );
 
 		// Action Scheduler integration, deferred to `init`: AS is not loaded yet while this file
 		// runs, nor at plugins_loaded on a stock WooCommerce site. Priority 1 precedes any queue run.
@@ -797,7 +674,7 @@ final class Bootstrap {
 
 					// AS failure states reach the jobs table; the bridge loads only when one fires.
 					add_action( 'action_scheduler_failed_execution', [ Background\ActionSchedulerFailureBridge::class, 'on_failed_execution' ], 10, 2 );
-					add_action( 'action_scheduler_failed_action', [ Background\ActionSchedulerFailureBridge::class, 'on_timed_out' ], 10, 1 );
+					add_action( 'action_scheduler_failed_action', [ Background\ActionSchedulerFailureBridge::class, 'on_timed_out' ] );
 					add_action( 'action_scheduler_unexpected_shutdown', [ Background\ActionSchedulerFailureBridge::class, 'on_unexpected_shutdown' ], 10, 2 );
 				}
 			},
@@ -807,9 +684,7 @@ final class Bootstrap {
 		// Weekly GC for `perflocale_mt_usage_YYYY_MM` options (13-month retention), per blog.
 		add_action(
 			'perflocale_mt_usage_gc',
-			[ BootstrapMaintenance::class, 'mt_usage_gc' ],
-			10,
-			1
+			[ BootstrapMaintenance::class, 'mt_usage_gc' ]
 		);
 
 		// Daily background-jobs GC, scheduled per blog: the blog id is the event argument and
@@ -819,13 +694,11 @@ final class Bootstrap {
 			[ BootstrapMaintenance::class, 'jobs_gc' ]
 		);
 
+		// String identity switch-over: one run of the per-blog chain (cold class, loaded when the event fires).
+		add_action( 'perflocale_str_ident_migrate', [ Strings\StrIdentMigration::class, 'run' ] );
+
 		// Hourly stuck-job watchdog - same multisite consideration as GC.
-		add_action(
-			'perflocale_jobs_watchdog',
-			static function ( $blog_id = 0 ): void {
-				Background\JobState::run_recurring_for_blog( (int) $blog_id, [ Background\JobState::class, 'watchdog' ] );
-			}
-		);
+		add_action( 'perflocale_jobs_watchdog', [ BootstrapMaintenance::class, 'jobs_watchdog' ] );
 
 		// Schedule both recurring events under the current engine: admin_init only (the drift
 		// probe queries the schedule store), which runs after AS's init@1 hook. Not on AJAX (heartbeat).
@@ -836,114 +709,26 @@ final class Bootstrap {
 		// Engine flip: move the recurring events to the new engine at once.
 		add_action( 'update_option_perflocale_settings', [ self::class, 'maybe_remigrate_engine' ], 10, 2 );
 
-		// Reset Settings' memo on save, so code reading a setting after saving it sees the new value.
-		add_action(
-			'update_option_perflocale_settings',
-			static function (): void {
-				$plugin = Plugin::get_instance();
-
-				if ( ! $plugin->has( 'settings' ) ) {
-					return;
-				}
-
-				$settings = $plugin->get( 'settings' );
-
-				if ( method_exists( $settings, 'reset_cache' ) ) {
-					$settings->reset_cache();
-				}
-			},
-			1
-		);
-
 		// Settings change: (un)schedule recurring features at once. Priority 20, after the memo
 		// reset (1) and engine remigration (10).
 		add_action( 'update_option_perflocale_settings', [ self::class, 'ensure_recurring_schedules' ], 20 );
 
 		// One-shot resume after activation: deactivation clears worker events but keeps JobState
 		// rows, and Activator schedules `perflocale_resume_jobs` to re-enqueue queued or running ones.
-		add_action(
-			'perflocale_resume_jobs',
-			static function (): void {
-				Background\Resumer::resume();
-			}
-		);
+		add_action( 'perflocale_resume_jobs', [ BootstrapMaintenance::class, 'resume_jobs' ] );
 
 		// Background workers: each binds `perflocale_job_run_<type>` to WorkerRegistry::run().
 		// Factories give each run a fresh object.
-		Background\WorkerRegistry::register(
-			'data_import',
-			static fn(): Background\AbstractJob => new Background\Jobs\DataImportJob()
-		);
-		Background\WorkerRegistry::register(
-			'data_export',
-			static fn(): Background\AbstractJob => new Background\Jobs\DataExportJob()
-		);
-		// Migration importers and template jobs run from cron or Action Scheduler, never a page
-		// view: bind them in job-capable contexts only.
+		self::register_workers( self::WORKERS );
+
 		if ( $write_context ) {
-			Background\WorkerRegistry::register(
-				'wpml_migration',
-				static fn(): Background\AbstractJob => new Background\Jobs\WpmlMigrationJob()
-			);
-			Background\WorkerRegistry::register(
-				'polylang_migration',
-				static fn(): Background\AbstractJob => new Background\Jobs\PolylangMigrationJob()
-			);
-			Background\WorkerRegistry::register(
-				'translatepress_migration',
-				static fn(): Background\AbstractJob => new Background\Jobs\TranslatePressMigrationJob()
-			);
-			// One-time backfill of menu and pattern references in existing translated templates.
-			Background\WorkerRegistry::register(
-				'template_refs_backfill',
-				static fn(): Background\AbstractJob => new Background\Jobs\TemplateRefsBackfillJob()
-			);
-			// Containers a menu or pattern event reaches beyond the changing request
-			// (TemplateBlockRefs::fan_out()).
-			Background\WorkerRegistry::register(
-				'template_refs_fanout',
-				static fn(): Background\AbstractJob => new Background\Jobs\TemplateRefsFanoutJob()
-			);
-			// XLIFF imports queued by POST /xliff/import.
-			Background\WorkerRegistry::register(
-				'xliff_import',
-				static fn(): Background\AbstractJob => new Background\Jobs\XliffImportJob()
-			);
-
-			// Not on AJAX: the job refuses to dispatch there, after its class loaded.
-			if ( is_admin() && ! wp_doing_ajax() ) {
-				add_action( 'admin_init', [ self::class, 'maybe_dispatch_template_refs_backfill' ], 20 );
-			}
-
-			// One-time jobs record a cancel in their dispatch state, so an admin page decides
-			// from that option alone.
-			add_action( 'perflocale/jobs/canceled', [ Background\OneTimeDispatch::class, 'on_canceled' ], 10, 2 );
-
-			// SQLite only: repair of string groups an older scan shared. The engine is checked first,
-			// so MySQL loads nothing; wp-admin only queues the job.
-			if ( defined( 'DB_ENGINE' ) && 'sqlite' === constant( 'DB_ENGINE' ) ) {
-				Background\WorkerRegistry::register(
-					'sqlite_group_repair',
-					static fn(): Background\AbstractJob => new Background\Jobs\StringGroupRepairJob()
-				);
-
-				if ( is_admin() && ! wp_doing_ajax() ) {
-					add_action( 'admin_init', [ self::class, 'maybe_dispatch_sqlite_group_repair' ] );
-				}
-			}
+			// Global fields and Content ReSync (only while on), its housekeeping: not for a REST write or another plugin's AJAX.
+			self::bind_jobs( ! Helper::is_rest_request() && ( ! wp_doing_ajax() || BootstrapAjax::runs_jobs() ) );
+		} elseif ( defined( 'ALTERNATE_WP_CRON' ) && ALTERNATE_WP_CRON ) {
+			// WP-Cron inside a page view defines DOING_CRON after boot; wp-cron.php reads its due events through this filter.
+			add_filter( 'pre_get_ready_cron_jobs', [ BootstrapRare::class, 'bind_jobs_in_page_cron' ] );
 		}
-		Background\WorkerRegistry::register(
-			'string_scan',
-			static fn(): Background\AbstractJob => new Background\Jobs\StringScanJob()
-		);
-		Background\WorkerRegistry::register(
-			'bulk_translate',
-			static fn(): Background\AbstractJob => new Background\Jobs\BulkTranslateJob()
-		);
-		Background\WorkerRegistry::register(
-			'auto_translate',
-			static fn(): Background\AbstractJob => new Background\Jobs\AutoTranslateJob()
-		);
+		self::register_workers( self::LATE_WORKERS );
 
 		// Pre-dispatch MT budget gate: veto a bulk MT dispatch whose estimate (skip-existing aware,
 		// via CostEstimator) exceeds the monthly cap, before any provider spend. Opt-out setting.
@@ -964,15 +749,6 @@ final class Bootstrap {
 			3
 		);
 
-		Background\WorkerRegistry::register(
-			'bulk_string_translate',
-			static fn(): Background\AbstractJob => new Background\Jobs\BulkStringTranslateJob()
-		);
-		Background\WorkerRegistry::register(
-			'site_translate',
-			static fn(): Background\AbstractJob => new Background\Jobs\SiteTranslateJob()
-		);
-
 		// Addon registry - discovers and boots addons after all plugins load.
 		$plugin->register(
 			'addon_registry',
@@ -984,11 +760,11 @@ final class Bootstrap {
 		Addon\AddonRegistry::register_cache_invalidation();
 
 		// Retire stored WooCommerce stock maps when stock sync, the add-on list or WooCommerce is
-		// switched, in every context. Class-name callbacks: InventorySync loads only when one fires.
-		add_action( 'perflocale/settings/updated', [ WooCommerce\InventorySync::class, 'retire_after_settings_change' ], 10, 2 );
-		add_action( 'update_option_perflocale_disabled_addons', [ WooCommerce\InventorySync::class, 'retire_stored_maps' ], 10, 0 );
-		add_action( 'activated_plugin', [ WooCommerce\InventorySync::class, 'retire_after_plugin_toggle' ], 10, 1 );
-		add_action( 'deactivated_plugin', [ WooCommerce\InventorySync::class, 'retire_after_plugin_toggle' ], 10, 1 );
+		// switched, in every context. Class-name callbacks: StoredMapRetire loads only when one fires.
+		add_action( 'perflocale/settings/updated', [ WooCommerce\StoredMapRetire::class, 'retire_after_settings_change' ], 10, 2 );
+		add_action( 'update_option_perflocale_disabled_addons', [ WooCommerce\StoredMapRetire::class, 'retire_stored_maps' ], 10, 0 );
+		add_action( 'activated_plugin', [ WooCommerce\StoredMapRetire::class, 'retire_after_plugin_toggle' ] );
+		add_action( 'deactivated_plugin', [ WooCommerce\StoredMapRetire::class, 'retire_after_plugin_toggle' ] );
 
 		// SEO integrations.
 		$plugin->register(
@@ -1058,88 +834,86 @@ final class Bootstrap {
 	}
 
 	/**
-	 * Drop the per-request memos that hold one blog's data: on switch_blog and from refresh_if_changed().
+	 * Bind the job workers of a job-capable request; migration and template jobs run from cron or Action Scheduler,
+	 * never a page view. Also called once WP-Cron runs inside a page view.
 	 *
-	 * Every blog-affine static or singleton memo must be reset here or be blog-keyed. Only one
-	 * string service exists per mode, so whichever is registered resets. LanguageRouter has its
-	 * own same-blog-aware switch_blog listener: never reset it here.
+	 * @param bool $all With the global-fields and ReSync workers and the housekeeping.
+	 * @return void
+	 */
+	public static function bind_jobs( bool $all ): void {
+		// URL bases compile triggers in cron; admin, WP-CLI, AJAX and REST register them in their bootstraps.
+		if ( wp_doing_cron() ) {
+			Router\UrlBases\LifecycleHooks::maybe_register();
+		}
+
+		self::register_workers( self::WRITE_WORKERS );
+
+		// Not on AJAX: the job refuses to dispatch there, after its class loaded.
+		if ( is_admin() && ! wp_doing_ajax() ) {
+			add_action( 'admin_init', [ BootstrapMaintenance::class, 'maybe_dispatch_template_refs_backfill' ], 20 );
+		}
+
+		if ( $all ) {
+			self::register_workers( [ 'global_fields_sync' => Background\Jobs\GlobalFieldsSyncJob::class ] );
+
+			if ( is_admin() && ! wp_doing_ajax() && ! wp_doing_cron() ) {
+				BootstrapAdmin::bind_resync_workers();
+			} else {
+				Util\ResyncSwitch::register_workers();
+			}
+		}
+
+		// One-time jobs record a cancel in their dispatch state, so an admin page decides
+		// from that option alone.
+		add_action( 'perflocale/jobs/canceled', [ Background\OneTimeDispatch::class, 'on_canceled' ], 10, 2 );
+
+		// SQLite only: repair of string groups an older scan shared. The engine is checked first,
+		// so MySQL loads nothing; wp-admin only queues the job.
+		if ( defined( 'DB_ENGINE' ) && 'sqlite' === constant( 'DB_ENGINE' ) ) {
+			self::register_workers( [ 'sqlite_group_repair' => Background\Jobs\StringGroupRepairJob::class ] );
+
+			if ( is_admin() && ! wp_doing_ajax() ) {
+				add_action( 'admin_init', [ BootstrapMaintenance::class, 'maybe_dispatch_sqlite_group_repair' ] );
+			}
+		}
+	}
+
+	/**
+	 * Bind each job type's worker hook; each run builds a fresh job from the class.
+	 *
+	 * @param array<string, class-string<Background\AbstractJob>> $workers Job type => class.
+	 * @return void
+	 */
+	private static function register_workers( array $workers ): void {
+		foreach ( $workers as $type => $class ) {
+			Background\WorkerRegistry::register( $type, static fn(): Background\AbstractJob => new $class() );
+		}
+	}
+
+	/**
+	 * Register the URL-bases runtime when the blog's autoloaded options hold a map; the class is never named before.
+	 * On switch_blog (an int) it reads the cached alloptions only, so the guard itself runs no query.
+	 *
+	 * @param mixed $all Autoloaded options, or the blog id (switch_blog).
+	 * @return mixed
+	 */
+	public static function url_bases( $all = null ) {
+		$options = is_array( $all ) ? $all : wp_cache_get( 'alloptions', 'options' );
+
+		if ( is_array( $options ) && isset( $options['perflocale_url_bases_map'] ) ) {
+			Router\UrlBases\Runtime::maybe_register();
+		}
+
+		return $all;
+	}
+
+	/**
+	 * Drop the per-request memos that hold one blog's data (switch_blog, CacheManager::refresh_if_changed()).
 	 *
 	 * @return void
 	 */
 	public static function reset_static_state(): void {
-		Translation\PostQueryFilter::reset_static_caches();
-		Translation\TermQueryFilter::reset_static_caches();
-		Translation\PostTranslationManager::reset_static_caches();
-		Database\Repository\TranslationGroupRepository::reset_static_caches();
-		Database\Repository\SlugTranslationRepository::reset_static_caches();
-		Seo\SitemapIntegration::reset_caches();
-		Seo\SchemaEnricher::reset();
-		Translation\MediaTranslationManager::reset_registered();
-		Addon\AddonSettings::reset_static_caches();
-		Helper::reset_static_caches();
-
-		try {
-			$plugin = Plugin::get_instance();
-
-			foreach ( [ 'string_translation', 'translation_file_loader' ] as $service ) {
-				if ( ! $plugin->has( $service ) ) {
-					continue;
-				}
-
-				$instance = $plugin->get( $service );
-
-				if ( method_exists( $instance, 'reset_for_blog_switch' ) ) {
-					$instance->reset_for_blog_switch();
-				}
-			}
-
-			if ( $plugin->has( 'settings' ) ) {
-				$plugin->get( 'settings' )->reset_cache();
-			}
-		} catch ( \Throwable $e ) {
-			// Mid-deactivation or container missing: fail closed.
-		}
-	}
-
-	/**
-	 * `admin_init`: TemplateRefsBackfillJob::maybe_dispatch(), unless the state option says done.
-	 *
-	 * The done check reads the autoloaded option before any job class loads.
-	 *
-	 * @return void
-	 */
-	public static function maybe_dispatch_template_refs_backfill(): void {
-		if ( self::one_time_job_done( self::TEMPLATE_REFS_BACKFILL_OPTION ) ) {
-			return;
-		}
-
-		Background\Jobs\TemplateRefsBackfillJob::maybe_dispatch();
-	}
-
-	/**
-	 * `admin_init` on SQLite: Background\Jobs\StringGroupRepairJob::maybe_dispatch(),
-	 * after the same done check as maybe_dispatch_template_refs_backfill().
-	 *
-	 * @return void
-	 */
-	public static function maybe_dispatch_sqlite_group_repair(): void {
-		if ( self::one_time_job_done( self::SQLITE_GROUP_REPAIR_OPTION ) ) {
-			return;
-		}
-
-		Background\Jobs\StringGroupRepairJob::maybe_dispatch();
-	}
-
-	/**
-	 * Whether a one-time job's state option says done (`done:<unix time>`).
-	 *
-	 * @param string $option State option.
-	 * @return bool
-	 */
-	private static function one_time_job_done( string $option ): bool {
-		$state = get_option( $option, '' );
-
-		return is_string( $state ) && str_starts_with( $state, 'done:' );
+		BootstrapRare::reset_static_state();
 	}
 
 	/**
@@ -1175,7 +949,7 @@ final class Bootstrap {
 	 * Register frontend-only services (never in a non-AJAX admin request).
 	 *
 	 * Page-response services (slug redirect, Content-Language, opt-in emitters, snippet guard) boot only where a page is served;
-	 * AJAX, WP-Cron, WP-CLI, XML-RPC and wp-login.php keep them registered for get(). REST cannot be told apart at init.
+	 * AJAX, WP-Cron, WP-CLI, XML-RPC, wp-login.php and REST keep them registered for get().
 	 *
 	 * @param Plugin $plugin Service container.
 	 * @return void
@@ -1183,7 +957,7 @@ final class Bootstrap {
 	private static function register_frontend_services( Plugin $plugin ): void {
 		// wp-login.php by core's own $pagenow (set before plugins load); unset, it fails open.
 		$page = ! wp_doing_ajax() && ! wp_doing_cron() && ! ( defined( 'WP_CLI' ) && WP_CLI ) && ! ( defined( 'XMLRPC_REQUEST' ) && XMLRPC_REQUEST )
-			&& 'wp-login.php' !== ( $GLOBALS['pagenow'] ?? '' );
+			&& 'wp-login.php' !== ( $GLOBALS['pagenow'] ?? '' ) && ! self::$rest;
 
 		$plugin->register(
 			'language_switcher',
@@ -1311,7 +1085,8 @@ final class Bootstrap {
 	 * @return void
 	 */
 	public static function register_rest_routes(): void {
-		BootstrapAdmin::register_rest_routes();
+		require_once __DIR__ . '/Api/RestBoot.php';
+		Api\RestBoot::register();
 	}
 
 	/**
@@ -1327,23 +1102,16 @@ final class Bootstrap {
 	/**
 	 * Allow duplicate post slugs across languages; the URL's language prefix keeps them apart.
 	 *
-	 * @param string   $slug The slug WP wants to assign (possibly with -2, -3, etc.).
-	 * @param int|null $post_id Post ID; null on a REST create, read as 0 like wp_insert_post()'s new post.
-	 * @param string   $post_status Post status.
-	 * @param string   $post_type Post type.
-	 * @param int|null $post_parent Post parent ID; null on a REST create.
-	 * @param string   $original_slug The original desired slug before deduplication.
-	 * @return string The slug to use.
+	 * @param mixed $slug The slug WP wants to assign (possibly with -2, -3, etc.).
+	 * @param mixed $post_id Post ID; null on a REST create.
+	 * @param mixed $post_status Post status.
+	 * @param mixed $post_type Post type.
+	 * @param mixed $post_parent Post parent ID; null on a REST create.
+	 * @param mixed $original_slug The original desired slug before deduplication.
+	 * @return mixed The slug to use.
 	 */
-	public static function allow_translation_duplicate_slugs(
-		string $slug,
-		$post_id,
-		string $post_status,
-		string $post_type,
-		$post_parent,
-		string $original_slug
-	): string {
-		return BootstrapWrites::allow_translation_duplicate_slugs( $slug, (int) $post_id, $post_status, $post_type, (int) $post_parent, $original_slug );
+	public static function allow_translation_duplicate_slugs( $slug, $post_id = 0, $post_status = '', $post_type = '', $post_parent = 0, $original_slug = '' ) {
+		return BootstrapWrites::allow_translation_duplicate_slugs( $slug, $post_id, $post_status, $post_type, $post_parent, $original_slug );
 	}
 
 	/**
@@ -1445,7 +1213,7 @@ final class Bootstrap {
 	 * @return void
 	 */
 	public static function auto_assign_default_language( int $post_id, ?\WP_Post $post = null ): void {
-		BootstrapWrites::auto_assign_default_language( $post_id, $post );
+		Translation\SaveHookGuards::auto_assign_default_language( $post_id, $post );
 	}
 
 	/**
@@ -1585,43 +1353,7 @@ final class Bootstrap {
 	}
 
 	/**
-	 * Record a boot where a conflicting multilingual plugin keeps PerfLocale from running.
-	 *
-	 * No cache listener runs then, so hreflang may go stale. Only the first dormant boot writes
-	 * DORMANT_KEY, at plugins_loaded, when the option-update listeners can run.
-	 *
-	 * @return void
-	 */
-	private static function note_dormant_boot(): void {
-		$stored = get_option( 'perflocale_settings' );
-
-		if ( ! is_array( $stored ) || isset( $stored[ self::DORMANT_KEY ] ) ) {
-			return;
-		}
-
-		add_action(
-			'plugins_loaded',
-			static function (): void {
-				$stored = get_option( 'perflocale_settings' );
-
-				if ( ! is_array( $stored ) || isset( $stored[ self::DORMANT_KEY ] ) ) {
-					return;
-				}
-
-				$stored[ self::DORMANT_KEY ] = 1;
-
-				update_option( 'perflocale_settings', $stored );
-			},
-			0
-		);
-	}
-
-	/**
 	 * On the first normal boot after a dormant one, retire the hreflang cache and drop the record.
-	 *
-	 * The group is retired at plugins_loaded:0. The record goes at the end of init, after Action
-	 * Scheduler init (the settings listeners pick the engine), under the settings lock on a fresh
-	 * read. See docs-ai/11-code-rationale.md, "Bootstrap: dormant boot".
 	 *
 	 * @param Plugin $plugin Plugin container.
 	 * @return void
@@ -1633,41 +1365,7 @@ final class Bootstrap {
 			return;
 		}
 
-		add_action(
-			'plugins_loaded',
-			static function () use ( $plugin, $settings ): void {
-				$cache = $plugin->get( 'cache' );
-
-				if ( $cache instanceof Cache\CacheManager ) {
-					$cache->invalidate_group( 'perflocale_hreflang' );
-				}
-
-				add_action(
-					'init',
-					static function () use ( $settings ): void {
-						Concurrency\Lock::with(
-							'settings_update',
-							10,
-							static function () use ( $settings ): void {
-								wp_cache_delete( 'perflocale_settings', 'options' );
-								wp_cache_delete( 'alloptions', 'options' );
-
-								$stored = get_option( 'perflocale_settings' );
-
-								if ( is_array( $stored ) && array_key_exists( self::DORMANT_KEY, $stored ) ) {
-									unset( $stored[ self::DORMANT_KEY ] );
-									update_option( 'perflocale_settings', $stored );
-								}
-
-								$settings->reset_cache();
-							}
-						);
-					},
-					PHP_INT_MAX
-				);
-			},
-			0
-		);
+		BootstrapMaintenance::resume_after_dormant_boot( $plugin, $settings );
 	}
 
 	/**
@@ -1709,22 +1407,18 @@ final class Bootstrap {
 	 * @return void
 	 */
 	public static function register_language_shortcode(): void {
-		add_shortcode(
-			'perflocale_language',
-			static function ( $atts ): string {
-				$atts = shortcode_atts( [ 'format' => 'name' ], (array) $atts, 'perflocale_language' );
-				$h    = perflocale();
+		add_shortcode( 'perflocale_language', [ self::class, 'render_language_shortcode' ] );
+	}
 
-				return match ( $atts['format'] ) {
-					'slug' => esc_html( $h->slug() ),
-					'locale' => esc_html( $h->locale() ),
-					'name' => esc_html( $h->name() ),
-					'native_name', 'native' => esc_html( $h->native_name() ),
-					'display_name', 'display' => esc_html( $h->display_name() ),
-					'flag' => esc_html( $h->flag() ),
-					default => esc_html( $h->name() ),
-				};
-			}
-		);
+	/**
+	 * Render [perflocale_language]; the renderer loads on first use.
+	 *
+	 * @param mixed $atts Shortcode attributes.
+	 * @return string
+	 */
+	public static function render_language_shortcode( $atts ): string {
+		require_once __DIR__ . '/Frontend/LanguageShortcode.php';
+
+		return Frontend\LanguageShortcode::render( $atts );
 	}
 }

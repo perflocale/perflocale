@@ -101,6 +101,8 @@ final class CacheInvalidator {
 	 * @return void
 	 */
 	public function clear_hreflang_before_unlink( int $post_id ): void {
+		self::forget_fallback_counts();
+
 		$this->clear_hreflang_for_post_and_siblings( $post_id );
 	}
 
@@ -117,6 +119,9 @@ final class CacheInvalidator {
 	 * @return void
 	 */
 	public function note_link_change( int $group_id, int $object_id, array $member_ids, int $displaced_id, array $left_member_ids ): void {
+		// Membership changes the stored untranslated-content count.
+		self::forget_fallback_counts();
+
 		$this->link_changes[ get_current_blog_id() . ':' . $group_id ] = [
 			'object'    => $object_id,
 			'members'   => $member_ids,
@@ -514,15 +519,9 @@ final class CacheInvalidator {
 		// deactivation and uninstall ordering window.
 		if ( \PerfLocale\Database\Schema::tables_exist() ) {
 			global $wpdb;
+			// Its old URL slugs (term_h1..term_h5) too.
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-			$wpdb->delete(
-				\PerfLocale\Database\Schema::table( 'slug_translations' ),
-				[
-					'object_id'   => $term_id,
-					'object_type' => 'term',
-				],
-				[ '%d', '%s' ]
-			);
+			$wpdb->query( $wpdb->prepare( "DELETE FROM %i WHERE object_id = %d AND object_type IN ('term','term_h1','term_h2','term_h3','term_h4','term_h5')", \PerfLocale\Database\Schema::table( 'slug_translations' ), $term_id ) );
 
 			// And its content_hashes row: ContentChangeDetector boots only in admin, REST and CLI, so its own
 			// cleanup misses a term deleted elsewhere.
@@ -551,7 +550,7 @@ final class CacheInvalidator {
 		$this->cache->flush_languages();
 
 		// Rewrite rules embed a regex of the language slugs, so they must be regenerated.
-		update_option( 'perflocale_flush_rules', 1, false );
+		update_option( 'perflocale_flush_rules', 1, true );
 		delete_transient( 'perflocale_rewrites_verified' );
 	}
 
@@ -580,6 +579,12 @@ final class CacheInvalidator {
 			return;
 		}
 
+		// Fallback pages change status, robots or target with these: page caches must drop every page (flush_all's hook).
+		if ( ( $new_settings['missing_translation_action'] ?? null ) !== ( $old_settings['missing_translation_action'] ?? null )
+			|| ( $new_settings['language_fallbacks'] ?? null ) !== ( $old_settings['language_fallbacks'] ?? null ) ) {
+			$this->cache->flush_all();
+		}
+
 		// URL settings shape the URLs in cached hreflang alternates and found-rows counts.
 		$url_keys = [ 'url_mode', 'url_prefix_type', 'hide_default_prefix', 'excluded_paths', 'translate_slugs', 'language_domains' ];
 
@@ -590,6 +595,11 @@ final class CacheInvalidator {
 				$this->cache->invalidate_group( 'perflocale_found_rows' );
 				break;
 			}
+		}
+
+		// Cached countries are the previous provider's answers: None or another provider applies on the next visit.
+		if ( ( $new_settings['geo_provider'] ?? null ) !== ( $old_settings['geo_provider'] ?? null ) ) {
+			$this->cache->invalidate_group( 'perflocale_geo_lookup' );
 		}
 
 		// Type translatability: cached hreflang alternates are not re-checked at serve time, and superseded
@@ -611,8 +621,11 @@ final class CacheInvalidator {
 			$languages = $lang_repo->get_active();
 
 			foreach ( $languages as $lang ) {
-				$this->cache->delete( "all_string_translations_{$lang->id}", 'perflocale_strings' );
+				$this->cache->delete( "all_str2_translations_{$lang->id}", 'perflocale_strings' );
 			}
+
+			require_once __DIR__ . '/CacheDiagnostics.php';
+			CacheDiagnostics::forget_map_sizes( $this->cache, array_column( $languages, 'id' ) );
 
 			if ( ( $new_settings['string_translation_mode'] ?? '' ) === 'files' ) {
 					// Tells TranslationFileLoader the files are regenerating, so a first miss does not end its retries.
@@ -677,7 +690,10 @@ final class CacheInvalidator {
 			$this->clear_hreflang_for_post_and_siblings( (int) $post->ID );
 		}
 
-		$urls = $this->public_translation_urls( (int) $post->ID );
+		// The stored count of untranslated content changes with any public change.
+		self::forget_fallback_counts();
+
+		$urls = array_values( array_unique( array_merge( $this->public_translation_urls( (int) $post->ID ), $this->fallback_aliases( (int) $post->ID ) ) ) );
 
 		if ( $urls === [] ) {
 			return;
@@ -737,6 +753,64 @@ final class CacheInvalidator {
 	}
 
 	/**
+	 * Each group member's URL in every other active language: where it was, or now is, served as a fallback.
+	 *
+	 * @param int $post_id Post id.
+	 * @return array<int, string>
+	 */
+	private function fallback_aliases( int $post_id ): array {
+		$urls = [];
+
+		try {
+			$plugin    = \PerfLocale\Plugin::get_instance();
+			$converter = $plugin->get( 'url_converter' );
+			$langs     = new \PerfLocale\Database\Repository\LanguageRepository( $this->cache );
+			$members   = [];
+
+			if ( ! $converter instanceof \PerfLocale\Router\UrlConverter ) {
+				return [];
+			}
+
+			foreach ( ( new \PerfLocale\Database\Repository\TranslationGroupRepository( $this->cache ) )->get_translations( $post_id, \PerfLocale\Enum\ObjectType::Post ) as $link ) {
+				if ( is_object( $link ) && isset( $link->object_id, $link->language_slug ) && is_numeric( $link->object_id ) && is_string( $link->language_slug ) ) {
+					$members[ (int) $link->object_id ] = $link->language_slug;
+				}
+			}
+
+			// An unlinked post is default-language content.
+			if ( $members === [] ) {
+				$default             = $langs->get_default();
+				$members[ $post_id ] = $default !== null && isset( $default->slug ) && is_string( $default->slug ) ? $default->slug : '';
+			}
+
+			foreach ( $members as $id => $own ) {
+				$permalink = get_permalink( $id );
+
+				if ( ! is_string( $permalink ) || $permalink === '' ) {
+					continue;
+				}
+
+				foreach ( $langs->get_active() as $lang ) {
+					$slug = isset( $lang->slug ) && is_string( $lang->slug ) ? $lang->slug : '';
+
+					if ( $slug !== '' && $slug !== $own ) {
+						$alias = $converter->convert( $permalink, $slug );
+
+						if ( $alias !== '' ) {
+							$urls[] = $alias;
+						}
+					}
+				}
+			}
+		} catch ( \Throwable $e ) {
+			// A missing container or table must never block a status change.
+			unset( $e );
+		}
+
+		return array_values( array_unique( $urls ) );
+	}
+
+	/**
 	 * Front-end URLs for every post in this post's translation group.
 	 *
 	 * Uses get_permalink() on purpose: it gives the URL a visitor requests, even in this admin request. URLs that
@@ -757,5 +831,28 @@ final class CacheInvalidator {
 		}
 
 		return array_values( array_unique( $urls ) );
+	}
+
+	/**
+	 * Drop the stored untranslated-content count (Admin\SiteHealth\FallbackPages::OPTION) unless it is confirmed absent.
+	 * Read first: delete_option() costs a query even without the row; a read that failed deletes (it proves nothing).
+	 *
+	 * @return void
+	 */
+	private static function forget_fallback_counts(): void {
+		global $wpdb;
+		/**
+		 * WordPress database access object.
+		 *
+		 * @var \wpdb $wpdb
+		 */
+
+		$queries = $wpdb->num_queries;
+
+		if ( false === get_option( 'perflocale_fallback_counts' ) && ( $wpdb->num_queries === $queries || '' === $wpdb->last_error ) ) {
+			return;
+		}
+
+		delete_option( 'perflocale_fallback_counts' );
 	}
 }

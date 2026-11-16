@@ -163,7 +163,7 @@ final class BlockTemplateWrites {
 					continue;
 				}
 
-				if ( $theme instanceof \WP_Term && self::relink_orphan( $post, $theme, $slug, (int) $lang->id, (int) $default->id ) ) {
+				if ( $theme instanceof \WP_Term && self::relink_orphan( $post, $theme, $slug, (int) $lang->id, (int) $default->id ) > 0 ) {
 					continue;
 				}
 
@@ -179,24 +179,98 @@ final class BlockTemplateWrites {
 	}
 
 	/**
-	 * Relink this language's orphaned translation into the source's group instead of seeding a copy.
+	 * This template's translation in one language as a save would give it: the existing one, else the orphan "Reset
+	 * to theme default" left, else a new copy; only that language, under ensure_translations_exist()'s conditions.
+	 * Content ReSync's fill asks first with $create false, so it spends nothing on a language that needs no copy.
 	 *
-	 * "Reset to theme default" deletes the source and leaves its translations; a
-	 * seeded copy would strand the finished one and take its slug. Match rules: see
-	 * docs-ai/11-code-rationale.md, "BlockTemplateWrites: orphan relink".
+	 * @param WP_Post   $post      The source template.
+	 * @param string    $lang_slug Target language slug.
+	 * @param bool|null $created   Set to true when a new copy was inserted.
+	 * @param bool      $create    Whether a missing copy is created.
+	 * @return int The translation's id; 0 when the conditions refuse one or the create failed; -1 when a copy would be created but $create is false.
+	 */
+	public static function ensure_translation( WP_Post $post, string $lang_slug, ?bool &$created = null, bool $create = true ): int {
+		$created = false;
+
+		if ( ! BlockTemplateSupport::is_template_type( $post->post_type ) || wp_is_post_revision( $post->ID ) || wp_is_post_autosave( $post->ID ) ) {
+			return 0;
+		}
+
+		if ( in_array( $post->post_status, [ 'auto-draft', 'trash', 'inherit' ], true ) ) {
+			return 0;
+		}
+
+		$plugin   = \PerfLocale\Plugin::get_instance();
+		$settings = $plugin->settings();
+		$langs    = $plugin->lang_repo();
+
+		if ( ! in_array( $post->post_type, $settings->get_translatable_post_types(), true ) ) {
+			return 0;
+		}
+
+		/** This filter is documented in src/Translation/BlockTemplateWrites.php */
+		if ( ! apply_filters( 'perflocale/fse/auto_create_translations', true, $post ) ) {
+			return 0;
+		}
+
+		$themes  = get_the_terms( $post->ID, 'wp_theme' );
+		$theme   = is_array( $themes ) ? reset( $themes ) : null;
+		$default = $langs->get_default();
+		$lang    = $langs->find_by_slug( $lang_slug );
+		$def     = \PerfLocale\Util\Scalar::str( \PerfLocale\Util\Scalar::prop( $default, 'slug' ) );
+		$slug    = \PerfLocale\Util\Scalar::str( \PerfLocale\Util\Scalar::prop( $lang, 'slug' ) );
+
+		if ( ! $theme instanceof \WP_Term || '' === $def || '' === $slug || $slug === $def ) {
+			return 0;
+		}
+
+		$manager   = new PostTranslationManager( $plugin->cache(), $settings );
+		$post_lang = \PerfLocale\Util\Scalar::str( \PerfLocale\Util\Scalar::prop( $manager->detect_post_language( $post->ID ), 'slug' ) );
+
+		if ( $post_lang !== $def ) {
+			return 0;
+		}
+
+		$found = \PerfLocale\Util\Scalar::int( $manager->get_translations( $post->ID )[ $slug ] ?? 0 );
+
+		if ( $found > 0 && get_post( $found ) instanceof WP_Post ) {
+			return $found;
+		}
+
+		$orphan = self::relink_orphan( $post, $theme, $slug, \PerfLocale\Util\Scalar::int( \PerfLocale\Util\Scalar::prop( $lang, 'id' ) ), \PerfLocale\Util\Scalar::int( \PerfLocale\Util\Scalar::prop( $default, 'id' ) ) );
+
+		if ( $orphan > 0 ) {
+			return $orphan;
+		}
+
+		if ( ! $create ) {
+			return -1;
+		}
+
+		$inserted = false;
+		$id       = $manager->create_translation( $post->ID, $slug, true, \PerfLocale\Enum\SourceType::Manual, $inserted );
+		$created  = $inserted;
+
+		return is_int( $id ) ? $id : 0;
+	}
+
+	/**
+	 * Relink this language's orphaned translation into the source's group instead of seeding a copy ("Reset to theme
+	 * default" deletes the source and leaves its translations). Match rules: docs-ai/11-code-rationale.md,
+	 * "BlockTemplateWrites: orphan relink".
 	 *
 	 * @param WP_Post  $source     The template being saved (default language).
 	 * @param \WP_Term $theme      The source's wp_theme term.
 	 * @param string   $lang_slug  Target language slug.
 	 * @param int      $lang_id    Target language ID.
 	 * @param int      $default_id Default language ID.
-	 * @return bool True when an orphan was found; the caller then seeds no copy.
+	 * @return int The orphan's id when one was found (the caller then seeds no copy), else 0.
 	 */
-	private static function relink_orphan( WP_Post $source, \WP_Term $theme, string $lang_slug, int $lang_id, int $default_id ): bool {
+	private static function relink_orphan( WP_Post $source, \WP_Term $theme, string $lang_slug, int $lang_id, int $default_id ): int {
 		$plugin = \PerfLocale\Plugin::get_instance();
 
 		if ( $source->post_name === '' || ! $plugin->has( 'group_repo' ) ) {
-			return false;
+			return 0;
 		}
 
 		global $wpdb;
@@ -229,7 +303,7 @@ final class BlockTemplateWrites {
 		);
 
 		if ( $orphan_id <= 0 ) {
-			return false;
+			return 0;
 		}
 
 		$groups = $plugin->get( 'group_repo' );
@@ -245,7 +319,7 @@ final class BlockTemplateWrites {
 			}
 		}
 
-		return true;
+		return $orphan_id;
 	}
 
 	/**

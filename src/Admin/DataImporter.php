@@ -11,7 +11,9 @@ namespace PerfLocale\Admin;
 
 use PerfLocale\Database\ConnectionGuard;
 use PerfLocale\Database\DataRegistry;
+use PerfLocale\Database\Repository\SlugTranslationWrites;
 use PerfLocale\Database\Schema;
+use PerfLocale\Database\Txn;
 
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
@@ -31,6 +33,11 @@ final class DataImporter {
 	 * Rows per insert batch.
 	 */
 	private const BATCH_SIZE = 500;
+
+	/**
+	 * Crashed ReSync writes a Replace repairs before its open-intent check (the housekeeping's batch).
+	 */
+	private const RESYNC_REPAIR_BATCH = 250;
 
 	/**
 	 * Fewest and most rows per piece (perflocale/import/batch_size, and
@@ -137,6 +144,20 @@ final class DataImporter {
 	private bool $languages_cleared = false;
 
 	/**
+	 * Replace: what LanguageWrites::release_slugs() released for languages the file does not bring back; null when nothing.
+	 *
+	 * @var array{values: string, map: array{0: array<mixed>, 1: array<mixed>}|null}|null
+	 */
+	private ?array $released = null;
+
+	/**
+	 * Replace: the release holds option publication until this transaction ends (OptionWriter::hold()).
+	 *
+	 * @var bool
+	 */
+	private bool $release_held = false;
+
+	/**
 	 * Rows a check left out on purpose, by reason (see skip_reason_notes()).
 	 *
 	 * @var array<string, int>
@@ -156,6 +177,13 @@ final class DataImporter {
 	 * @var bool
 	 */
 	private bool $languages_changed = false;
+
+	/**
+	 * Active language rows this import wrote, code => [ locale, name ]: the report names root posts their prefix takes.
+	 *
+	 * @var array<string, array{0: string, 1: string}>
+	 */
+	private array $added_codes = [];
 
 	/**
 	 * Whether a Merge began writing: when it stops after that, what it wrote is finished (finish_stopped_merge()).
@@ -204,6 +232,13 @@ final class DataImporter {
 	private array $changed_matches = [];
 
 	/**
+	 * Term URL slug rows of slug_translations held back for restore_term_slugs(), with their sanitized flag.
+	 *
+	 * @var array<int, array{0: array<string, mixed>, 1: bool}>
+	 */
+	private array $term_slug_rows = [];
+
+	/**
 	 * Replace: the open transaction's connection guard (null outside it), so a write wpdb resends on a new connection
 	 * changes nothing.
 	 *
@@ -218,15 +253,16 @@ final class DataImporter {
 	 * @param string               $file_path        Path to the JSON file.
 	 * @param bool                 $replace          Replace all existing data (true) or merge; only Replace applies the
 	 *                                               file's configuration.
-	 * @param bool                 $sanitize_strings Sanitize string translation, language and slug rows as the plugin's
+	 * @param bool                 $sanitize_strings Sanitize string translation, language, slug and pending-change rows as the plugin's
 	 *                                               own writers do for a user without `unfiltered_html` (the admin job
 	 *                                               decides; WP-CLI passes false).
 	 * @param array<string, mixed> $options          `allow_foreign_ids` (the operator confirmed this site is a copy of
 	 *                                               the source; read with `! empty()`, a replayed job's value is 1, '1'
 	 *                                               or true) and `addon_choices` (`addon_data` and `<owner>/<group id>`
 	 *                                               parts to import; null: all the file carries).
-	 * @return array{imported: int, skipped: int, errors: array<int, string>, sanitized: int, refused?: bool, not_applied?: array<int, string>, notice?: string, refused_addresses?: array<int, string>, address_notice?: string, notes?: array<int, string>, default_language_kept?: string, skipped_reasons?: array<string, int>, kept_settings?: array<int, string>, unread_sections?: array<int, string>, undeclared_sections?: array<int, string>, changed_matches?: array<string, int>}
+	 * @return array{imported: int, skipped: int, errors: array<int, string>, sanitized: int, refused?: bool, not_applied?: array<int, string>, notice?: string, refused_addresses?: array<int, string>, address_notice?: string, notes?: array<int, string>, default_language_kept?: string, skipped_reasons?: array<string, int>, kept_settings?: array<int, string>, unread_sections?: array<int, string>, undeclared_sections?: array<int, string>, changed_matches?: array<string, int>, slug_clashes?: array<int, string>}
 	 *         `refused`: stopped before its first write (a failure that changed nothing); `errors` says why.
+	 *         A Replace is also refused while a Content ReSync write intent is open (after the crashed ones are repaired).
 	 */
 	public function import( string $file_path, bool $replace = false, bool $sanitize_strings = false, array $options = [] ): array {
 		$result = [
@@ -241,9 +277,12 @@ final class DataImporter {
 		$this->site_default         = null;
 		$this->default_kept         = '';
 		$this->languages_cleared    = false;
+		$this->released             = null;
+		$this->release_held         = false;
 		$this->skip_reasons         = [];
 		$this->strings_carried      = false;
 		$this->languages_changed    = false;
+		$this->added_codes          = [];
 		$this->merge_writing        = false;
 		$this->replaced_link_tables = false;
 		$this->groups_keep_strings  = false;
@@ -251,13 +290,27 @@ final class DataImporter {
 		$this->language_id_set      = null;
 		$this->changed_matches      = [];
 		$this->guard                = null;
+		$this->term_slug_rows       = [];
 
-		// One import per site at a time, whatever started it, from before the file is read until the last write.
-		if ( ! ImportLock::acquire() ) {
-			$result['errors'][] = ImportLock::busy_message();
+		// Inside another plugin transaction (a hook): refused before anything is sent; its START TRANSACTION would commit that one.
+		if ( $replace && \PerfLocale\Database\Tx::open() ) {
+			$result['errors'][] = __( 'Replace import aborted: the database could not open a transaction; rolling back so no data is lost.', 'perflocale' );
 			$result['refused']  = true;
 
 			return $result;
+		}
+
+		// One import per site at a time, whatever started it, from before the file is read until the last write. A URL-slug
+		// write holds the same lock briefly: three tries, a second apart.
+		for ( $try = 1; ! ImportLock::acquire(); ++$try ) {
+			if ( $try >= 3 || ImportLock::held() || '' !== ImportLock::refused() ) {
+				$result['errors'][] = '' !== ImportLock::refused() ? ImportLock::refused() : ImportLock::busy_message();
+				$result['refused']  = true;
+
+				return $result;
+			}
+
+			sleep( 1 );
 		}
 
 		try {
@@ -545,8 +598,8 @@ final class DataImporter {
 
 		if ( ! $allow_foreign_ids && $identity_rules && ! $has_recorded_url
 			&& ( ( $replace && [] !== self::tables_to_wipe( $data ) )
-				|| self::carries_object_ids( $data, array_keys( $addon['members'] ) )
-				|| ( self::carries_language_refs( $data ) && ! self::has_rows( $data, 'languages' ) ) ) ) {
+				|| self::carries_object_ids( $data, array_keys( $addon['members'] ), $replace )
+				|| ( self::carries_language_refs( $data, $replace ) && ! self::has_rows( $data, 'languages' ) ) ) ) {
 			$result['errors'][] = __( 'Import refused. Tick the copy-confirmation box on the import form (WP-CLI: --force) to import it anyway. This file records no site address, so it cannot be matched to this site. Tick the box only when this site is a copy of the site the file was exported from and its post and term IDs still match.', 'perflocale' );
 			$result['refused']  = true;
 
@@ -582,7 +635,7 @@ final class DataImporter {
 				return $result;
 			}
 
-			if ( self::carries_object_ids( $data, array_keys( $addon['members'] ) ) ) {
+			if ( self::carries_object_ids( $data, array_keys( $addon['members'] ), $replace ) ) {
 				$result['errors'][] = sprintf(
 					/* translators: 1: site address recorded in the export file, 2: this site's address. The quoted phrase is the import form's checkbox label and must match it word for word. */
 					__( 'Import refused. Tick the copy-confirmation box on the import form (WP-CLI: --force) to import it anyway. This file was exported from %1$s, not this site (%2$s). Its translation links, translated slugs and content hashes name posts and terms by numeric ID, and on a site that was set up separately the same IDs belong to different content. Tick the box only when this site is a copy of %1$s and its post and term IDs still match - a staging clone, a domain migration, or a backup of this site that records a language-specific address. The box is labelled “This site is a copy of the site the file was exported from”.', 'perflocale' ),
@@ -596,7 +649,7 @@ final class DataImporter {
 
 			// Rows naming a language by id with no languages section to resolve them: a German translation would land under
 			// whatever language has that id here.
-			if ( self::carries_language_refs( $data ) && ! self::has_rows( $data, 'languages' ) ) {
+			if ( self::carries_language_refs( $data, $replace ) && ! self::has_rows( $data, 'languages' ) ) {
 				$result['errors'][] = sprintf(
 					/* translators: 1: site address recorded in the export file, 2: this site's address. "Languages" names a section checkbox on the export screen: use the same word as that checkbox. The quoted phrase is the import form's checkbox label and must match it word for word. */
 					__( 'Import refused. Export again from %1$s with the Languages section included, or tick the copy-confirmation box on the import form (WP-CLI: --force). This file was exported from %1$s, not this site (%2$s), and it carries no Languages section. Its translations name their language by numeric ID, and the same ID belongs to a different language here. Tick the box only when this site is a copy of %1$s, or for a backup of this site that records a language-specific address. The box is labelled “This site is a copy of the site the file was exported from”.', 'perflocale' ),
@@ -617,7 +670,7 @@ final class DataImporter {
 		];
 
 		try {
-			$quality = self::stream_quality_issues( $reader, $data, $limits, ( ! $allow_foreign_ids && $identity_rules ) ? self::fingerprint_sources( $addon['members'] ) : [], $presence );
+			$quality = self::stream_quality_issues( $reader, $data, $limits, ( ! $allow_foreign_ids && $identity_rules ) ? self::fingerprint_sources( $addon['members'], $replace ) : [], $presence );
 		} catch ( \UnexpectedValueException $e ) {
 			$quality = [ self::read_error_message( $e, $limits ) ];
 		}
@@ -625,6 +678,20 @@ final class DataImporter {
 		if ( ! empty( $quality ) ) {
 			$result['errors']  = $quality;
 			$result['refused'] = true;
+			return $result;
+		}
+
+		// A setting of the wrong shape would be stored coerced ("Array"): Replace applies settings, so it refuses first.
+		$misshapen = $replace ? self::misshapen_settings( $data ) : [];
+
+		if ( [] !== $misshapen ) {
+			$result['errors'][] = sprintf(
+				/* translators: %s: comma-separated setting names, such as mt_provider. */
+				__( 'Import refused: the file holds a value of the wrong type for these settings: %s. Nothing was changed.', 'perflocale' ),
+				implode( ', ', $misshapen )
+			);
+			$result['refused']  = true;
+
 			return $result;
 		}
 
@@ -665,6 +732,19 @@ final class DataImporter {
 			}
 		}
 
+		// A Replace that clears the post links (both ReSync tables go with them) or the pending changes would delete a
+		// ReSync write's intent: crashed writes are repaired first; an intent still open refuses before the first write.
+		if ( $replace ) {
+			$intent_refusal = self::open_resync_intents( self::tables_to_wipe( $data ) );
+
+			if ( '' !== $intent_refusal ) {
+				$result['errors'][] = $intent_refusal;
+				$result['refused']  = true;
+
+				return $result;
+			}
+		}
+
 		// Merge never changes configuration: each part the file carries is counted as skipped and named.
 		if ( ! $replace ) {
 			$not_applied = [];
@@ -681,6 +761,17 @@ final class DataImporter {
 				/* translators: "Merge" and "Replace" are the import modes on the Settings → Export & Import screen. */
 				$result['notice'] = __( 'Settings, add-on settings, the add-on list and roles in the file were not applied (Merge). Use Replace to apply them; a file with only those sections deletes no rows.', 'perflocale' );
 			}
+
+			// The automation history names this site's changes by id and has no key to merge on: Merge leaves it out.
+			$automation_rows = $reader->count( 'pending_changes' );
+
+			if ( $automation_rows > 0 ) {
+				$result['skipped']      += $automation_rows;
+				$result['not_applied'][] = 'automation';
+				/* translators: "Merge" and "Replace" are the import modes on the Settings → Export & Import screen. */
+				$automation_notice = __( 'The automation history in the file was not applied (Merge). Use Replace to restore it.', 'perflocale' );
+				$result['notice']  = isset( $result['notice'] ) ? $result['notice'] . ' ' . $automation_notice : $automation_notice;
+			}
 		}
 
 		// Tables.
@@ -690,7 +781,8 @@ final class DataImporter {
 			$wpdb = Typed::wpdb();
 
 			// Table => type scope (null: whole table), resolved once for the wipe and for the abort gate (partly cleared tables).
-			$wipe_plan = $replace ? self::tables_to_wipe( $data ) : [];
+			$wipe_plan      = $replace ? self::tables_to_wipe( $data ) : [];
+			$intent_refused = '';
 
 			$this->languages_cleared   = array_key_exists( 'languages', $wipe_plan );
 			$this->groups_keep_strings = '!string' === ( $wipe_plan['translation_groups'] ?? null );
@@ -712,14 +804,19 @@ final class DataImporter {
 				ImportLock::bind_session( self::merge_lost_message() );
 			}
 
+			$slugs_before = null;
+			$committed    = false;
+
 			try {
 				if ( $replace ) {
 					// Wipe and re-import in one transaction, with DELETE (TRUNCATE commits implicitly); ids are kept. Checked against
 					// false only (0 is success). The guard is set first, so a statement resent on a new connection matches nothing.
 					$this->guard = new ConnectionGuard( 'import' );
 
+					// The intent fence below holds by gap locks, which follow this transaction's level: REPEATABLE READ
+					// on a READ COMMITTED server too (next transaction only; a reconnect after it fails the guard).
 					// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-					if ( ! $this->guard->begin() || false === $wpdb->query( 'START TRANSACTION' ) ) {
+					if ( ( ConnectionGuard::applies() && false === $wpdb->query( 'SET TRANSACTION ISOLATION LEVEL REPEATABLE READ' ) ) || ! $this->guard->begin( true ) || false === $wpdb->query( 'START TRANSACTION' ) ) {
 						self::log_db_error( 'START TRANSACTION', (string) $wpdb->last_error );
 
 						throw new \RuntimeException( __( 'Replace import aborted: the database could not open a transaction; rolling back so no data is lost.', 'perflocale' ) );
@@ -729,6 +826,56 @@ final class DataImporter {
 
 					// finally: the connection's error reporting goes back as found, whatever leaves the loop.
 					try {
+						// The check above, repeated with a locking read: an intent begun since refuses here, and one
+						// begun later waits until this transaction ends.
+						if ( ( self::wipes_resync_intents( $wipe_plan ) && 0 !== ( new \PerfLocale\Database\Repository\ResyncRepository() )->open_intents_for_update() )
+							|| ( self::wipes_string_intents( $wipe_plan ) && 0 !== ( new \PerfLocale\Database\Repository\PendingChangeRepository() )->string_intents_for_update() )
+						) {
+							$intent_refused = self::resync_writing_refusal();
+
+							throw new \RuntimeException( $intent_refused );
+						}
+
+						// Rewriting the languages: every language row by id next (the global order, Inputs::lock_languages()), whatever
+						// order the file lists its sections in. After the intent fence: a string writer holds its intent, then a language row.
+						if ( array_key_exists( 'languages', $wipe_plan ) && ! \PerfLocale\Router\UrlBases\Inputs::lock_languages() ) {
+							self::log_db_error( 'locking the languages', (string) $wpdb->last_error );
+
+							// phpcs:disable WordPress.Security.EscapeOutput.ExceptionNotEscaped -- Plain text for WP-CLI and the import report; the admin notice escapes it when it prints it.
+							throw new \RuntimeException(
+								sprintf(
+									/* translators: %s: table name */
+									__( 'Replace import aborted: the existing rows of table "%s" could not be read; the whole import was rolled back, nothing was changed.', 'perflocale' ),
+									'languages'
+								)
+							);
+							// phpcs:enable WordPress.Security.EscapeOutput.ExceptionNotEscaped
+						}
+
+						// The slugs before the wipe, under the same locks: one the file does not bring back is released before COMMIT.
+						if ( array_key_exists( 'languages', $wipe_plan ) ) {
+							$slugs_before = \PerfLocale\Router\UrlBases\Inputs::slugs( true );
+
+							if ( null === $slugs_before ) {
+								// phpcs:disable WordPress.Security.EscapeOutput.ExceptionNotEscaped -- Plain text for WP-CLI and the import report; the admin notice escapes it when it prints it.
+								throw new \RuntimeException(
+									sprintf(
+										/* translators: %s: table name */
+										__( 'Replace import aborted: the existing rows of table "%s" could not be read; the whole import was rolled back, nothing was changed.', 'perflocale' ),
+										'languages'
+									)
+								);
+								// phpcs:enable WordPress.Security.EscapeOutput.ExceptionNotEscaped
+							}
+						}
+
+						// A scope's deferred-removal record names string ids the file's strings reuse: it goes with the strings
+						// (the next sync of the scope derives it again). Before the wipe: a removal worker locks its record
+						// first, then the rows, and this takes them in the same order.
+						if ( array_key_exists( 'strings', $wipe_plan ) && ! self::clear_scope_removal_records() ) {
+							throw new \RuntimeException( __( 'Replace import aborted: the records of deferred string removals could not be cleared; rolling back so no data is lost.', 'perflocale' ) );
+						}
+
 						foreach ( $wipe_plan as $table_name => $type_scope ) {
 							// From a class allow-list, sanitized to a bare identifier: prepare() cannot bind a table name.
 							$full_table = Schema::sanitize_table( Schema::table( $table_name ) );
@@ -768,6 +915,31 @@ final class DataImporter {
 								);
 							}
 						}
+
+						// The ReSync tables copy post content by post id and are not exported: they go with the post links.
+						$this->stop_unless_connection_kept();
+						$resync_error = array_key_exists( 'translation_links', $wipe_plan ) && self::wipes_resync_intents( $wipe_plan )
+							? ( new \PerfLocale\Database\Repository\ResyncRepository() )->wipe( $this->connection_guard()->condition() )
+							: '';
+
+						if ( '' !== $resync_error ) {
+							self::log_db_error( 'clearing resync tables', $resync_error );
+
+							throw new \RuntimeException(
+								sprintf(
+									/* translators: %s: table name */
+									__( 'Replace import aborted: table "%s" could not be cleared; rolling back so no data is lost.', 'perflocale' ),
+									'resync_state'
+								)
+							);
+						}
+
+						// Pending string changes name string and language ids the file's rows may reuse: closed (target_gone);
+						// the file's own pending changes are imported after this.
+						$this->stop_unless_connection_kept();
+						if ( self::closes_pending_strings( $wipe_plan ) && ! self::close_pending_strings( $this->connection_guard()->condition() ) ) {
+							throw new \RuntimeException( __( 'Replace import aborted: the pending string changes could not be closed; rolling back so no data is lost.', 'perflocale' ) );
+						}
 					} finally {
 						$wpdb->suppress_errors( $was_suppressing );
 					}
@@ -780,6 +952,11 @@ final class DataImporter {
 
 				foreach ( DataRegistry::import_tables() as $table_name ) {
 					if ( ! $reader->is_row_list( $table_name ) ) {
+						continue;
+					}
+
+					// Counted and named above.
+					if ( ! $replace && 'pending_changes' === $table_name ) {
 						continue;
 					}
 
@@ -799,6 +976,10 @@ final class DataImporter {
 					$exclude_type = ( is_string( $scope ) && str_starts_with( $scope, '!' ) ) ? substr( $scope, 1 ) : '';
 
 					$table_result = $this->import_table( $table_name, $reader->rows( $table_name, $max_row ), $replace, $sanitize_strings, $exclude_type );
+
+					if ( 'slug_translations' === $table_name ) {
+						$this->restore_term_slugs( $replace, $table_result );
+					}
 
 					$result['imported']  += $table_result['imported'];
 					$result['skipped']   += $table_result['skipped'];
@@ -843,6 +1024,22 @@ final class DataImporter {
 					}
 				}
 
+				// Languages the file does not bring back: their URL bases data and map entries go in this transaction, never to a
+				// language added later under the slug.
+				if ( $replace && null !== $slugs_before ) {
+					$this->release_removed_slugs( $slugs_before );
+				}
+
+				// A Replace that skipped a held pair's twin or refused a strings row leaves their rows naming no string.
+				if ( $replace && ( $this->work_table()->has( ImportWorkTable::TWIN ) || $this->work_table()->has( ImportWorkTable::REFUSED ) ) ) {
+					ImportStringTwins::settle(
+						$this->work_table(),
+						$this->connection_guard()->condition(),
+						/* translators: %s: table name */
+						sprintf( __( 'Replace import aborted: a row of table "%s" could not be saved because of a database error; the whole import was rolled back, nothing was changed.', 'perflocale' ), 'strings' )
+					);
+				}
+
 				// A Replace that touched languages must leave exactly one default (none loses unprefixed URLs and fallbacks, two
 				// pick one by read order); checked inside the transaction.
 				if ( $replace && ( $this->languages_cleared || $this->languages_changed ) ) {
@@ -873,6 +1070,8 @@ final class DataImporter {
 					if ( ! $this->connection_guard()->kept() ) {
 						throw new \RuntimeException( self::connection_lost_message() );
 					}
+
+					$committed = true;
 				}
 			} catch ( \Throwable $e ) {
 				if ( $replace ) {
@@ -886,14 +1085,73 @@ final class DataImporter {
 				}
 
 				// Tables back where they were and configuration never applied: the site is as it was.
+
+				// A refusal rolled back before its first DELETE: nothing was imported.
+				if ( '' !== $intent_refused ) {
+					$result['errors'][] = $intent_refused;
+					$result['refused']  = true;
+
+					return $result;
+				}
+
 				throw $e;
 			} finally {
 				if ( null !== $this->guard ) {
+					$guard = $this->guard;
 					$this->guard->end();
 					$this->guard = null;
+
+					// The release's held publication: after a confirmed COMMIT, else every cached form of what it wrote goes. The
+					// caches of what committed go before any listener of the held writes runs (one may throw).
+					if ( $this->release_held ) {
+						$this->release_held = false;
+						$released           = $this->released;
+						$then               = static function () use ( $committed, $released ): void {
+							if ( ! $committed ) {
+								return;
+							}
+
+							$cache = \PerfLocale\Plugin::get_instance()->has( 'cache' ) ? \PerfLocale\Plugin::get_instance()->get( 'cache' ) : null;
+
+							// Each step runs when another throws. The committed tables' caches too (the string files follow at the end).
+							\PerfLocale\Database\Tx::each(
+								static function () use ( $released ): void {
+									if ( 'stored' === ( $released['values'] ?? '' ) ) {
+										\PerfLocale\Router\UrlBases\Publication::reset_dry_run();
+									}
+								},
+								static function () use ( $released ): void {
+									if ( null !== ( $released['map'] ?? null ) ) {
+										\PerfLocale\Router\UrlBases\Publication::map_released();
+									}
+								},
+								static function () use ( $cache ): void {
+									if ( $cache instanceof \PerfLocale\Cache\CacheManager ) {
+										$cache->flush_languages();
+									}
+								},
+								static fn() => \PerfLocale\Background\MigrationCacheHelper::flush_post_migration_caches( false )
+							);
+						};
+
+						if ( [] !== \PerfLocale\Database\OptionWriter::settle( $committed, $guard, $then ) ) {
+							\PerfLocale\Router\UrlBases\Publication::reset_dry_run();
+						}
+					}
 				}
 
 				ImportLock::bind_session( '' );
+			}
+
+			// After COMMIT, as LanguageWrites::delete() after its release (its caches went at settle()).
+			if ( null !== $this->released ) {
+				if ( 'stored' === $this->released['values'] ) {
+					\PerfLocale\Router\UrlBases\Lifecycle::clear_none();
+				}
+
+				if ( null !== $this->released['map'] ) {
+					\PerfLocale\Router\UrlBases\Publication::slug_released( $this->released['map'][0], $this->released['map'][1] );
+				}
 			}
 
 			ImportLock::heartbeat();
@@ -913,10 +1171,21 @@ final class DataImporter {
 				$this->drop_stale_source_map();
 			}
 
+			// The cleared strings table holds only rows this import hashed, so its counts start over.
+			if ( array_key_exists( 'strings', $wipe_plan ) ) {
+				\PerfLocale\Strings\StrIdentMigration::replaced();
+			}
+
 			// Merge strands groups (no natural key; their links skip on object_lang): swept once, after every table, so no
 			// group is swept before its links land.
 			if ( ! $replace ) {
 				$this->sweep_orphan_groups();
+			}
+
+			// A restored automation history, or pending string changes the Replace closed, change the pending count.
+			if ( array_key_exists( 'pending_changes', $wipe_plan ) || self::closes_pending_strings( $wipe_plan ) ) {
+				\PerfLocale\Automation\ChangeService::mark_badge_dirty();
+				\PerfLocale\Automation\ChangeService::end_batch();
 			}
 		}
 
@@ -983,8 +1252,11 @@ final class DataImporter {
 			\PerfLocale\Translation\ContentSync::suspend_meta_write_sync();
 		}
 
+		// Matched to this site or a confirmed copy: only then is this site's own redirect history replaced.
+		$same_site = true === $identity || $allow_foreign_ids;
+
 		try {
-			$items = ExportItems::import( $reader, $lists + $addon['members'], $replace, $max_row, self::batch_size( 'options' ) );
+			$items = ExportItems::import( $reader, $lists + $addon['members'], $replace, $max_row, self::batch_size( 'options' ), $same_site );
 		} finally {
 			if ( ! $mirror ) {
 				\PerfLocale\Translation\ContentSync::resume_meta_write_sync();
@@ -993,6 +1265,10 @@ final class DataImporter {
 
 		$result['imported'] += $items['imported'];
 		$result['skipped']  += $items['skipped'];
+
+		foreach ( $items['errors'] as $error ) {
+			$result['errors'][] = $error;
+		}
 
 		foreach ( $items['reasons'] as $reason => $count ) {
 			$this->note_skip( (string) $reason, (int) $count );
@@ -1147,6 +1423,30 @@ final class DataImporter {
 			}
 		}
 
+		foreach ( self::urlbases_after_import() as $note ) {
+			$result['notes'][] = $note;
+		}
+
+		// Added codes are never refused mid-import: the report names the root posts their prefix now takes.
+		if ( [] !== $this->added_codes && \PerfLocale\Plugin::get_instance()->has( 'settings' ) ) {
+			require_once dirname( __DIR__ ) . '/Translation/LanguageCodeSlugs.php';
+			$settings = \PerfLocale\Plugin::get_instance()->settings();
+			$names    = [];
+
+			foreach ( $this->added_codes as $code => [ $locale, $name ] ) {
+				foreach ( \PerfLocale\Translation\LanguageCodeSlugs::paths( (string) $code, $locale, $settings ) as $path ) {
+					$names[ $path ] = $name;
+				}
+			}
+
+			$clashes = \PerfLocale\Translation\LanguageCodeSlugs::clash_notes( $names, $settings );
+
+			if ( [] !== $clashes ) {
+				$result['slug_clashes'] = $clashes;
+				$result['notes']        = array_merge( $result['notes'] ?? [], $clashes );
+			}
+		}
+
 		/**
 		 * Fires after DataImporter::import() restored rows and flushed caches, for both the inline and the background path
 		 * (add-on caches, audit logs, notifications).
@@ -1172,12 +1472,48 @@ final class DataImporter {
 	}
 
 	/**
+	 * Compile the URL bases the import may have changed (values, languages, pages); notes name what is not in use.
+	 *
+	 * @return list<string>
+	 */
+	private static function urlbases_after_import(): array {
+		\PerfLocale\Router\UrlBases\Lifecycle::validate_none();
+
+		if ( false === get_option( \PerfLocale\Router\UrlBases\Values::OPTION, false ) && false === get_option( \PerfLocale\Router\UrlBases\Publication::MAP, false ) && ! has_filter( \PerfLocale\Router\UrlBases\CodeValues::HOOK ) ) {
+			return [];
+		}
+
+		try {
+			$compiled = \PerfLocale\Router\UrlBases\Lifecycle::compile_now( 'import' );
+		} catch ( \Throwable $e ) {
+			// The import itself succeeded: the next admin page load compiles again.
+			\PerfLocale\Router\UrlBases\Publication::mark_dirty( 'import' );
+
+			return [ __( 'URL bases: the update after the import failed; it is retried on the next admin page load.', 'perflocale' ) ];
+		}
+
+		$issues = [] !== $compiled['report'] ? \PerfLocale\Admin\UrlBases\Health::issues( $compiled['report'] ) : [];
+		$notes  = [];
+
+		foreach ( array_slice( $issues, 0, 10 ) as $line ) {
+			/* translators: %s: why a URL base is not in use */
+			$notes[] = sprintf( __( 'URL bases: %s', 'perflocale' ), $line );
+		}
+
+		if ( count( $issues ) > 10 ) {
+			$notes[] = __( 'URL bases: more values are not in use; see PerfLocale > Settings > URL & Routing > URL Bases.', 'perflocale' );
+		}
+
+		return $notes;
+	}
+
+	/**
 	 * Mark the rewrite rules, whose pattern lists the language codes, for a rebuild.
 	 *
 	 * @return void
 	 */
 	private static function mark_rewrite_flush(): void {
-		update_option( 'perflocale_flush_rules', 1, false );
+		update_option( 'perflocale_flush_rules', 1, true );
 		delete_transient( 'perflocale_rewrites_verified' );
 	}
 
@@ -1339,12 +1675,42 @@ final class DataImporter {
 	}
 
 	/**
+	 * The file's applicable settings whose value does not have the setting's shape (SettingsWriter::fits_shape()).
+	 *
+	 * @param array<array-key, mixed> $data Envelope.
+	 * @return array<int, string>
+	 */
+	private static function misshapen_settings( array $data ): array {
+		if ( ! isset( $data['settings'] ) || ! is_array( $data['settings'] ) ) {
+			return [];
+		}
+
+		// The keys apply_configuration() stores: known, not secret, not kept as this site has them, not overridden.
+		$settings = \PerfLocale\Plugin::get_instance()->get( 'settings' );
+		$defaults = method_exists( $settings, 'get_defaults' ) ? Typed::map( $settings->get_defaults() ) : [];
+		$applied  = array_diff_key( self::applicable_settings( $data['settings'], array_keys( $defaults ) ), array_flip( self::kept_setting_keys() ) );
+		$keys     = [];
+
+		foreach ( $applied as $key => $value ) {
+			if ( $settings instanceof \PerfLocale\Settings && $settings->is_overridden( (string) $key ) ) {
+				continue;
+			}
+
+			if ( ! \PerfLocale\Util\SettingsWriter::fits_shape( (string) $key, $value, $defaults[ (string) $key ] ?? null ) ) {
+				$keys[] = (string) $key;
+			}
+		}
+
+		return $keys;
+	}
+
+	/**
 	 * The settings a Replace import leaves as this site has them.
 	 *
 	 * @return array<int, string>
 	 */
 	public static function kept_setting_keys(): array {
-		$defaults = [ 'language_domains', 'mt_libre_url', 'mt_agency_url', 'mt_agency_batch', 'delete_data_on_uninstall', 'background_paused' ];
+		$defaults = [ 'language_domains', 'mt_libre_url', 'mt_agency_url', 'mt_agency_batch', 'mt_agency_max_chars', 'delete_data_on_uninstall', 'background_paused' ];
 
 		/**
 		 * Filters the settings a Replace import keeps as this site has them: those describing the site, not its data
@@ -1357,7 +1723,8 @@ final class DataImporter {
 		 *
 		 * @param array<int, string> $keys Setting keys. Default: language_domains,
 		 *                                 mt_libre_url, mt_agency_url, mt_agency_batch,
-		 *                                 delete_data_on_uninstall, background_paused.
+		 *                                 mt_agency_max_chars, delete_data_on_uninstall,
+		 *                                 background_paused.
 		 * @return array<int, string>
 		 */
 		$keys = apply_filters( 'perflocale/import/keep_target_settings', $defaults );
@@ -1412,6 +1779,7 @@ final class DataImporter {
 			'mt_libre_url'             => __( 'LibreTranslate URL', 'perflocale' ),
 			'mt_agency_url'            => __( 'Agency Endpoint URL', 'perflocale' ),
 			'mt_agency_batch'          => __( 'My endpoint accepts batches', 'perflocale' ),
+			'mt_agency_max_chars'      => __( 'Maximum characters per request', 'perflocale' ),
 			'delete_data_on_uninstall' => __( 'Delete all plugin data when uninstalling', 'perflocale' ),
 			'background_paused'        => __( 'Pause queue', 'perflocale' ),
 		];
@@ -1735,6 +2103,153 @@ final class DataImporter {
 	}
 
 	/**
+	 * Delete every string scope's deferred-removal record (PENDING_REMOVALS_PREFIX options) in the Replace transaction.
+	 * The names are read first so their options caches are dropped too.
+	 *
+	 * @return bool False when a statement failed (logged).
+	 */
+	private static function clear_scope_removal_records(): bool {
+		$wpdb = $GLOBALS['wpdb'] ?? null;
+
+		if ( ! $wpdb instanceof \wpdb ) {
+			return false;
+		}
+
+		$like = $wpdb->esc_like( \PerfLocale\Database\Repository\StringRepository::PENDING_REMOVALS_PREFIX ) . '%';
+		$sql  = $wpdb->prepare( 'SELECT option_name FROM %i WHERE option_name LIKE %s', $wpdb->options, $like );
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared -- Prepared above.
+		$read  = is_string( $sql ) && '' !== $sql ? $wpdb->query( $sql ) : false;
+		$names = is_int( $read ) ? array_map( static fn( $name ): string => is_scalar( $name ) ? (string) $name : '', $wpdb->get_col() ) : null; // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The result of the checked read above; no query runs here.
+
+		if ( null === $names ) {
+			self::log_db_error( 'reading the string scope records', $wpdb->last_error );
+
+			return false;
+		}
+
+		if ( [] === $names ) {
+			return true;
+		}
+
+		$sql = $wpdb->prepare( 'DELETE FROM %i WHERE option_name LIKE %s', $wpdb->options, $like );
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared -- Prepared above; the options caches are dropped below.
+		$deleted = is_string( $sql ) && '' !== $sql ? $wpdb->query( $sql ) : false;
+
+		foreach ( $names as $name ) {
+			wp_cache_delete( $name, 'options' );
+		}
+
+		\PerfLocale\Database\NotOptions::unlist( $names );
+
+		if ( false === $deleted ) {
+			self::log_db_error( 'clearing the string scope records', $wpdb->last_error );
+
+			return false;
+		}
+
+		return true;
+	}
+
+	/**
+	 * Close the site's pending string changes (target_gone) in the Replace transaction.
+	 *
+	 * @param string $guard The transaction's connection-guard condition.
+	 * @return bool False when the statement failed (logged).
+	 */
+	private static function close_pending_strings( string $guard ): bool {
+		if ( null !== ( new \PerfLocale\Database\Repository\PendingChangeRepository() )->close_pending_of_type( 'string', 'target_gone', $guard ) ) {
+			return true;
+		}
+
+		$wpdb = $GLOBALS['wpdb'] ?? null;
+		self::log_db_error( 'closing pending string changes', $wpdb instanceof \wpdb ? $wpdb->last_error : '' );
+
+		return false;
+	}
+
+	/**
+	 * Whether this wipe plan closes the pending string changes: it clears the strings or languages their ids name.
+	 *
+	 * @param array<string, string|null> $wipe_plan See tables_to_wipe().
+	 * @return bool
+	 */
+	private static function closes_pending_strings( array $wipe_plan ): bool {
+		return ( array_key_exists( 'strings', $wipe_plan ) || array_key_exists( 'languages', $wipe_plan ) ) && \PerfLocale\Automation\ChangeService::available();
+	}
+
+	/**
+	 * Why a Replace with this wipe plan must wait for Content ReSync, or ''.
+	 * Stale intents (crashed writes) are reconciled first; any intent still open refuses (a write in progress, or one
+	 * not repairable yet). The transaction repeats the check before its first DELETE.
+	 *
+	 * @param array<string, string|null> $wipe_plan See tables_to_wipe().
+	 * @return string The refusal, '' to go on.
+	 */
+	private static function open_resync_intents( array $wipe_plan ): string {
+		// A string Apply or Undo in flight: its put-back would land over the imported value.
+		if ( self::wipes_string_intents( $wipe_plan ) ) {
+			\PerfLocale\Automation\ChangeService::settle_string_intents( self::RESYNC_REPAIR_BATCH );
+
+			if ( 0 !== ( new \PerfLocale\Database\Repository\PendingChangeRepository() )->string_intents_for_update() ) {
+				return self::resync_writing_refusal();
+			}
+		}
+
+		if ( ! self::wipes_resync_intents( $wipe_plan ) ) {
+			return '';
+		}
+
+		// A driver ReSync does not run on cannot repair an interrupted write: an intent left from another driver refuses.
+		if ( ! \PerfLocale\Resync\Store::available() ) {
+			return 0 === ( new \PerfLocale\Database\Repository\ResyncRepository() )->open_intents_for_update() ? '' : \PerfLocale\Resync\Store::unavailable_text();
+		}
+
+		\PerfLocale\Resync\SyncRecorder::reconcile_stale( static fn (): bool => true, self::RESYNC_REPAIR_BATCH );
+
+		$open = \PerfLocale\Resync\SyncRecorder::open_intents();
+
+		if ( null !== $open && 0 === $open['fresh'] && 0 === $open['stale'] ) {
+			return '';
+		}
+
+		if ( null !== $open && 0 === $open['fresh'] ) {
+			return __( 'Import refused. Content ReSync could not repair an interrupted update of a translation yet, and a Replace import would delete the record it needs for that. Run the import again in a few minutes.', 'perflocale' );
+		}
+
+		return self::resync_writing_refusal();
+	}
+
+	/**
+	 * The refusal of a Replace while a Content ReSync write is in progress.
+	 *
+	 * @return string
+	 */
+	private static function resync_writing_refusal(): string {
+		return __( 'Import refused. Content ReSync is writing an update to a translation right now, and a Replace import would delete the record that keeps that write safe. Run the import again in a few minutes.', 'perflocale' );
+	}
+
+	/**
+	 * Whether this wipe plan replaces what a string Apply or Undo writes or records: the strings, their values, links
+	 * or the pending changes.
+	 *
+	 * @param array<string, string|null> $wipe_plan See tables_to_wipe().
+	 * @return bool
+	 */
+	private static function wipes_string_intents( array $wipe_plan ): bool {
+		return [] !== array_intersect_key( $wipe_plan, array_flip( [ 'strings', 'string_translations', 'translation_links', 'pending_changes' ] ) ) && \PerfLocale\Automation\ChangeService::available();
+	}
+
+	/**
+	 * Whether this wipe plan deletes ReSync intents: it clears `translation_links` or `pending_changes`.
+	 *
+	 * @param array<string, string|null> $wipe_plan See tables_to_wipe().
+	 * @return bool
+	 */
+	private static function wipes_resync_intents( array $wipe_plan ): bool {
+		return ( array_key_exists( 'translation_links', $wipe_plan ) || array_key_exists( 'pending_changes', $wipe_plan ) ) && \PerfLocale\Resync\Store::has_tables();
+	}
+
+	/**
 	 * Does the envelope carry `strings` rows? Gates the Replace half of the string reap and repair; Merge runs both
 	 * always (its orphan sweep can strand links in any merge).
 	 *
@@ -1762,15 +2277,16 @@ final class DataImporter {
 	}
 
 	/**
-	 * Does the envelope carry rows keyed by a post, term or string id: translation_links (string links too: their
-	 * object_id is the source's strings.id), slug_translations, content_hashes, meta lists, add-on parts read? Strings
-	 * match on original_hash and are portable. Pure: network-import reuses one instance across blogs.
+	 * Whether the envelope carries rows keyed by a post, term or string id (translation_links, slug_translations,
+	 * content_hashes, meta lists, add-on parts; in Replace mode pending_changes). Strings match on original_hash and are
+	 * portable. Pure: network-import reuses one instance.
 	 *
 	 * @param array<array-key, mixed> $data    Decoded envelope.
 	 * @param array<int, string>      $members The add-on part row lists the import reads.
+	 * @param bool                    $replace Replace mode (Merge skips the automation history).
 	 * @return bool
 	 */
-	private static function carries_object_ids( array $data, array $members = [] ): bool {
+	private static function carries_object_ids( array $data, array $members = [], bool $replace = true ): bool {
 		$sections = Typed::strs( $data['sections'] ?? [] );
 
 		foreach ( $members as $member ) {
@@ -1780,7 +2296,7 @@ final class DataImporter {
 		}
 
 		foreach ( DataRegistry::object_id_tables() as $table ) {
-			if ( self::has_rows( $data, $table ) ) {
+			if ( ( $replace || 'pending_changes' !== $table ) && self::has_rows( $data, $table ) ) {
 				return true;
 			}
 		}
@@ -1801,12 +2317,13 @@ final class DataImporter {
 	 * Does the envelope carry rows naming a language by numeric id (the tables whose language_id fk_refs() points at
 	 * languages)? Those ids are remapped only while the file's own languages section is imported, in Merge.
 	 *
-	 * @param array<array-key, mixed> $data Decoded envelope.
+	 * @param array<array-key, mixed> $data    Decoded envelope.
+	 * @param bool                    $replace Replace mode (Merge skips the automation history).
 	 * @return bool
 	 */
-	private static function carries_language_refs( array $data ): bool {
+	private static function carries_language_refs( array $data, bool $replace = true ): bool {
 		foreach ( DataRegistry::language_ref_tables() as $table ) {
-			if ( self::has_rows( $data, $table ) ) {
+			if ( ( $replace || 'pending_changes' !== $table ) && self::has_rows( $data, $table ) ) {
 				return true;
 			}
 		}
@@ -1862,8 +2379,10 @@ final class DataImporter {
 
 		$port = isset( $parts['port'] ) ? (int) $parts['port'] : 0;
 
-		// An explicit default port and an implicit one are the same address.
-		if ( 80 === $port || 443 === $port ) {
+		// Only the scheme's own default port is implicit: http://host:443 is another address than http://host.
+		$scheme = strtolower( (string) ( $parts['scheme'] ?? '' ) );
+
+		if ( ( 'http' === $scheme && 80 === $port ) || ( 'https' === $scheme && 443 === $port ) ) {
 			$port = 0;
 		}
 
@@ -1909,12 +2428,12 @@ final class DataImporter {
 		if ( isset( $data['format_version'] ) ) {
 			$incoming = (int) $data['format_version'];
 
-			if ( $incoming > DataExporter::FORMAT_VERSION ) {
+			if ( $incoming > DataExporter::READ_VERSION ) {
 				$errors[] = sprintf(
 					/* translators: 1: incoming format version, 2: current format version */
 					__( 'This export uses format version %1$d, but this build only understands up to %2$d. Update PerfLocale before importing.', 'perflocale' ),
 					$incoming,
-					DataExporter::FORMAT_VERSION
+					DataExporter::READ_VERSION
 				);
 			}
 		}
@@ -2080,13 +2599,18 @@ final class DataImporter {
 	 * Row lists whose rows can carry a fingerprint: list => [ column naming the kind, or '' ; fixed kind, or '' ].
 	 *
 	 * @param array<string, mixed> $members The add-on part row lists the import reads (addon_plan()).
+	 * @param bool                 $replace Replace mode (Merge skips the automation history, so it is not watched).
 	 * @return array<string, array{0: string, 1: string}>
 	 */
-	private static function fingerprint_sources( array $members ): array {
+	private static function fingerprint_sources( array $members, bool $replace = true ): array {
 		$sources = [];
 
 		foreach ( DataExporter::fingerprint_columns() as $table => $column ) {
 			$sources[ $table ] = [ $column, '' ];
+		}
+
+		if ( ! $replace ) {
+			unset( $sources['pending_changes'] );
 		}
 
 		$kinds = [
@@ -2379,10 +2903,11 @@ final class DataImporter {
 		global $wpdb;
 		$formats = [];
 
+		// DESCRIBE, not SHOW COLUMNS: the SQLite 2.2.x legacy translator answers SHOW COLUMNS of a quoted name with no rows.
 		// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $full_table is Schema::table(); schema introspection only.
 		foreach ( (array) $wpdb->get_results(
 			$wpdb->prepare(
-				'SHOW COLUMNS FROM %i',
+				'DESCRIBE %i',
 				$full_table
 			)
 		) as $c ) {
@@ -2529,42 +3054,7 @@ final class DataImporter {
 		}
 
 		// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic, only when WP_DEBUG_LOG is on.
-		error_log( 'PerfLocale DataImporter: database error while ' . $where . ' - code ' . self::db_error_code( $error ) );
-	}
-
-	/**
-	 * A fixed code for a database error, matched on the driver's own message only (MySQL's text, or the error_message
-	 * block of the SQLite integration's HTML): the rest quotes queries and values, so a value cannot pick the code.
-	 *
-	 * @param string $error The database error.
-	 * @return string
-	 */
-	private static function db_error_code( string $error ): string {
-		if ( 1 === preg_match( '~class="error_message"[^>]*>\s*(.*?)\s*</div>~s', $error, $m ) ) {
-			$error = (string) preg_replace( '~^Error occurred at line \d+ in Function .*?\. Error message was: ~s', '', $m[1] );
-		}
-
-		$error = (string) preg_replace( '~^SQLSTATE\[\w+\]: [^:]*: (?:\d+ )?~', '', ltrim( $error ) );
-		$codes = [
-			'duplicate_key'  => '~^(?:Duplicate entry|UNIQUE constraint failed)~',
-			'too_long'       => '~^Data too long~',
-			'bad_value'      => '~^(?:Incorrect \w+ value|Out of range value|Truncated incorrect)~',
-			'not_null'       => '~^(?:Column \'[^\']*\' cannot be null|Field \'[^\']*\' doesn\'t have a default|NOT NULL constraint failed)~',
-			'missing_table'  => '~^(?:Table \'[^\']*\' doesn\'t exist|no such table)~',
-			'missing_column' => '~^(?:Unknown column|no such column|table \S+ has no column named)~',
-			'deadlock'       => '~^Deadlock found~',
-			'lock_timeout'   => '~^(?:Lock wait timeout|database is locked)~',
-			'connection'     => '~^(?:MySQL server has gone away|Lost connection)~',
-			'syntax'         => '~^(?:You have an error in your SQL syntax|near "[^"]*": syntax error)~',
-		];
-
-		foreach ( $codes as $code => $pattern ) {
-			if ( 1 === preg_match( $pattern, $error ) ) {
-				return $code;
-			}
-		}
-
-		return 'other';
+		error_log( 'PerfLocale DataImporter: database error while ' . $where . ' - code ' . \PerfLocale\Util\DbErrorCode::of( $error ) );
 	}
 
 	/**
@@ -2847,6 +3337,7 @@ final class DataImporter {
 		$linked_posts = [];
 		$piece_map    = [];
 		$piece_moved  = [];
+		$piece_twins  = [];
 
 		foreach ( $piece as $row ) {
 			if ( ! is_array( $row ) ) {
@@ -2918,10 +3409,34 @@ final class DataImporter {
 
 			// After the FK rewrite and column filter, before the duplicate lookup. Stored even when empty (an empty value reads
 			// as untranslated; skipping would leave a link without a value), except a language code (below).
+			// An imported automation change never carries a replaced value or a result to undo against.
+			if ( 'pending_changes' === $table_name ) {
+				self::prepare_pending_change_row( $row );
+			}
+
+			// A tuple every write path refuses (it would share another string's identity) is left out.
+			if ( 'strings' === $table_name && \PerfLocale\Database\Repository\StringRepository::refused( Typed::str( $row['domain'] ?? '' ), Typed::str( $row['context'] ?? '' ), Typed::str( $row['original'] ?? '' ) ) ) {
+				++$result['skipped'];
+				$this->note_skip( 'string_separator' );
+
+				// Replace: its translations, links, pending rows and group are removed after the tables (Merge leaves them out).
+				if ( $replace && $old_id > 0 ) {
+					$piece_twins[ ImportWorkTable::REFUSED ][ $old_id ] = Typed::int( $row['group_id'] ?? null );
+				}
+
+				continue;
+			}
+
+			// The identity hash comes from the row, never from the file (an older export carries the old format).
+			if ( 'strings' === $table_name && is_string( $row['domain'] ?? null ) && is_string( $row['context'] ?? null ) && is_string( $row['original'] ?? null ) ) {
+				$row['original_hash'] = \PerfLocale\Database\Repository\StringRepository::compute_hash( $row['domain'], $row['context'], $row['original'] );
+			}
+
 			$row_sanitized = $sanitize_strings && match ( $table_name ) {
 				'string_translations' => self::sanitize_string_translation_row( $row ),
 				'languages'           => self::sanitize_language_row( $row ),
 				'slug_translations'   => self::sanitize_slug_translation_row( $row ),
+				'pending_changes'     => self::sanitize_pending_change_row( $row ),
 				default               => false,
 			};
 
@@ -2982,6 +3497,22 @@ final class DataImporter {
 			$prepared = $this->check_merge_links( $prepared, $result );
 		}
 
+		// Term URL slug rows: restored once, after the table's other rows, as one namespace state (section 4).
+		if ( 'slug_translations' === $table_name ) {
+			foreach ( $prepared as $i => $entry ) {
+				// Routed on the stored form whatever the trust: MySQL readers match the type in any case.
+				$type = is_string( $entry['row']['object_type'] ?? null ) ? sanitize_key( $entry['row']['object_type'] ) : null;
+
+				if ( in_array( $type, SlugTranslationWrites::TERM_TYPES, true ) ) {
+					$entry['row']['object_type'] = $type;
+					$this->term_slug_rows[]      = [ $entry['row'], $entry['sanitized'] ];
+					unset( $prepared[ $i ] );
+				}
+			}
+
+			$prepared = array_values( $prepared );
+		}
+
 		// Replace: the keys this piece would take that the table holds (import_table()).
 		$piece_keys = ( $replace && null === $whole_keys ) ? $this->taken_in_piece( $table_name, $full_table, array_column( $prepared, 'row' ), $col_formats ) : [];
 
@@ -3014,6 +3545,18 @@ final class DataImporter {
 						unset( $row['id'] );
 						$new_id = true;
 					} else {
+						// A held pair's twin (its hash taken by a row of this file): its rows join that row after the tables.
+						$kept = 'strings' === $table_name && $old_id > 0 ? ImportStringTwins::holder( $full_table, Typed::str( $row['original_hash'] ?? '' ) ) : 0;
+
+						if ( $kept > 0 && $kept !== $old_id ) {
+							$piece_twins[ ImportWorkTable::TWIN ][ $old_id ]       = $kept;
+							$piece_twins[ ImportWorkTable::TWIN_GROUP ][ $old_id ] = Typed::int( $row['group_id'] ?? null );
+
+							if ( ( $entry['file']['original_hash'] ?? null ) === $row['original_hash'] ) {
+								$piece_twins[ ImportWorkTable::TWIN_SERVED ][ $old_id ] = $kept;
+							}
+						}
+
 						++$result['skipped'];
 						continue;
 					}
@@ -3093,6 +3636,10 @@ final class DataImporter {
 				// Marked at once: a Merge stopping after this row still flushes the rewrite rules.
 				if ( 'languages' === $table_name ) {
 					$this->languages_changed = true;
+
+					if ( ! empty( $row['is_active'] ) && is_string( $row['slug'] ?? null ) ) {
+						$this->added_codes[ $row['slug'] ] = [ is_string( $row['locale'] ?? null ) ? $row['locale'] : '', is_string( $row['name'] ?? null ) && '' !== $row['name'] ? $row['name'] : $row['slug'] ];
+					}
 				}
 
 				if ( $row_sanitized ) {
@@ -3147,10 +3694,109 @@ final class DataImporter {
 		$work->put( ImportWorkTable::MOVED_GROUP, $piece_moved );
 		$work->put( ImportWorkTable::LINKED_POST, $linked_posts );
 
+		foreach ( $piece_twins as $kind => $map ) {
+			$work->put( $kind, $map );
+		}
+
 		// Free memory per piece with wp_cache_flush_runtime(), not wp_cache_flush(), which would empty a persistent backend
 		// for the whole site each piece (core 6.1+).
 		\PerfLocale\Cache\CacheManager::flush_runtime();
 		// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter
+	}
+
+	/**
+	 * Restore the held-back term URL slug rows: inside the Replace transaction through its guard, or (Merge) one
+	 * transaction per namespace under the import lock. Counts go into the table result before its abort gates.
+	 *
+	 * @param bool                                                                                                      $replace Replace mode.
+	 * @param array{imported: int, skipped: int, failed: int, dropped: int, errors: array<int, string>, sanitized: int} $result  Table result (updated).
+	 * @return void
+	 * @throws \RuntimeException When a row cannot be written (Replace: the caller rolls back).
+	 */
+	private function restore_term_slugs( bool $replace, array &$result ): void {
+		$rows                 = $this->term_slug_rows;
+		$this->term_slug_rows = [];
+
+		if ( [] === $rows ) {
+			return;
+		}
+
+		if ( $replace ) {
+			$this->stop_unless_connection_kept();
+		}
+
+		try {
+			$done = SlugTranslationWrites::restore_term_slugs( array_column( $rows, 0 ), $replace ? Txn::CALLER : Txn::OWN, $replace ? $this->guard : null );
+		} catch ( \RuntimeException $e ) {
+			// The import lock lost or the Merge's connection gone (ImportLock::heartbeat()): its own message.
+			if ( in_array( $e->getMessage(), [ esc_html( ImportLock::busy_message() ), esc_html( self::merge_lost_message() ) ], true ) ) {
+				throw $e;
+			}
+
+			if ( $replace && null !== $this->guard && ! $this->guard->holds() ) {
+				throw new \RuntimeException( self::connection_lost_message(), 0, $e ); // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- Plain text for WP-CLI and the import report; the admin notice escapes it when it prints it.
+			}
+
+			self::log_db_error( 'restoring term URL slugs', $e->getMessage() );
+
+			throw new \RuntimeException(
+				$replace
+					? esc_html__( 'Replace import aborted: the URL slugs of terms could not be saved because of a database error; the whole import was rolled back, nothing was changed.', 'perflocale' )
+					: esc_html__( 'Import stopped: the URL slugs of terms could not be saved because of a database error. Rows imported before them are kept; import the file again.', 'perflocale' ),
+				0,
+				$e // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- The previous exception, never printed.
+			);
+		}
+
+		$result['imported'] += $done['imported'];
+		$result['skipped']  += $done['skipped'] + $done['dropped'];
+		$result['dropped']  += $done['dropped'];
+
+		if ( $done['dropped'] > 0 ) {
+			$this->note_skip( 'url_slug_taken', $done['dropped'] );
+		}
+
+		foreach ( $rows as [ $row, $sanitized ] ) {
+			if ( $sanitized && in_array( Typed::int( $row['language_id'] ?? 0 ) . '|' . Typed::int( $row['object_id'] ?? 0 ), $done['written'], true ) ) {
+				++$result['sanitized'];
+			}
+		}
+	}
+
+	/**
+	 * Replace: release the URL bases data and map entries of slugs that were language rows under the lock before the wipe
+	 * and are none after the file's rows (an explicit list: deleting needs positive proof), inside the transaction.
+	 *
+	 * @param array<int, string> $before Slugs read under the language locks before the wipe.
+	 * @return void
+	 * @throws \RuntimeException When the rows cannot be read again or the release fails: the import rolls back.
+	 */
+	private function release_removed_slugs( array $before ): void {
+		$this->stop_unless_connection_kept();
+
+		try {
+			$after = \PerfLocale\Router\UrlBases\Inputs::slugs( true );
+
+			if ( null === $after ) {
+				throw new \RuntimeException( 'release: the language rows could not be read' );
+			}
+
+			$gone = array_values( array_diff( $before, $after ) );
+
+			if ( [] === $gone ) {
+				return;
+			}
+
+			// Its writes publish caches and actions only after COMMIT.
+			if ( ! \PerfLocale\Database\OptionWriter::hold( $this->connection_guard() ) ) {
+				throw new \RuntimeException( 'release: option writes are held by another transaction' );
+			}
+
+			$this->release_held = true;
+			$this->released     = \PerfLocale\Database\Repository\LanguageWrites::release_slugs( $gone, $this->connection_guard() );
+		} catch ( \Throwable $e ) {
+			throw new \RuntimeException( __( 'Replace import aborted: the translated URL bases of the removed languages could not be released; rolling back so no data is lost.', 'perflocale' ), 0, $e ); // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- Plain text for WP-CLI and the import report; the admin notice escapes it when it prints it.
+		}
 	}
 
 	/**
@@ -3303,6 +3949,178 @@ final class DataImporter {
 	}
 
 	/**
+	 * Prepare one imported automation change in place, whatever the sanitising flag.
+	 * `previous` is dropped so no file can make an undo write a value of its choosing; a decided change also loses its
+	 * proposal and result hash (a restored history is read-only). Pending changes keep the proposal; approve re-checks.
+	 *
+	 * @param array<string, mixed> $row Row, after the unknown-column filter.
+	 * @return void
+	 */
+	private static function prepare_pending_change_row( array &$row ): void {
+		if ( array_key_exists( 'previous', $row ) ) {
+			$row['previous'] = null;
+		}
+
+		if ( 'string' === ( $row['object_type'] ?? '' ) && in_array( $row['result_status'] ?? '', \PerfLocale\Database\Repository\PendingChangeRepository::INTENTS, true ) ) {
+			$row['result_status'] = '';
+		}
+
+		$status = is_string( $row['status'] ?? null ) ? $row['status'] : '';
+
+		if ( ! in_array( $status, \PerfLocale\Database\Repository\PendingChangeRepository::STATUSES, true ) ) {
+			$row['status'] = \PerfLocale\Database\Repository\PendingChangeRepository::STATUS_SUPERSEDED;
+			$status        = $row['status'];
+		}
+
+		// The column is latin1: a job id is a UUID or ''.
+		if ( array_key_exists( 'job_id', $row ) && ( ! is_string( $row['job_id'] ) || 1 !== preg_match( '/^(?:[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})?$/', $row['job_id'] ) ) ) {
+			$row['job_id'] = '';
+		}
+
+		if ( \PerfLocale\Database\Repository\PendingChangeRepository::STATUS_PENDING !== $status ) {
+			$row['payload']     = '';
+			$row['result_hash'] = '';
+
+			// Retention prunes by decided_at, so a decided row always has one: its created time, else now.
+			$datetime = '/^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$/';
+
+			if ( ! is_string( $row['decided_at'] ?? null ) || 1 !== preg_match( $datetime, $row['decided_at'] ) ) {
+				$row['decided_at'] = is_string( $row['created_at'] ?? null ) && 1 === preg_match( $datetime, $row['created_at'] ) ? $row['created_at'] : gmdate( 'Y-m-d H:i:s' );
+			}
+
+			return;
+		}
+
+		// Pending reads filter on `decided_at IS NULL`: a file's time would hide the row from them.
+		if ( array_key_exists( 'decided_at', $row ) ) {
+			$row['decided_at'] = null;
+		}
+
+		// Base ids do not travel between sites: base 0 makes the next resync bootstrap. An imported parts list is not
+		// the job's own, so `parts_complete` goes and the proposal counts as source text for a viewer who cannot read it.
+		if ( 'post' === ( $row['object_type'] ?? '' ) && is_string( $row['payload'] ?? null ) && '' !== $row['payload'] ) {
+			$payload = json_decode( $row['payload'], true );
+
+			if ( is_array( $payload ) ) {
+				unset( $payload['parts_complete'] );
+
+				$payload['base_id'] = 0;
+				$encoded            = wp_json_encode( $payload );
+				$row['payload']     = is_string( $encoded ) ? $encoded : '';
+			}
+
+			$summary = is_string( $row['summary'] ?? null ) ? json_decode( $row['summary'], true ) : null;
+
+			if ( is_array( $summary ) && array_key_exists( 'base_id', $summary ) ) {
+				$summary['base_id'] = 0;
+				$encoded            = wp_json_encode( $summary );
+				$row['summary']     = is_string( $encoded ) ? $encoded : '';
+			}
+		}
+	}
+
+	/**
+	 * Sanitize one imported pending post proposal in place for an importer without `unfiltered_html`.
+	 * Sensitive and `_perflocale_*` meta and `parts` are dropped; an absent field is never defaulted to ''.
+	 *
+	 * @param array<string, mixed> $row     Row, after prepare_pending_change_row().
+	 * @param array<mixed>         $payload Its decoded payload.
+	 * @return bool True when the row was changed.
+	 */
+	private static function sanitize_pending_post_row( array &$row, array $payload ): bool {
+		$clean = $payload;
+
+		if ( is_string( $clean['post_title'] ?? null ) ) {
+			$clean['post_title'] = wp_kses( $clean['post_title'], 'data' );
+		}
+
+		foreach ( [ 'post_content', 'post_excerpt' ] as $field ) {
+			if ( is_string( $clean[ $field ] ?? null ) ) {
+				$clean[ $field ] = wp_kses_post( $clean[ $field ] );
+			}
+		}
+
+		if ( is_array( $clean['meta'] ?? null ) ) {
+			$patterns  = \PerfLocale\Translation\PostTranslationManager::sensitive_meta_patterns();
+			$post_type = is_string( $payload['post_type'] ?? null ) ? $payload['post_type'] : '';
+			$meta      = [];
+
+			foreach ( $clean['meta'] as $key => $value ) {
+				$key = (string) $key;
+
+				if ( str_starts_with( $key, '_perflocale_' ) || \PerfLocale\Translation\PostTranslationManager::is_sensitive_meta_key( $key, $patterns ) ) {
+					continue;
+				}
+
+				if ( is_string( $value ) ) {
+					/** This filter is documented in src/MachineTranslation/MetaTranslator.php */
+					$format = apply_filters( 'perflocale/mt/meta_key_format', 'html', $key, $post_type, \PerfLocale\Util\Scalar::int( $row['source_id'] ?? 0 ) );
+					$value  = 'text' === $format ? sanitize_textarea_field( $value ) : wp_kses_post( $value );
+				} elseif ( null !== $value ) {
+					continue;
+				}
+
+				$meta[ $key ] = $value;
+			}
+
+			$clean['meta'] = $meta;
+		}
+
+		unset( $clean['parts'] );
+
+		if ( $clean === $payload ) {
+			return false;
+		}
+
+		$encoded        = wp_json_encode( $clean );
+		$row['payload'] = is_string( $encoded ) ? $encoded : '';
+
+		return true;
+	}
+
+	/**
+	 * Sanitize one imported pending string proposal in place, as imported string translations are.
+	 *
+	 * @param array<string, mixed> $row Row, after prepare_pending_change_row().
+	 * @return bool True when the row was changed.
+	 */
+	private static function sanitize_pending_change_row( array &$row ): bool {
+		if ( ! is_string( $row['payload'] ?? null ) || '' === $row['payload'] ) {
+			return false;
+		}
+
+		$payload = json_decode( $row['payload'], true );
+
+		if ( ! is_array( $payload ) ) {
+			$row['payload'] = '';
+
+			return true;
+		}
+
+		if ( 'post' === ( $row['object_type'] ?? '' ) ) {
+			return self::sanitize_pending_post_row( $row, $payload );
+		}
+
+		$clean = [
+			'translation' => is_string( $payload['translation'] ?? null ) ? \PerfLocale\Helper::sanitize_untrusted_string_translation( $payload['translation'] ) : '',
+			// null keeps the stored forms on approve; only a list is cleaned.
+			'extra_forms' => is_array( $payload['extra_forms'] ?? null ) ? array_map(
+				static fn ( $form ): string => is_string( $form ) ? \PerfLocale\Helper::sanitize_untrusted_string_translation( $form ) : '',
+				array_values( $payload['extra_forms'] )
+			) : null,
+		];
+
+		if ( $clean === $payload ) {
+			return false;
+		}
+
+		$encoded        = wp_json_encode( $clean );
+		$row['payload'] = is_string( $encoded ) ? $encoded : '';
+
+		return true;
+	}
+
+	/**
 	 * Sanitize one imported `languages` row's string cells with LanguageRepository::sanitize_data() (as the Languages
 	 * screen and REST store them), without the code's shape check, so a restore can keep an older or empty code. A value
 	 * that outgrows its column (`<` becomes `&lt;`) is refused by wpdb and counts as failed.
@@ -3417,17 +4235,23 @@ final class DataImporter {
 
 			case 'strings':
 				$tbl = Schema::table( 'strings' );
-				return static function ( array $row ) use ( $wpdb, $tbl ): int {
+				$db  = Typed::wpdb();
+				return static function ( array $row ) use ( $db, $tbl ): int {
 					if ( empty( $row['original_hash'] ) ) {
 						return 0; }
+					// An other-form row of the tuple moves to its new hash first, so the merge matches it.
+					\PerfLocale\Strings\StrIdentMigration::adopt( [ \PerfLocale\Util\Scalar::str( $row['original_hash'] ) => $row ] );
 					// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-					return (int) $wpdb->get_var(
-						$wpdb->prepare(
-							'SELECT id FROM %i WHERE original_hash = %s LIMIT 1',
+					$held = $db->get_row(
+						$db->prepare(
+							'SELECT id, domain, context, original, original_hash FROM %i WHERE original_hash = %s LIMIT 1',
 							$tbl,
 							$row['original_hash']
 						)
 					);
+
+					// Another tuple's row under its own form (a kept twin) is never this string: left unmapped.
+					return is_object( $held ) && ! \PerfLocale\Database\Repository\StringRepository::foreign( $held, \PerfLocale\Util\Scalar::str( $row['original_hash'] ) ) ? \PerfLocale\Util\Scalar::int( \PerfLocale\Util\Scalar::prop( $held, 'id' ) ) : 0;
 				};
 
 			default:
@@ -3781,7 +4605,7 @@ final class DataImporter {
 		$checked = 0;
 		$changed = 0;
 
-		foreach ( self::fingerprint_sources( $members ) as $table => [ $column, $fixed ] ) {
+		foreach ( self::fingerprint_sources( $members, true ) as $table => [ $column, $fixed ] ) {
 			if ( ! $reader->is_row_list( $table ) || 0 === $reader->count( $table ) ) {
 				continue;
 			}
@@ -3895,10 +4719,24 @@ final class DataImporter {
 						$count
 					);
 					break;
+				case 'string_separator':
+					$notes[] = sprintf(
+						/* translators: %d: number of strings */
+						_n( '%d string was not imported because its context or text holds a control character that gettext reserves (U+0004 or U+0000).', '%d strings were not imported because their context or text holds a control character that gettext reserves (U+0004 or U+0000).', $count, 'perflocale' ),
+						$count
+					);
+					break;
 				case 'unknown_language':
 					$notes[] = sprintf(
 						/* translators: %d: number of rows */
 						_n( '%d row was not imported because the language it names does not exist on this site. Import the file with its Languages section to bring the language too.', '%d rows were not imported because the language they name does not exist on this site. Import the file with its Languages section to bring the language too.', $count, 'perflocale' ),
+						$count
+					);
+					break;
+				case 'url_slug_taken':
+					$notes[] = sprintf(
+						/* translators: %d: number of rows */
+						_n( '%d term URL slug was not imported because another term of the same language already uses it.', '%d term URL slugs were not imported because another term of the same language already uses them.', $count, 'perflocale' ),
 						$count
 					);
 					break;

@@ -46,15 +46,21 @@ final class AdminServiceHooks {
 			add_action( "{$taxonomy}_edit_form_fields", [ self::class, 'render_edit_fields' ], 10, 2 );
 			add_action( "created_{$taxonomy}", [ self::class, 'save_term_language' ] );
 			add_action( "edited_{$taxonomy}", [ self::class, 'save_term_language' ] );
+
+			// After the language row and its save: the URL slug is in the term's (new) language.
+			add_action( "{$taxonomy}_edit_form_fields", [ TermUrlSlugField::class, 'render' ], 11, 2 );
+			add_action( "edited_{$taxonomy}", [ TermUrlSlugField::class, 'save' ], 11 );
 		}
 	}
 
 	/**
-	 * @param string $hook The current admin page hook.
+	 * @param mixed $hook The current admin page hook (mixed: iframe_header() passes null outside admin.php).
 	 * @return void
 	 */
-	public static function enqueue( string $hook ): void {
-		self::assets()->enqueue( $hook );
+	public static function enqueue( mixed $hook ): void {
+		if ( is_string( $hook ) ) {
+			self::assets()->enqueue( $hook );
+		}
 	}
 
 	/**

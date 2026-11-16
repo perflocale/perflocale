@@ -1,5 +1,5 @@
 /**
- * PerfLocale - Redirect priority editor on the Settings > URL & Routing tab.
+ * PerfLocale - Redirect priority editor on Settings > URL & Routing > Visitor Redirects.
  *
  * Drag-and-drop / keyboard reorder for the chip list at `.pl-prio-editor`.
  * The chips reuse the `.pl-fb-chip` styling from the language-fallback

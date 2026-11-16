@@ -306,7 +306,7 @@ final class PerfLocaleSeopress implements \PerfLocale\Addon\AddonInterface {
 	 * @return string 'text' for this addon's SEO keys, else $format.
 	 */
 	public function mt_meta_key_format( string $format, string $key, string $post_type ): string {
-		return in_array( $key, self::MT_TEXT_KEYS, true ) ? 'text' : $format;
+		return 'copy' !== $format && in_array( $key, self::MT_TEXT_KEYS, true ) ? 'text' : $format;
 	}
 
 

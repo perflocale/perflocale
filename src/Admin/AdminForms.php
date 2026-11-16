@@ -91,6 +91,8 @@ final class AdminForms {
 			$repaired = $generator->get_repaired_count();
 			// Languages whose translations could not be read kept their files; the notice names them.
 			$read_failed = count( $generator->get_read_failed_locales() );
+			// Languages skipped as too large are read back from their record by the notice, never from the URL.
+			$skipped = count( $generator->get_skipped_locales() );
 
 			wp_safe_redirect(
 				add_query_arg(
@@ -100,6 +102,8 @@ final class AdminForms {
 						'files_generated'   => $count,
 						'repaired'          => $repaired,
 						'files_read_failed' => $read_failed,
+						'files_skipped'     => $skipped,
+						'files_queued'      => $generator->was_queued() ? 1 : 0,
 					],
 					admin_url( 'admin.php' )
 				)
@@ -125,6 +129,7 @@ final class AdminForms {
 		$tab    = sanitize_key( wp_unslash( $_POST['perflocale_settings_tab'] ) );
 		$page   = new Pages\SettingsPage( $this->settings );
 		$values = $page->extract_tab_values( $tab );
+		$urls   = $this->url_shape();
 
 		// wpdb refuses a too-long or invalid-UTF-8 value instead of storing it, so the notice carries the real result;
 		// update() also returns false for a save that changed nothing, hence the no-op signal.
@@ -175,6 +180,23 @@ final class AdminForms {
 			$redirect_args['mt-agency-http'] = '1';
 		}
 
+		// Both currency writers run on this save; either may refuse a row.
+		$addon_refused = class_exists( 'PerfLocaleWooCommerceAdmin', false ) ? Typed::strs( \PerfLocaleWooCommerceAdmin::$refused_rates ) : [];
+		$rates_refused = array_unique( array_merge( \PerfLocale\Util\SettingsWriter::last_refused_rates(), $addon_refused ) );
+
+		if ( [] !== $rates_refused ) {
+			$redirect_args['rate-refused'] = rawurlencode( implode( ',', $rates_refused ) );
+		}
+
+		// A change to how language paths are built: the notice names the root posts a language prefix now takes.
+		if ( $urls !== $this->url_shape() ) {
+			$redirect_args['slug-clash'] = '1';
+		}
+
+		if ( [] !== Pages\SettingsPage::last_refused_numbers() ) {
+			$redirect_args['number-refused'] = rawurlencode( implode( ',', Pages\SettingsPage::last_refused_numbers() ) );
+		}
+
 		if ( [] !== Pages\SettingsPage::last_refused_sync_fields() ) {
 			$redirect_args['sync-refused'] = rawurlencode( implode( ',', Pages\SettingsPage::last_refused_sync_fields() ) );
 		}
@@ -184,10 +206,51 @@ final class AdminForms {
 			$redirect_args['subtab'] = $tab;
 		} else {
 			$redirect_args['tab'] = $tab;
+			$subtab               = isset( $_POST['perflocale_settings_subtab'] ) && is_string( $_POST['perflocale_settings_subtab'] ) ? sanitize_key( wp_unslash( $_POST['perflocale_settings_subtab'] ) ) : '';
+
+			if ( in_array( $subtab, Pages\SettingsPage::SUBTABS[ $tab ] ?? [], true ) ) {
+				$redirect_args['subtab'] = $subtab;
+			}
 		}
 
 		wp_safe_redirect( add_query_arg( $redirect_args, admin_url( 'admin.php' ) ) );
 		exit;
+	}
+
+	/**
+	 * The root paths of a language with this slug and locale (its code and URL prefix).
+	 *
+	 * @param string $slug   Language slug.
+	 * @param string $locale Locale.
+	 * @return array<int, string>
+	 */
+	private static function paths_of( string $slug, string $locale ): array {
+		require_once dirname( __DIR__ ) . '/Translation/LanguageCodeSlugs.php';
+
+		return '' !== $slug ? \PerfLocale\Translation\LanguageCodeSlugs::paths( $slug, $locale, \PerfLocale\Plugin::get_instance()->settings() ) : [];
+	}
+
+	/**
+	 * The first root path an active language with this slug and locale would take from a published root post, or ''.
+	 *
+	 * @param string             $slug   Language slug.
+	 * @param string             $locale Locale.
+	 * @param array<int, string> $except Paths it holds already.
+	 * @return string
+	 */
+	private static function code_clash( string $slug, string $locale, array $except = [] ): string {
+		$paths = array_values( array_diff( self::paths_of( $slug, $locale ), $except ) );
+
+		return \PerfLocale\Translation\LanguageCodeSlugs::clash( $paths, \PerfLocale\Plugin::get_instance()->settings() )[0];
+	}
+
+	/**
+	 * The settings that decide the root paths languages take; the settings save notice compares them.
+	 *
+	 * @return array<int, mixed>
+	 */
+	private function url_shape(): array {
+		return [ $this->settings->get_url_mode(), $this->settings->get( 'translatable_post_types' ), $this->settings->get( 'url_prefix_type' ), $this->settings->get( 'hide_default_prefix' ) ];
 	}
 
 	/**
@@ -255,7 +318,7 @@ final class AdminForms {
 			? null
 			: [ \PerfLocale\Helper::class, 'sanitize_untrusted_string_translation' ];
 
-		return \PerfLocale\Admin\PoSync::import_from_file( $path, $lang, $replace, $sanitize );
+		return \PerfLocale\Admin\PoSync::import_from_file( $path, $lang, $replace, $sanitize, \PerfLocale\Strings\Domains::restricted_for_current_user() );
 	}
 
 	/**
@@ -362,7 +425,7 @@ final class AdminForms {
 			if ( $job->should_run_async( $job_args, $settings ) ) {
 				$result = \PerfLocale\Background\Dispatcher::dispatch( $job, $job_args );
 
-				if ( ( $result['mode'] ?? '' ) === 'async' ) {
+				if ( $result['mode'] === 'async' ) {
 					wp_safe_redirect( add_query_arg( 'perflocale_notice', 'export_queued', admin_url( 'admin.php?page=perflocale-jobs' ) ) );
 					exit;
 				}
@@ -380,14 +443,21 @@ final class AdminForms {
 				wp_die( esc_html__( 'Security check failed.', 'perflocale' ), '', [ 'response' => 403 ] );
 			}
 
-			if ( ! current_user_can( 'manage_options' ) ) {
+			// As the upload, the export and the job: before anything is staged.
+			if ( ! current_user_can( 'manage_options' ) || ! current_user_can( 'perflocale_import_export' ) ) {
 				wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ), '', [ 'response' => 403 ] );
 			}
 
 			// A file sent in pieces (ImportUpload): the form carries the token, the assembled copy is staged; taking it ends the
 			// upload and frees its quota place.
 			$upload_token   = isset( $_POST['perflocale_import_upload'] ) && is_string( $_POST['perflocale_import_upload'] ) ? sanitize_text_field( wp_unslash( $_POST['perflocale_import_upload'] ) ) : '';
-			$persisted_path = '' !== $upload_token ? \PerfLocale\Admin\ImportUpload::claim( $upload_token ) : '';
+			$claim_refused  = '';
+			$persisted_path = '' !== $upload_token ? \PerfLocale\Admin\ImportUpload::claim( $upload_token, $claim_refused ) : '';
+
+			if ( '' !== $claim_refused ) {
+				wp_safe_redirect( ImportNotice::url( $redirect_url, 'error', $claim_refused ) );
+				exit;
+			}
 
 			if ( null === $persisted_path ) {
 				wp_safe_redirect( ImportNotice::url( $redirect_url, 'error', \PerfLocale\Admin\ImportUpload::busy_message() ) );
@@ -458,23 +528,42 @@ final class AdminForms {
 
 				$token          = wp_generate_password( 16, false );
 				$persisted_path = $temp_dir . '/import-' . $token . '.json';
+				$dest           = false;
+
+				$stage_refused = \PerfLocale\Admin\ImportUpload::stage_within_quota(
+					$upload_size,
+					static function () use ( $persisted_path, $upload_size, &$dest ): bool {
+						$dest = \PerfLocale\Admin\ImportUpload::open_reserved( $persisted_path, $upload_size );
+
+						return false !== $dest;
+					}
+				);
+
+				if ( '' !== $stage_refused ) {
+					if ( $dest ) {
+						fclose( $dest ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose -- Closing handle.
+						wp_delete_file( $persisted_path );
+					}
+					wp_safe_redirect( ImportNotice::url( $redirect_url, 'error', $stage_refused ) );
+					exit;
+				}
 
 				// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fopen, WordPress.PHP.NoSilencedErrors.Discouraged -- Reading a fresh PHP upload tmp file; WP_Filesystem cannot reach php_uploaded_file area; @ suppresses open-failure warning handled by the truthiness check below.
 				$source = @fopen( $tmp_path, 'rb' );
-				// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fopen, WordPress.PHP.NoSilencedErrors.Discouraged -- Writing into our wp-content/uploads/perflocale/temp/ scratch dir created via wp_mkdir_p above; @ suppresses open-failure warning handled below.
-				$dest = @fopen( $persisted_path, 'wb' );
 
 				if ( ! $source || ! $dest ) {
 					if ( $source ) {
 						fclose( $source ); } // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose -- Closing handle.
 					if ( $dest ) {
 						fclose( $dest ); }   // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose -- Closing handle.
+					wp_delete_file( $persisted_path );
 					wp_safe_redirect( ImportNotice::url( $redirect_url, 'error', __( 'Could not stage uploaded file.', 'perflocale' ) ) );
 					exit;
 				}
 
 				// Every read and write checked: a full disk would leave a truncated copy reported as invalid JSON.
 				$staged = true;
+				$copied = 0;
 
 				while ( ! feof( $source ) ) {
 					$chunk = fread( $source, 65536 ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fread -- Chunked copy of fresh PHP upload tmp file.
@@ -486,9 +575,10 @@ final class AdminForms {
 						$staged = false;
 						break;
 					}
+					$copied += strlen( $chunk );
 				}
 				fclose( $source ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose -- Closing handle.
-				$staged = fclose( $dest ) && $staged; // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose -- Closing handle.
+				$staged = fclose( $dest ) && $staged && $copied === $upload_size; // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose -- Closing handle.
 				wp_delete_file( $tmp_path );
 
 				if ( ! $staged ) {
@@ -535,7 +625,13 @@ final class AdminForms {
 				exit;
 			}
 
-			$result = \PerfLocale\Background\Dispatcher::dispatch( $import_job, $import_args );
+			// A queued import is created under the staging lock after one more live-import check; an inline run holds the
+			// import lock instead, for longer than the staging lock lives.
+			$settings = \PerfLocale\Plugin::get_instance()->get( 'settings' );
+			$dispatch = static fn(): array => \PerfLocale\Background\Dispatcher::dispatch( $import_job, $import_args );
+			$result   = $settings instanceof \PerfLocale\Settings && $import_job->should_run_async( $import_args, $settings )
+				? \PerfLocale\Admin\ImportUpload::dispatch_alone( $dispatch )
+				: $dispatch();
 
 			if ( $result['mode'] === 'async' ) {
 				wp_safe_redirect( add_query_arg( 'perflocale_notice', 'import_queued', admin_url( 'admin.php?page=perflocale-jobs' ) ) );
@@ -701,7 +797,9 @@ final class AdminForms {
 				$msg .= ' ' . $rejected_note;
 			}
 
-			wp_safe_redirect( ImportNotice::url( $redirect_url, 'success', $msg ) );
+			$clashes = \PerfLocale\Migration\MigrationRunner::clash_lines( $r );
+
+			wp_safe_redirect( ImportNotice::url( $redirect_url, [] !== $clashes ? 'warning' : 'success', implode( ' ', array_merge( [ $msg ], $clashes ) ) ) );
 			exit;
 		}
 
@@ -771,8 +869,8 @@ final class AdminForms {
 				$msg .= ' ' . implode( ' ', $notices );
 			}
 
-			// Items read and not imported: an attention notice instead of a plain success.
-			$skipped_lines = \PerfLocale\Migration\MigrationRunner::skipped_lines( 'polylang', $r );
+			// Items read and not imported, and root posts a language prefix takes: an attention notice instead of a plain success.
+			$skipped_lines = array_merge( \PerfLocale\Migration\MigrationRunner::skipped_lines( 'polylang', $r ), \PerfLocale\Migration\MigrationRunner::clash_lines( $r ) );
 
 			if ( $skipped_lines !== [] ) {
 				wp_safe_redirect( ImportNotice::url( $redirect_url, 'warning', $msg . ' ' . implode( ' ', $skipped_lines ) ) );
@@ -842,7 +940,9 @@ final class AdminForms {
 				);
 			}
 
-			wp_safe_redirect( ImportNotice::url( $redirect_url, 'success', $msg ) );
+			$clashes = \PerfLocale\Migration\MigrationRunner::clash_lines( $r );
+
+			wp_safe_redirect( ImportNotice::url( $redirect_url, [] !== $clashes ? 'warning' : 'success', implode( ' ', array_merge( [ $msg ], $clashes ) ) ) );
 			exit;
 		}
 	}
@@ -898,7 +998,7 @@ final class AdminForms {
 			$this->swap_front_page_to_language( $new_lang );
 
 			// URL prefixes change with the default: flush rewrite rules.
-			update_option( 'perflocale_flush_rules', 1, false );
+			update_option( 'perflocale_flush_rules', 1, true );
 
 			// Clear the language cookie so visitors detect the new default.
 			if ( ! headers_sent() ) {
@@ -973,12 +1073,15 @@ final class AdminForms {
 			$deleted = ( $deletable && is_array( $blockers ) )
 				? $repo->delete( $lang_id )
 				: false;
+			// Refused while it has URL bases data a table without transactions could not release with it, or not confirmed.
+			$why     = ! $deleted && $deletable && is_array( $blockers ) ? \PerfLocale\Database\Repository\LanguageWrites::refused() : '';
+			$message = 'delete_data' === $why ? 'delete_url_bases' : ( 'delete_unknown' === $why ? 'delete_unknown' : 'delete_failed' );
 
 			wp_safe_redirect(
 				add_query_arg(
 					[
 						'page'    => 'perflocale-languages',
-						'message' => $deleted ? 'deleted' : 'delete_failed',
+						'message' => $deleted ? 'deleted' : $message,
 					],
 					admin_url( 'admin.php' )
 				)
@@ -1070,6 +1173,23 @@ final class AdminForms {
 				exit;
 			}
 
+			$dup = 1 === $data['is_active'] ? self::code_clash( $data['slug'], $data['locale'] ) : '';
+
+			if ( '' !== $dup ) {
+				wp_safe_redirect(
+					add_query_arg(
+						[
+							'page'    => 'perflocale-languages',
+							'action'  => 'add',
+							'message' => 'slug_used_by_content',
+							'dup'     => rawurlencode( $dup ),
+						],
+						admin_url( 'admin.php' )
+					)
+				);
+				exit;
+			}
+
 			// Ticked rename boxes, `perflocale_rename[old_slug] = new_slug`, unslashed and sanitize_key()'d; empty and no-op
 			// pairs dropped (nonce verified above).
 			$rename_payload = [];
@@ -1092,6 +1212,28 @@ final class AdminForms {
 				}
 			}
 
+			// A renamed active language takes its new prefix's root path, as an added one does: refused before any write.
+			foreach ( $rename_payload as $old_slug => $new_slug ) {
+				$candidate = $repo->find_by_slug( $old_slug );
+				$locale    = is_object( $candidate ) && is_string( $candidate->locale ?? null ) ? $candidate->locale : '';
+				$dup       = $candidate && ! empty( $candidate->is_active ) ? self::code_clash( $new_slug, $locale, self::paths_of( $old_slug, $locale ) ) : '';
+
+				if ( '' !== $dup ) {
+					wp_safe_redirect(
+						add_query_arg(
+							[
+								'page'    => 'perflocale-languages',
+								'action'  => 'add',
+								'message' => 'slug_used_by_content',
+								'dup'     => rawurlencode( $dup ),
+							],
+							admin_url( 'admin.php' )
+						)
+					);
+					exit;
+				}
+			}
+
 			$renamed_count = 0;
 
 			foreach ( $rename_payload as $old_slug => $new_slug ) {
@@ -1103,6 +1245,20 @@ final class AdminForms {
 
 				if ( $repo->rename_slug( (int) $candidate->id, $new_slug ) ) {
 					++$renamed_count;
+				} elseif ( '' !== \PerfLocale\Database\Repository\LanguageWrites::refused() ) {
+					wp_safe_redirect(
+						add_query_arg(
+							[
+								'page'    => 'perflocale-languages',
+								'action'  => 'add',
+								'message' => 'rename_refused',
+								'reason'  => \PerfLocale\Database\Repository\LanguageWrites::refused(),
+								'dup'     => rawurlencode( $new_slug ),
+							],
+							admin_url( 'admin.php' )
+						)
+					);
+					exit;
 				}
 			}
 
@@ -1136,6 +1292,31 @@ final class AdminForms {
 
 		if ( $action_type === 'edit' && isset( $_POST['language_id'] ) ) {
 			$lang_id = absint( $_POST['language_id'] );
+			$before  = $repo->find( $lang_id );
+			$old     = $before->slug ?? null;
+			$old     = is_string( $old ) ? $old : '';
+			$code    = '' !== $data['slug'] ? $data['slug'] : $old;
+			$locale  = $before->locale ?? null;
+			$locale  = is_string( $locale ) ? $locale : '';
+
+			// An activation takes the language's root paths; a new code or locale its new ones.
+			$dup = $before && 1 === $data['is_active'] ? self::code_clash( $code, '' !== $data['locale'] ? $data['locale'] : $locale, empty( $before->is_active ) ? [] : self::paths_of( $old, $locale ) ) : '';
+
+			if ( '' !== $dup ) {
+				wp_safe_redirect(
+					add_query_arg(
+						[
+							'page'        => 'perflocale-languages',
+							'action'      => 'edit',
+							'language_id' => $lang_id,
+							'message'     => 'slug_used_by_content',
+							'dup'         => rawurlencode( $dup ),
+						],
+						admin_url( 'admin.php' )
+					)
+				);
+				exit;
+			}
 
 			// The add branch's duplicate check, excluding this row: otherwise update() fails with a raw SQL error and the
 			// default side effects would still run.
@@ -1225,7 +1406,7 @@ final class AdminForms {
 						}
 
 						// Flush rewrite rules for the new default prefix.
-						update_option( 'perflocale_flush_rules', 1, false );
+						update_option( 'perflocale_flush_rules', 1, true );
 					}
 				}
 
@@ -1234,6 +1415,24 @@ final class AdminForms {
 						[
 							'page'    => 'perflocale-languages',
 							'message' => 'updated',
+						],
+						admin_url( 'admin.php' )
+					)
+				);
+				exit;
+			}
+
+			// A slug change not done: refused before its row write, or not confirmed after it (refused() says which).
+			if ( '' !== \PerfLocale\Database\Repository\LanguageWrites::refused() ) {
+				wp_safe_redirect(
+					add_query_arg(
+						[
+							'page'        => 'perflocale-languages',
+							'action'      => 'edit',
+							'language_id' => $lang_id,
+							'message'     => 'rename_refused',
+							'reason'      => \PerfLocale\Database\Repository\LanguageWrites::refused(),
+							'dup'         => rawurlencode( $data['slug'] ),
 						],
 						admin_url( 'admin.php' )
 					)
@@ -1338,10 +1537,17 @@ final class AdminForms {
 		$link_failures = 0;
 		// Cells the database could not compare byte for byte (table and connection character sets differ).
 		$mismatch = 0;
+		// Edited cells whose string row was deleted (since render, or by a fold before the write with no single survivor).
+		$gone = 0;
 
-		// Every string's group_id in one query (also dedups repeated ids).
+		// Every string's group_id in one query (also dedups repeated ids); a string of a domain the user may not see
+		// (perflocale/strings/domain_capability) is skipped and counted.
 		$string_ids = array_values( array_filter( array_map( 'absint', array_keys( $translations ) ) ) );
 		$group_map  = [];
+		$tuples     = [];
+		$seen       = [];
+		$listed     = false;
+		$restricted = 0;
 
 		if ( ! empty( $string_ids ) ) {
 			$placeholders = implode( ',', array_fill( 0, count( $string_ids ), '%d' ) );
@@ -1349,13 +1555,26 @@ final class AdminForms {
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare
 			$rows = $wpdb->get_results(
 				$wpdb->prepare(
-					"SELECT id, group_id FROM %i WHERE id IN ({$placeholders})",
+					"SELECT id, group_id, domain, context, original FROM %i WHERE id IN ({$placeholders})",
 					array_merge( [ $strings_table ], $string_ids )
 				)
 			);
 
-			foreach ( (array) $rows as $row ) {
-				$group_map[ (int) $row->id ] = (int) $row->group_id;
+			$listed = is_array( $rows ) && $wpdb instanceof \wpdb && '' === $wpdb->last_error;
+
+			foreach ( is_array( $rows ) ? $rows : [] as $row ) {
+				$id          = \PerfLocale\Util\Scalar::int( \PerfLocale\Util\Scalar::prop( $row, 'id' ) );
+				$domain      = \PerfLocale\Util\Scalar::str( \PerfLocale\Util\Scalar::prop( $row, 'domain' ) );
+				$seen[ $id ] = true;
+
+				if ( \PerfLocale\Strings\Domains::is_restricted( $domain ) ) {
+					++$restricted;
+					continue;
+				}
+
+				$group_map[ $id ] = \PerfLocale\Util\Scalar::int( \PerfLocale\Util\Scalar::prop( $row, 'group_id' ) );
+				// Finds the survivor when an identity fold deletes this row before the write (StringCellWrite::save_live()).
+				$tuples[ $id ] = [ $domain, \PerfLocale\Util\Scalar::str( \PerfLocale\Util\Scalar::prop( $row, 'context' ) ), \PerfLocale\Util\Scalar::str( \PerfLocale\Util\Scalar::prop( $row, 'original' ) ) ];
 			}
 		}
 
@@ -1392,16 +1611,17 @@ final class AdminForms {
 				continue;
 			}
 
-			// No `strings` row (stale form, deleted since render): nothing to write or repair.
-			if ( ! array_key_exists( $string_id, $group_map ) ) {
+			// A restricted string (counted above), or no list read: skipped.
+			if ( ! isset( $group_map[ $string_id ] ) && ( isset( $seen[ $string_id ] ) || ! $listed ) ) {
 				continue;
 			}
 
-			$group_id = $group_map[ $string_id ];
+			// Null: no `strings` row (deleted since render); its edited cells are reported below, never written.
+			$group_id = $group_map[ $string_id ] ?? null;
 
 			// group_id can be 0, gone, or a post or term group's; links under any of them would orphan or repoint that group,
 			// and skipping would lose the typed text without a message. So the group is healed at the first write below.
-			$needs_group = ! $group_repo->is_string_group( $group_id );
+			$needs_group = null !== $group_id && ! $group_repo->is_string_group( $group_id );
 
 			foreach ( $lang_translations as $lang_id => $value ) {
 				$lang_id = absint( $lang_id );
@@ -1436,6 +1656,11 @@ final class AdminForms {
 					$over_mt = $stored_now !== $was;
 				}
 
+				if ( null === $group_id ) {
+					$gone += '' === $value ? 0 : 1;
+					continue;
+				}
+
 				$read_text  = $current_map[ $string_id ][ $lang_id ] ?? null;
 				$read_forms = $current_extra_map[ $string_id ][ $lang_id ] ?? null;
 				$row_extra  = $extra_forms_post[ $string_id ][ $lang_id ] ?? null;
@@ -1461,7 +1686,7 @@ final class AdminForms {
 						$outcome = \PerfLocale\Strings\StringCellWrite::remove( $group_repo, $group_id, $string_id, $lang_id, $read_text, is_array( $row_extra ) ? $read_forms : false, $over_mt );
 					}
 
-					if ( 'saved' === $outcome || 'unlabelled' === $outcome ) {
+					if ( 'saved' === $outcome ) {
 						++$deleted;
 						$touched_lang_ids[ $lang_id ] = true;
 					} elseif ( 'stale' === $outcome ) {
@@ -1489,6 +1714,11 @@ final class AdminForms {
 				// Mint a string group and point the string at it first (repair_orphaned_translations() step 2's statements), so
 				// the value is written once, with its link; only the first written cell pays.
 				if ( $needs_group ) {
+					if ( ! $wpdb instanceof \wpdb ) {
+						++$link_failures;
+						continue 2;
+					}
+
 					// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 					$minted = (bool) $wpdb->insert(
 						$groups_table,
@@ -1501,31 +1731,38 @@ final class AdminForms {
 						continue 2;
 					}
 
-					$group_id = (int) $wpdb->insert_id;
+					$minted_id = (int) $wpdb->insert_id;
+					$taken     = $minted_id > 0 ? \PerfLocale\Database\Repository\StringGroupAssigner::repoint( $wpdb, $string_id, $group_id, $minted_id ) : 0;
 
-					// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-					$wpdb->update(
-						$strings_table,
-						[ 'group_id' => $group_id ],
-						[ 'id' => $string_id ],
-						[ '%d' ],
-						[ '%d' ]
-					);
+					// Moved only while it still named the group read; a repair another writer made first is used.
+					if ( 0 === $taken ) {
+						// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Reclaiming the group just created, by primary key.
+						$wpdb->delete( $groups_table, [ 'id' => $minted_id ], [ '%d' ] );
+						++$link_failures;
+						continue 2;
+					}
 
+					$group_id    = $taken;
 					$needs_group = false;
 				}
 
 				// Forms go with the text, so another writer's forms never stay next to it.
 				$forms   = is_array( $row_extra ) ? $posted_extra_json : false;
-				$outcome = \PerfLocale\Strings\StringCellWrite::save( $group_repo, $group_id, $string_id, $lang_id, $read_text, $read_forms, $value, $forms, $over_mt );
+				// Written to $to_id: the string, or the survivor of its tuple when a fold deleted the row since the read.
+				[ $outcome, $to_id, $to_group ] = \PerfLocale\Strings\StringCellWrite::save_live( $group_repo, $group_id, $string_id, $lang_id, $read_text, $read_forms, $value, $forms, $over_mt, $tuples[ $string_id ] ?? [ '', '', '' ] );
 
 				// A missing link is created (upsert_link() reaps this string's row under a dead group).
-				if ( 'unlinked' === $outcome && false !== $group_repo->upsert_link( $group_id, $string_id, $lang_id, 'translated', \PerfLocale\Enum\SourceType::Manual ) ) {
+				if ( 'unlinked' === $outcome && false !== $group_repo->upsert_link( $to_group, $to_id, $lang_id, 'translated', \PerfLocale\Enum\SourceType::Manual ) ) {
 					$outcome = 'saved';
 				}
 
+				if ( 'gone' === $outcome ) {
+					++$gone;
+					continue;
+				}
+
 				if ( 'stale' === $outcome ) {
-					$stale[] = $cell;
+					$stale[] = $to_id . '_' . $lang_id;
 					continue;
 				}
 
@@ -1534,11 +1771,11 @@ final class AdminForms {
 					continue;
 				}
 
-				if ( 'unlinked' === $outcome || 'unlabelled' === $outcome ) {
-					// No link or label for the text: put the row back as read (while it is still the person's).
+				if ( 'unlinked' === $outcome ) {
+					// No link for the text: put the row back as read (while it is still the person's).
 					$back = null === $read_text
-						? \PerfLocale\Strings\StringCellWrite::clear( $string_id, $lang_id, $value, $forms )
-						: \PerfLocale\Strings\StringCellWrite::write( $string_id, $lang_id, $value, false === $forms ? null : $forms, $read_text, false === $forms ? false : $read_forms );
+						? \PerfLocale\Strings\StringCellWrite::clear( $to_id, $lang_id, $value, $forms )
+						: \PerfLocale\Strings\StringCellWrite::write( $to_id, $lang_id, $value, false === $forms ? null : $forms, $read_text, false === $forms ? false : $read_forms );
 
 					// A value left stored is flushed like a saved one, so caches and files match the table.
 					if ( 1 !== $back ) {
@@ -1569,8 +1806,11 @@ final class AdminForms {
 			$all_langs = $lang_repo->get_active();
 
 			foreach ( $all_langs as $lang ) {
-				$cache->delete( "all_string_translations_{$lang->id}", 'perflocale_strings' );
+				$cache->delete( "all_str2_translations_{$lang->id}", 'perflocale_strings' );
 			}
+
+			require_once __DIR__ . '/../Cache/CacheDiagnostics.php';
+			\PerfLocale\Cache\CacheDiagnostics::forget_map_sizes( $cache, array_column( $all_langs, 'id' ) );
 
 			// Files mode: regenerate only the touched languages. The all-language cache delete above stays broad: an add-on's
 			// gettext bridge depends on it.
@@ -1607,6 +1847,14 @@ final class AdminForms {
 
 		if ( $mismatch > 0 ) {
 			$redirect_args['save_mismatch'] = $mismatch;
+		}
+
+		if ( $gone > 0 ) {
+			$redirect_args['save_gone'] = $gone;
+		}
+
+		if ( $restricted > 0 ) {
+			$redirect_args['restricted'] = $restricted;
 		}
 
 		wp_safe_redirect( add_query_arg( self::strings_filters( $redirect_args ), admin_url( 'admin.php' ) ) );
@@ -1704,7 +1952,7 @@ final class AdminForms {
 			]
 		);
 
-		if ( ( $outcome['mode'] ?? '' ) === 'denied' || ( $outcome['mode'] ?? '' ) === 'error' ) {
+		if ( 'denied' === $outcome['mode'] || 'error' === $outcome['mode'] ) {
 			set_transient( 'perflocale_bulk_mt_error_' . get_current_user_id(), (string) ( $outcome['error'] ?? __( 'Dispatch failed.', 'perflocale' ) ), 5 * MINUTE_IN_SECONDS );
 			wp_safe_redirect( add_query_arg( 'message', 'site_translate_denied', admin_url( 'admin.php?page=perflocale-translations' ) ) );
 			exit;
@@ -1763,6 +2011,18 @@ final class AdminForms {
 		// "Translate the entire site" posts the same nonce with action=site_translate: the SiteTranslateJob chain, never inline.
 		if ( sanitize_key( wp_unslash( $_POST['perflocale_translations_action'] ) ) === 'site_translate' ) {
 			$this->process_site_translate();
+			return;
+		}
+
+		// Content ReSync's "Update translations" dialog: the same nonce, capability and completeness marker, then the
+		// estimate step.
+		// phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- sanitize_key() is the sanitiser; Scalar::str() only types the value for it.
+		if ( sanitize_key( \PerfLocale\Util\Scalar::str( wp_unslash( $_POST['perflocale_translations_action'] ) ) ) === 'update_translations' ) {
+			if ( ! \PerfLocale\Util\ResyncSwitch::on() ) {
+				\PerfLocale\Util\ResyncOff::refuse();
+			}
+
+			ResyncEntry::translations_dialog();
 			return;
 		}
 
@@ -1836,6 +2096,15 @@ final class AdminForms {
 		}
 
 		switch ( $bulk_action ) {
+			case 'update_translations':
+				// Content ReSync on the ticked rows: the estimate step, then Start.
+				if ( ! \PerfLocale\Util\ResyncSwitch::on() ) {
+					\PerfLocale\Util\ResyncOff::refuse();
+				}
+
+				ResyncEntry::translations_bulk( $ids, $target_lang_ids, $preserve );
+				break;
+
 			case 'mt_translate':
 				if ( ! AdminController::bulk_mt_translate_available() ) {
 					$redirect( 'bulk_mt_unavailable' );
@@ -1879,11 +2148,19 @@ final class AdminForms {
 					set_transient( 'perflocale_bulk_mt_error_' . get_current_user_id(), $first_error, 5 * MINUTE_IN_SECONDS );
 				}
 
-				// Same for the first warning (a kept-source row, or a short title or excerpt).
-				$first_warning = (string) ( $r['first_warning'] ?? '' );
+				// Same for the warnings: the first (a kept-source row, a short title or excerpt), then each other pair an
+				// earlier stopped run left.
+				$warnings = array_values( array_unique( array_filter( array_merge( [ $r['first_warning'] ?? '' ], is_array( $r['redo_notes'] ?? null ) ? $r['redo_notes'] : [] ), static fn( mixed $w ): bool => is_string( $w ) && '' !== trim( $w ) ) ) );
+				$more     = is_numeric( $r['redo_notes_more'] ?? null ) ? max( 0, (int) $r['redo_notes_more'] ) : 0;
 
-				if ( $first_warning !== '' ) {
-					set_transient( 'perflocale_bulk_mt_warning_' . get_current_user_id(), $first_warning, 5 * MINUTE_IN_SECONDS );
+				if ( $more > 0 ) {
+					/* translators: %d: number of further warnings of the same kind that are not listed. */
+					$warnings[] = sprintf( _n( '%d more is not listed.', '%d more are not listed.', $more, 'perflocale' ), $more );
+				}
+
+				// One warning stays a string: the form a downgraded release reads.
+				if ( [] !== $warnings ) {
+					set_transient( 'perflocale_bulk_mt_warning_' . get_current_user_id(), 1 === count( $warnings ) ? $warnings[0] : $warnings, 5 * MINUTE_IN_SECONDS );
 				}
 
 				$redirect(
@@ -2053,8 +2330,9 @@ final class AdminForms {
 
 			// Buffer the build so a stray notice cannot land before the Content-Type header and corrupt the .po file.
 			ob_start();
-			$tmp   = wp_tempnam( 'perflocale-po-' );
-			$bytes = \PerfLocale\Admin\PoSync::export_to_file( $tmp, $lang );
+			$tmp    = wp_tempnam( 'perflocale-po-' );
+			$report = [];
+			$bytes  = \PerfLocale\Admin\PoSync::export_to_file( $tmp, $lang, '', $report, \PerfLocale\Strings\Domains::restricted_for_current_user() );
 			ob_end_clean();
 
 			if ( $bytes === false ) {
@@ -2172,7 +2450,8 @@ final class AdminForms {
 	 * Stream a finished `data_export` job's file as a download (admin_init, `perflocale_export_download=<JOB_ID>`).
 	 *
 	 * Gates: the per-job nonce, `perflocale_import_export` (as DataExportJob requires; Jobs screen users may lack it),
-	 * a complete data_export job with a `path`, and its realpath inside uploads/perflocale/exports/. Deleted after.
+	 * `manage_options` or JobAccess::may_handle() for the job, a complete data_export job with a `path`, and its realpath
+	 * inside uploads/perflocale/exports/. Deleted after.
 	 *
 	 * @return void
 	 */
@@ -2200,6 +2479,11 @@ final class AdminForms {
 		}
 
 		$job = \PerfLocale\Background\JobState::get( $job_id );
+
+		// Another user's export also needs manage_options (the export form's capability) or the job supervisor rights.
+		if ( is_array( $job ) && ! current_user_can( 'manage_options' ) && ! \PerfLocale\Background\JobAccess::may_handle( $job ) ) {
+			wp_die( esc_html__( 'Insufficient permissions.', 'perflocale' ), '', [ 'response' => 403 ] );
+		}
 
 		if ( ! is_array( $job )
 			|| ( $job['type'] ?? '' ) !== 'data_export'
@@ -2338,16 +2622,6 @@ final class AdminForms {
 	}
 
 	/**
-	 * The create notice's warnings of a translate_post() result, or ''; MtCreateNotice loads only for a warned create.
-	 *
-	 * @param array<string, mixed> $result translate_post() result.
-	 * @return string
-	 */
-	private static function mt_warning( array $result ): string {
-		return isset( $result['builder_warning'] ) || isset( $result['length_warning'] ) ? MtCreateNotice::warning_of( $result ) : '';
-	}
-
-	/**
 	 * Handle "Create translation" from the Translations panel (the classic metabox and host plugins' panels).
 	 * Docs: docs-ai/11-code-rationale.md, "AdminController: Create translation".
 	 *
@@ -2382,15 +2656,20 @@ final class AdminForms {
 		$existing = $manager->get_translation_id( $source_id, $target_lang );
 
 		if ( $existing !== null && get_post( $existing ) ) {
+			// Listed as missing on the panel: say why nothing can be created, naming no post.
+			if ( \PerfLocale\Api\TranslationsController::hidden_translation( $source_id, (int) $existing ) ) {
+				wp_die( esc_html( \PerfLocale\Api\TranslationsController::unavailable_message( $target_lang ) ), '', [ 'response' => 403 ] );
+			}
+
 			$new_id = (int) $existing;
 		}
 
-		// create_translation() copies from get_copy_source_id()'s post: checked too, before any provider call (0: nothing
-		// would be created).
+		// create_translation() copies from get_copy_source_id()'s post: edit and read on it, also when it is the post
+		// clicked (edit alone does not prove read), before any provider call (0: nothing would be created).
 		$copy_from = $manager->get_copy_source_id( $source_id, $target_lang );
 
-		if ( $copy_from > 0 && $copy_from !== $source_id && ! \PerfLocale\Helper::user_can_copy_translation_source( $copy_from ) ) {
-			wp_die( esc_html__( 'You cannot edit the original this translation is copied from.', 'perflocale' ), '', [ 'response' => 403 ] );
+		if ( $copy_from > 0 && ! \PerfLocale\Helper::user_can_copy_translation_source( $copy_from ) ) {
+			wp_die( esc_html( \PerfLocale\Api\TranslationsController::source_refusal( $copy_from, $target_lang )->get_error_message() ), '', [ 'response' => 403 ] );
 		}
 
 		// The new post takes the copy source's type: that type's create capability.
@@ -2399,53 +2678,34 @@ final class AdminForms {
 		}
 
 		// Machine translation only for languages in mt_auto_translate_languages (empty: all); others get a clean stub.
-		$auto_scope  = (array) $settings->get( 'mt_auto_translate_languages', [] );
-		$mt_in_scope = ( $auto_scope === [] || in_array( $target_lang, $auto_scope, true ) );
-
-		// Only when a translation is about to be created and no link row exists; needs the MT capability, the REST rate
-		// limit, core edit_post on the source and the password filter. admit() last (it counts). A refusal gives the stub.
-		$source_post   = get_post( $source_id );
+		$mt_in_scope   = \PerfLocale\MachineTranslation\MtOnCreate::in_scope( $plugin->settings(), $target_lang );
 		$mt_reason     = '';
 		$mt_reason_own = false;
 		$mt_warning    = '';
 
-		if (
-			$copy_from > 0
-			&& $existing === null
-			&& $settings->mt_enabled()
-			&& (bool) $settings->get( 'mt_auto_translate_on_create' )
-			&& $mt_in_scope
-			&& current_user_can( 'perflocale_use_mt' )
-			&& current_user_can( 'edit_post', $source_id )
-			&& $source_post instanceof \WP_Post
-		) {
-			$throttled = null;
+		// Only when a translation is about to be created and no link row exists, of the post copied. A refusal or failure
+		// gives the stub; a queued one goes back to the post clicked.
+		if ( $copy_from > 0 && $existing === null ) {
+			$plain = static fn(): array => [ $manager->create_translation( $source_id, $target_lang, $mt_in_scope ), false ];
+			$mt    = \PerfLocale\MachineTranslation\MtOnCreate::run( $plugin->settings(), $plugin->cache(), $copy_from, $target_lang, $plain );
 
-			if ( ! \PerfLocale\MachineTranslation\TranslationService::may_send_post( $source_post, 'auto_create' ) ) {
-				$mt_reason = __( 'The original is password-protected, and machine translation does not send password-protected posts when a translation is created.', 'perflocale' );
-			} else {
-				$throttled = \PerfLocale\Translation\MtRateLimiter::admit( get_current_user_id() );
+			// Another Create of the pair is paying the provider: a stub now would take the slot it fills.
+			if ( $mt['busy'] ) {
+				wp_die(
+					esc_html( $mt['reason'] ),
+					'',
+					[
+						'response'  => 409,
+						'back_link' => true,
+					]
+				);
 			}
 
-			if ( $throttled instanceof \WP_Error ) {
-				$mt_reason = $throttled->get_error_message();
-			} elseif ( '' === $mt_reason ) {
-				try {
-					$mt_service = new \PerfLocale\MachineTranslation\TranslationService( $settings, $cache );
-					$result     = $mt_service->translate_post( $source_id, $target_lang );
-					$new_id     = $result['post_id'] ?? false;
-					$mt_warning = self::mt_warning( $result );
-
-					if ( ! $new_id ) {
-						$mt_reason = __( 'The machine translation returned no translation.', 'perflocale' );
-					}
-				} catch ( \Throwable $e ) {
-					// MT failed (save guard refusal, provider error): the stub below, with the reason shown.
-					$new_id        = false;
-					$mt_reason     = $e->getMessage();
-					$mt_reason_own = $e instanceof \PerfLocale\MachineTranslation\NotSavedException;
-				}
-			}
+			// Queued, or the pair's jobs unread: back to the post clicked with the notice, no stub.
+			$new_id        = $mt['queued'] || $mt['unread'] ? $source_id : ( $mt['id'] > 0 ? $mt['id'] : false );
+			$mt_reason     = $mt['reason'];
+			$mt_reason_own = $mt['own'];
+			$mt_warning    = $mt['warning'];
 		}
 
 		// The stub: out-of-scope languages get it empty (auto-MT can fill it later), other fallbacks copy the source.
@@ -2458,13 +2718,13 @@ final class AdminForms {
 		}
 
 		if ( '' !== $mt_reason ) {
-			MtCreateNotice::remember( is_numeric( $new_id ) ? (int) $new_id : 0, $mt_reason, $mt_reason_own );
+			MtCreateNotice::remember( $new_id, $mt_reason, $mt_reason_own );
 		} elseif ( '' !== $mt_warning ) {
-			MtCreateNotice::remember_warning( is_numeric( $new_id ) ? (int) $new_id : 0, $mt_warning );
+			MtCreateNotice::remember_warning( $new_id, $mt_warning );
 		}
 
-		// A translation the user may not view is never named: back to the source, whose panel shows "Translated".
-		$named = is_numeric( $new_id ) ? (int) $new_id : 0;
+		// A translation the user may not view is never named (one linked meanwhile): back to the source.
+		$named = $new_id;
 
 		if ( $named !== $source_id && ! \PerfLocale\Helper::user_can_view_object( $named ) ) {
 			$new_id = $source_id;
@@ -2518,8 +2778,9 @@ final class AdminForms {
 		// The new term is seeded from get_copy_source_id()'s term: checked too.
 		$copy_from = $manager->get_copy_source_id( $source_id, $taxonomy, $target_lang );
 
+		// A term the user may not edit is left out of its maps: refused naming none.
 		if ( $copy_from > 0 && $copy_from !== $source_id && ! current_user_can( 'edit_term', $copy_from ) ) {
-			wp_die( esc_html__( 'You cannot edit the original this translation is copied from.', 'perflocale' ), '', [ 'response' => 403 ] );
+			wp_die( esc_html( \PerfLocale\Api\TranslationsController::source_unavailable_message( $target_lang ) ), '', [ 'response' => 403 ] );
 		}
 
 		// wp_insert_term() checks no capability: the copy source taxonomy's own create rule.
@@ -2775,22 +3036,24 @@ final class AdminForms {
 	}
 
 	/**
-	 * Process the dashboard's quick actions (clear cache, refresh permalinks).
+	 * Process the dashboard's quick actions (clear cache, refresh permalinks): POST only, so a GET (an old link, a
+	 * prefetch) does no work and shows the screen.
 	 *
 	 * @return void
 	 */
 	public function process_dashboard_actions(): void {
+		// phpcs:ignore WordPress.Security.NonceVerification.Missing
+		if ( empty( $_POST['perflocale_dashboard_action'] ) ) {
+			return;
+		}
+
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
 		if ( ! isset( $_GET['page'] ) || $_GET['page'] !== 'perflocale' ) {
 			return;
 		}
 
-		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
-		$action = isset( $_GET['perflocale_action'] ) ? sanitize_text_field( wp_unslash( $_GET['perflocale_action'] ) ) : '';
-
-		if ( empty( $action ) ) {
-			return;
-		}
+		// phpcs:ignore WordPress.Security.NonceVerification.Missing -- Verified next, before any work.
+		$action = is_string( $_POST['perflocale_dashboard_action'] ) ? sanitize_key( wp_unslash( $_POST['perflocale_dashboard_action'] ) ) : '';
 
 		// Nonce first (check_admin_referer() dies on failure), then capability.
 		check_admin_referer( 'perflocale_dashboard_action' );
@@ -2812,12 +3075,63 @@ final class AdminForms {
 
 			$redirect = add_query_arg( 'perflocale_notice', 'cache_cleared', $redirect );
 		} elseif ( $action === 'flush_permalinks' ) {
-			flush_rewrite_rules();
+			// The deferred flush (one claimer, on the next request's init), asked at most every 10 seconds: repeated clicks
+			// make one flush.
+			if ( \PerfLocale\Concurrency\Lock::acquire( 'dashboard_flush_permalinks', 10 ) ) {
+				update_option( 'perflocale_flush_rules', 1, true );
+			}
 
 			$redirect = add_query_arg( 'perflocale_notice', 'permalinks_flushed', $redirect );
 		}
 
 		wp_safe_redirect( $redirect );
+		exit;
+	}
+
+	/**
+	 * Apply, reject or undo one held update (admin-post), then return to its screen.
+	 *
+	 * @param string $kind 'apply', 'reject' or 'undo'.
+	 * @return void
+	 */
+	public static function handle_review( string $kind ): void {
+		$id = \PerfLocale\Util\Scalar::int( $_POST['change'] ?? 0 ); // phpcs:ignore WordPress.Security.NonceVerification.Missing, WordPress.Security.ValidatedSanitizedInput -- A non-negative integer through Scalar::int(), never output or stored as text; it scopes the nonce action verified next, and nothing is acted upon before.
+		check_admin_referer( 'perflocale_review_' . $kind . '_' . $id );
+
+		$row = ( new \PerfLocale\Database\Repository\PendingChangeRepository() )->find( $id );
+
+		// A change the user may not decide answers as a missing one, so its existence is not disclosed.
+		if ( null === $row || ! current_user_can( 'string' === $row['object_type'] ? 'perflocale_manage_translations' : 'perflocale_translate' )
+			|| ! \PerfLocale\Automation\ChangeService::may_decide( $row, 'approve' ) ) {
+			wp_die( esc_html__( 'The change no longer exists.', 'perflocale' ), '', [ 'response' => 404 ] );
+		}
+
+		if ( 'apply' === $kind ) {
+			$kses_ok = '1' === \PerfLocale\Util\Scalar::str( wp_unslash( $_POST['kses_ok'] ?? '' ) ); // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Compared as string === '1' only; never output, stored or used in SQL.
+			$edit    = '1' === \PerfLocale\Util\Scalar::str( wp_unslash( $_POST['edit'] ?? '' ) ); // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Compared as string === '1' only; never output, stored or used in SQL.
+			$outcome = \PerfLocale\Automation\ChangeService::approve( $id, null, $kses_ok );
+			$link    = $outcome['ok'] && $edit && 'post' === $row['object_type'] ? ObjectLinks::edit_url( $row['object_id'] ) : '';
+
+			if ( '' !== $link ) {
+				wp_safe_redirect( $link );
+				exit;
+			}
+		} else {
+			$outcome = 'reject' === $kind ? \PerfLocale\Automation\ChangeService::reject( $id ) : \PerfLocale\Automation\ChangeService::undo( $id );
+		}
+
+		$url = 'string' === $row['object_type']
+			? add_query_arg(
+				[
+					'page'                     => 'perflocale-strings',
+					StringReview::OUTCOME_FLAG => $id,
+					'outcome'                  => sanitize_key( $outcome['code'] ),
+				],
+				admin_url( 'admin.php' )
+			)
+			: add_query_arg( 'outcome', sanitize_key( $outcome['code'] ), ReviewUpdate::url( $id ) );
+
+		wp_safe_redirect( $url );
 		exit;
 	}
 }

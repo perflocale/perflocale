@@ -274,6 +274,10 @@ final class FormatLocale {
 	 * @return string
 	 */
 	public static function intl( float $value, string $locale, string $currency = '', ?int $decimals = null ): string {
+		if ( ! class_exists( '\\NumberFormatter' ) ) {
+			return '';
+		}
+
 		$style = $currency === '' ? \NumberFormatter::DECIMAL : \NumberFormatter::CURRENCY;
 		$key   = $locale . '|' . $style . '|' . $decimals;
 

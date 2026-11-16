@@ -41,6 +41,47 @@ abstract class AbstractJob {
 	abstract public function get_required_capability(): string;
 
 	/**
+	 * Capability a dispatch with these args needs; the worker checks it again for the stored `created_by` user.
+	 *
+	 * @since 1.0.8
+	 * @param array<mixed> $args Job args.
+	 * @return string The type's own capability unless a job narrows it for some args.
+	 */
+	public function required_capability_for( array $args ): string {
+		unset( $args );
+
+		return $this->get_required_capability();
+	}
+
+	/**
+	 * Capabilities every run needs besides required_capability_for(), as the job's own screen asks: JobAccess::ALSO_REQUIRES,
+	 * so the job lists need no job class.
+	 *
+	 * @since 1.0.8
+	 * @return list<string>
+	 */
+	public function also_requires(): array {
+		return JobAccess::ALSO_REQUIRES[ $this->get_type() ] ?? [];
+	}
+
+	/**
+	 * Whether the user (null: the current one) holds every capability of also_requires().
+	 *
+	 * @since 1.0.8
+	 * @param int|null $user_id User; null for the current user.
+	 * @return bool
+	 */
+	final public function holds_also_required( ?int $user_id = null ): bool {
+		foreach ( $this->also_requires() as $capability ) {
+			if ( ! ( null === $user_id ? current_user_can( $capability ) : user_can( $user_id, $capability ) ) ) {
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	/**
 	 * Auto mode runs the job in the background when args_size() reaches this.
 	 *
 	 * @return int
@@ -156,6 +197,17 @@ abstract class AbstractJob {
 	 * @return bool
 	 */
 	public function starts_next_when_done(): bool {
+		return false;
+	}
+
+	/**
+	 * Whether an identical twin the caller may not handle counts as this dispatch queued (it does the same work)
+	 * instead of a refusal; the twin's id, state and log stay its own.
+	 *
+	 * @since 1.0.8
+	 * @return bool
+	 */
+	public function joins_hidden_twin(): bool {
 		return false;
 	}
 

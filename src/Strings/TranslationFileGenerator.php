@@ -9,8 +9,12 @@ declare( strict_types=1 );
 
 namespace PerfLocale\Strings;
 
+use PerfLocale\Background\BackgroundEvents;
+use PerfLocale\Bootstrap;
 use PerfLocale\Cache\CacheManager;
+use PerfLocale\Concurrency\Lock;
 use PerfLocale\Database\Schema;
+use PerfLocale\Util\Scalar;
 
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
@@ -32,12 +36,41 @@ final class TranslationFileGenerator {
 	public const MANIFEST_OPTION = 'perflocale_l10n_manifest';
 
 	/**
+	 * Languages a run stopped inside (memory or time), skipped until their row count or memory_limit changes:
+	 * ['running' => [locale, rows, limit, started] while one is built, 'too_large' => [locale => [rows, limit, at]]].
+	 *
+	 * @var string
+	 */
+	public const TOO_LARGE_OPTION = 'perflocale_l10n_too_large';
+
+	/**
+	 * Lock serializing runs, so a 'running' entry another run finds is one that died, never one still building.
+	 *
+	 * @var string
+	 */
+	public const LOCK = 'l10n_regen';
+
+	/**
+	 * Lock TTL in seconds, renewed per read range and per language: a run that died frees the lock this long after.
+	 *
+	 * @var int
+	 */
+	public const LOCK_TTL = 120;
+
+	/**
+	 * Seconds after which a 'running' entry with the lock free is reported as a run that died (Site Health).
+	 *
+	 * @var int
+	 */
+	public const RUN_STALE_AFTER = 300;
+
+	/**
 	 * Combined bundle format version the loader requires: bump it on any change to TranslationFileLoader::map_key() or
 	 * the bundle's shape, or an older bundle is served with keys that never match.
 	 *
 	 * @var int
 	 */
-	public const COMBINED_VERSION = 1;
+	public const COMBINED_VERSION = 2;
 
 	/**
 	 * Filename prefix of the combined bundle; shared so the loader builds the name from its own suffix without another
@@ -55,6 +88,13 @@ final class TranslationFileGenerator {
 	private const RELINK_BATCH = 200;
 
 	/**
+	 * Strings read per query while one language's files are built.
+	 *
+	 * @var int
+	 */
+	private const READ_BATCH = 2000;
+
+	/**
 	 * @var CacheManager
 	 */
 	private readonly CacheManager $cache;
@@ -67,11 +107,25 @@ final class TranslationFileGenerator {
 	private array $read_failed_locales = [];
 
 	/**
+	 * Locales the last generate_all() skipped as too large (TOO_LARGE_OPTION); their files were kept.
+	 *
+	 * @var string[]
+	 */
+	private array $skipped_locales = [];
+
+	/**
 	 * Translation rows the last generate_all()'s orphan repair removed or linked again.
 	 *
 	 * @var int
 	 */
 	private int $repaired_count = 0;
+
+	/**
+	 * Whether the last generate_all() found another run holding the lock and queued a full run instead.
+	 *
+	 * @var bool
+	 */
+	private bool $queued = false;
 
 	/**
 	 * Constructor.
@@ -95,8 +149,40 @@ final class TranslationFileGenerator {
 	 */
 	public function generate_all( ?array $only_language_ids = null ): int {
 		$this->read_failed_locales = [];
+		$this->skipped_locales     = [];
 		$this->repaired_count      = 0;
+		$this->queued              = false;
 
+		if ( ! Lock::acquire( self::LOCK, self::LOCK_TTL ) ) {
+			$this->queued = true;
+
+			// One background full run (a superset of any scoped request); it queues itself again while the lock is held.
+			if ( ! BackgroundEvents::is_scheduled( Bootstrap::FILES_REGENERATE_HOOK, [] ) ) {
+				BackgroundEvents::enqueue( Bootstrap::FILES_REGENERATE_HOOK, [], intdiv( self::LOCK_TTL, 4 ) );
+			}
+
+			return 0;
+		}
+
+		try {
+			return $this->generate_locked( $only_language_ids );
+		} catch ( \UnderflowException $lost ) {
+			// The lock expired and another run took it over: that run owns the markers and the manifest now.
+			return 0;
+		} finally {
+			Lock::release( self::LOCK );
+		}
+	}
+
+	/**
+	 * generate_all() under the lock.
+	 *
+	 * @param int[]|null $only_language_ids See generate_all().
+	 * @return int
+	 *
+	 * @throws \UnderflowException When the lock was lost (keep_lock()).
+	 */
+	private function generate_locked( ?array $only_language_ids ): int {
 		$this->ensure_directory();
 
 		$lang_repo = \PerfLocale\Plugin::get_instance()->get( 'lang_repo' );
@@ -136,114 +222,88 @@ final class TranslationFileGenerator {
 		$repair               = $this->repair_orphaned_translations();
 		$this->repaired_count = $repair['dangling'] + $repair['repaired_rows'];
 
-		// Fetch all translated strings grouped by domain and language.
-		$failed_language_ids = [];
-		$all_translations    = $this->fetch_all_translations( $languages, $failed_language_ids );
+		// Smallest language first, each listed in the manifest once written: one too large for memory cannot keep the
+		// smaller ones from being served.
+		$sizes = $this->language_sizes();
+		usort( $languages, static fn( $a, $b ): int => ( $sizes[ Scalar::int( Scalar::prop( $a, 'id' ) ) ] ?? 0 ) <=> ( $sizes[ Scalar::int( Scalar::prop( $b, 'id' ) ) ] ?? 0 ) );
 
-		// A language whose read failed has an unknown state, not an empty one: it leaves this run, its files and manifest
-		// entries stay, and the failure is reported.
-		if ( $failed_language_ids !== [] ) {
-			$healthy = [];
-
-			foreach ( $languages as $language ) {
-				if ( in_array( (int) $language->id, $failed_language_ids, true ) ) {
-					$failed_locale               = (string) $language->locale;
-					$this->read_failed_locales[] = $failed_locale;
-					unset( $all_translations[ $failed_locale ] );
-					$this->report_read_failure( $failed_locale );
-					continue;
-				}
-
-				$healthy[] = $language;
-			}
-
-			$languages = $healthy;
-		}
-
-		// Step 1: the target state (path => content) without touching disk; empty sets make no file (step 3 removes it).
-		// Each locale also gets one combined bundle in map_key() form, kept apart because a stale bundle shadows the files.
+		// One language at a time (read in id ranges, written, then freed), so memory holds the largest language, not all.
 		$target          = [];
 		$combined_target = [];
+		$healthy         = [];
+		$count           = 0;
 
-		foreach ( $all_translations as $locale => $domains ) {
-			$combined_map = [];
+		// A language a run stopped inside (a fatal cannot be caught: a marker is written before and cleared after each one)
+		// is skipped while its row count and memory_limit are unchanged; its files stay, as on a failed read.
+		$limit = (string) ini_get( 'memory_limit' );
+		$state = (array) get_option( self::TOO_LARGE_OPTION, [] );
+		$big   = (array) ( $state['too_large'] ?? [] );
 
-			foreach ( $domains as $domain => $messages ) {
-				if ( empty( $messages ) ) {
-					continue;
-				}
-
-				$path            = $this->compute_l10n_path( $domain, $locale );
-				$target[ $path ] = $this->compute_l10n_content( $messages );
-
-				foreach ( $messages as $key => $value ) {
-					// Keys are `context\x04original`; a numeric original is an int array key, so stringify as the loader reads it.
-					$context  = '';
-					$original = $key;
-
-					if ( is_string( $key ) && str_contains( $key, "\x04" ) ) {
-						[ $context, $original ] = explode( "\x04", $key, 2 );
-					}
-
-					$combined_map[ TranslationFileLoader::map_key( $domain, $context, strval( $original ) ) ] = $value;
-				}
-			}
-
-			if ( $combined_map !== [] ) {
-				$combined_target[ $this->compute_combined_path( (string) $locale ) ] = $this->compute_combined_content( $combined_map );
-			}
+		// Under the lock, a 'running' entry is a run that died.
+		if ( is_array( $state['running'] ?? null ) ) {
+			$run                                 = $state['running'];
+			$big[ Scalar::str( $run[0] ?? '' ) ] = [ Scalar::int( $run[1] ?? 0 ), Scalar::str( $run[2] ?? '' ), time() ];
 		}
-
-		// A changed or obsolete combined bundle is deleted before any per-domain change and the new one written last;
-		// an unchanged one stays.
-		$combined_pending = [];
 
 		foreach ( $languages as $language ) {
 			$locale = isset( $language->locale ) ? (string) $language->locale : '';
+			$rows   = $sizes[ Scalar::int( Scalar::prop( $language, 'id' ) ) ] ?? 0;
+			$seen   = (array) ( $big[ $locale ] ?? [] );
 
-			if ( $locale === '' ) {
+			if ( [] !== $seen && $rows === ( $seen[0] ?? null ) && $limit === ( $seen[1] ?? null ) ) {
+				$this->skipped_locales[] = $locale;
 				continue;
 			}
 
-			$cpath = $this->compute_combined_path( $locale );
-			$fresh = $combined_target[ $cpath ] ?? null;
+			unset( $big[ $locale ] );
+			$this->keep_lock();
+			update_option(
+				self::TOO_LARGE_OPTION,
+				[
+					'running'   => [ $locale, $rows, $limit, time() ],
+					'too_large' => $big,
+				],
+				false
+			);
+			$messages = $this->fetch_language( $language );
 
-			if ( $fresh !== null && is_file( $cpath ) && md5_file( $cpath ) === md5( $fresh ) ) {
+			// A language whose read failed has an unknown state, not an empty one: it leaves this run, its files and manifest
+			// entries stay, and the failure is reported.
+			if ( null === $messages ) {
+				$this->read_failed_locales[] = $locale;
+				$this->report_read_failure( $locale );
 				continue;
 			}
 
-			if ( is_file( $cpath ) ) {
-				wp_delete_file( $cpath );
+			$healthy[] = $language;
+			$this->keep_lock();
 
-				if ( function_exists( 'opcache_invalidate' ) ) {
-					opcache_invalidate( $cpath, true );
-				}
+			if ( '' !== $locale ) {
+				$count += $this->write_language( $locale, $messages, $target, $combined_target );
+				$this->list_language( $locale, array_keys( $target + $combined_target ) );
 			}
 
-			if ( $fresh !== null ) {
-				$combined_pending[ $cpath ] = $fresh;
-			}
+			unset( $messages );
 		}
 
-		// Step 2: write only changed files (md5 compare), and count only writes that landed: the count is what the
-		// Regenerate screen shows.
-		$count = 0;
-
-		foreach ( $target as $path => $content ) {
-			if ( is_file( $path ) && md5_file( $path ) === md5( $content ) ) {
-				continue;
-			}
-
-			if ( $this->write_l10n_file( $path, $content ) ) {
-				++$count;
-			}
+		// The run ended: no language is being built; a full run forgets entries of languages no longer active.
+		if ( null === $only_language_ids ) {
+			$big = array_intersect_key( $big, array_flip( $this->skipped_locales ) );
 		}
+
+		if ( [] === $big ) {
+			delete_option( self::TOO_LARGE_OPTION );
+		} else {
+			update_option( self::TOO_LARGE_OPTION, [ 'too_large' => $big ], false );
+		}
+
+		$languages = $healthy;
 
 		// Step 3: delete files outside the target state, after the writes so no request sees an empty directory. A scoped run
 		// (subset, failed reads) keeps other languages' files.
 		$subset_suffixes = null;
 
-		if ( $only_language_ids !== null || $this->read_failed_locales !== [] ) {
+		if ( $only_language_ids !== null || $this->read_failed_locales !== [] || $this->skipped_locales !== [] ) {
 			$subset_suffixes = array_map(
 				static fn( $lang ): string => '-' . sanitize_file_name( (string) $lang->locale ) . '.l10n.php',
 				$languages
@@ -280,11 +340,6 @@ final class TranslationFileGenerator {
 			}
 		}
 
-		// Combined bundles last, once the directory is settled; not counted (an internal cache tier).
-		foreach ( $combined_pending as $cpath => $content ) {
-			$this->write_l10n_file( $cpath, $content );
-		}
-
 		// Step 4: the manifest, filtered through is_file() (an intended path is not a written one) after clearstatcache()
 		// (WP_Filesystem::move() leaves the stat cache stale). A bundle not listed is never trusted.
 		clearstatcache();
@@ -302,6 +357,159 @@ final class TranslationFileGenerator {
 		update_option( self::MANIFEST_OPTION, $manifest, true );
 
 		return $count;
+	}
+
+	/**
+	 * Write one locale's per-domain files and combined bundle (unchanged files skipped); records their paths.
+	 * A changed bundle is deleted before the per-domain writes and the new one written after them.
+	 *
+	 * @param string                               $locale          Locale.
+	 * @param array<string, array<string, string>> $messages        [domain => [key => translation]].
+	 * @param array<string, true>                  $target          Per-domain paths of this run (updated).
+	 * @param array<string, true>                  $combined_target Bundle paths of this run (updated).
+	 * @return int Per-domain files written.
+	 */
+	private function write_language( string $locale, array $messages, array &$target, array &$combined_target ): int {
+		$files        = [];
+		$combined_map = [];
+
+		foreach ( $messages as $domain => $domain_messages ) {
+			if ( empty( $domain_messages ) ) {
+				continue;
+			}
+
+			$domain          = (string) $domain;
+			$path            = $this->compute_l10n_path( $domain, $locale );
+			$files[ $path ]  = $this->compute_l10n_content( $domain_messages );
+			$target[ $path ] = true;
+
+			foreach ( $domain_messages as $key => $value ) {
+				// Keys are `context\x04original`; a numeric original is an int array key, so stringify as the loader reads it.
+				$context  = '';
+				$original = $key;
+
+				if ( is_string( $key ) && str_contains( $key, "\x04" ) ) {
+					[ $context, $original ] = explode( "\x04", $key, 2 );
+				}
+
+				$combined_map[ TranslationFileLoader::map_key( $domain, $context, strval( $original ) ) ] = $value;
+			}
+		}
+
+		$cpath = $this->compute_combined_path( $locale );
+		$fresh = null;
+
+		if ( $combined_map !== [] ) {
+			$fresh                     = $this->compute_combined_content( $combined_map );
+			$combined_target[ $cpath ] = true;
+		}
+
+		unset( $combined_map );
+
+		$bundle_current = null !== $fresh && is_file( $cpath ) && md5_file( $cpath ) === md5( $fresh );
+
+		if ( ! $bundle_current && is_file( $cpath ) ) {
+			wp_delete_file( $cpath );
+
+			if ( function_exists( 'opcache_invalidate' ) ) {
+				opcache_invalidate( $cpath, true );
+			}
+		}
+
+		// Only changed files, and only writes that landed: the count is what the Regenerate screen shows.
+		$count = 0;
+
+		foreach ( $files as $path => $content ) {
+			if ( is_file( $path ) && md5_file( $path ) === md5( $content ) ) {
+				continue;
+			}
+
+			if ( $this->write_l10n_file( $path, $content ) ) {
+				++$count;
+			}
+		}
+
+		// The bundle (an internal cache tier, not counted) last for this locale.
+		if ( null !== $fresh && ! $bundle_current ) {
+			$this->write_l10n_file( $cpath, $fresh );
+		}
+
+		return $count;
+	}
+
+	/**
+	 * Translated rows per language id, for the write order; [] when the read fails (the active order then).
+	 *
+	 * @return array<int, int>
+	 */
+	private function language_sizes(): array {
+		global $wpdb;
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- One grouped count per run, on the language_id index.
+		$rows  = $wpdb instanceof \wpdb ? $wpdb->get_results( $wpdb->prepare( "SELECT language_id, COUNT(*) AS n FROM %i WHERE translation != '' GROUP BY language_id", Schema::table( 'string_translations' ) ) ) : null;
+		$sizes = [];
+
+		foreach ( is_array( $rows ) ? $rows : [] as $row ) {
+			$sizes[ Scalar::int( Scalar::prop( $row, 'language_id' ) ) ] = Scalar::int( Scalar::prop( $row, 'n' ) );
+		}
+
+		return $sizes;
+	}
+
+	/**
+	 * List the files written so far in the manifest at once (the written language's earlier entries replaced); the run's
+	 * end writes the full manifest.
+	 *
+	 * @param string   $locale Locale.
+	 * @param string[] $paths  Paths this run wrote or kept so far.
+	 * @return void
+	 */
+	private function list_language( string $locale, array $paths ): void {
+		$suffix   = '-' . sanitize_file_name( $locale ) . '.l10n.php';
+		$manifest = array_filter( (array) get_option( self::MANIFEST_OPTION, [] ), static fn( $name ): bool => is_string( $name ) && ! str_ends_with( $name, $suffix ) );
+
+		clearstatcache();
+
+		foreach ( $paths as $path ) {
+			if ( is_file( $path ) ) {
+				$manifest[] = basename( $path );
+			}
+		}
+
+		$manifest = array_values( array_unique( $manifest ) );
+		sort( $manifest );
+		update_option( self::MANIFEST_OPTION, $manifest, true );
+	}
+
+	/**
+	 * Renew the run lock; a run that lost it stops before its next read or write.
+	 *
+	 * @return void
+	 *
+	 * @throws \UnderflowException When another run holds the lock now.
+	 */
+	private function keep_lock(): void {
+		if ( ! Lock::renew( self::LOCK, self::LOCK_TTL ) ) {
+			throw new \UnderflowException( 'lock lost' );
+		}
+	}
+
+	/**
+	 * Locales the last generate_all() skipped as too large; their files were kept.
+	 *
+	 * @return string[]
+	 */
+	public function get_skipped_locales(): array {
+		return $this->skipped_locales;
+	}
+
+	/**
+	 * Whether the last generate_all() was queued behind another run (it wrote nothing).
+	 *
+	 * @return bool
+	 */
+	public function was_queued(): bool {
+		return $this->queued;
 	}
 
 	/**
@@ -614,7 +822,7 @@ final class TranslationFileGenerator {
 		}
 		// phpcs:enable
 
-		// No cache flush: fetch_all_translations() reads the tables directly.
+		// No cache flush: fetch_language() reads the tables directly.
 
 		return $out;
 	}
@@ -653,33 +861,30 @@ final class TranslationFileGenerator {
 	}
 
 	/**
-	 * Every string translation by locale and domain; a language whose reads fail is left out and its id added to
-	 * $failed_language_ids, so a database error never reads as no translations.
+	 * One language's translations by domain, read in string id ranges of READ_BATCH rows.
 	 *
-	 * @param array<int, object> $languages           Active languages.
-	 * @param int[]              $failed_language_ids Receives the ids of languages whose reads failed.
-	 * @return array<string, array<string, array<string, string>>> [locale => [domain => [original => translation]]].
+	 * @param object $language An active language (id, locale).
+	 * @return array<string, array<string, string>>|null [domain => [key => translation]]; null when a read failed.
+	 *
+	 * @throws \UnderflowException When the run lost its lock (keep_lock()).
 	 */
-	private function fetch_all_translations( array $languages, array &$failed_language_ids ): array {
+	private function fetch_language( object $language ): ?array {
 		// phpcs:disable PluginCheck.Security.DirectDB.UnescapedDBParameter
 		global $wpdb;
 
-		$strings_table     = Schema::table( 'strings' );
-		$links_table       = Schema::table( 'translation_links' );
-		$groups_table      = Schema::table( 'translation_groups' );
+		$language_id = (int) ( $language->id ?? 0 );
+		$result      = [];
+
+		if ( empty( $language->locale ) || ! $wpdb instanceof \wpdb ) {
+			return $result;
+		}
+
+		$tables            = [ Schema::table( 'strings' ), Schema::table( 'translation_groups' ), Schema::table( 'translation_links' ) ];
 		$translations_repo = new \PerfLocale\Database\Repository\StringTranslationRepository( $this->cache );
+		$after             = 0;
 
-		$result = [];
-
-		foreach ( $languages as $language ) {
-			$language_id = (int) $language->id;
-			$locale      = $language->locale;
-
-			if ( empty( $locale ) ) {
-				continue;
-			}
-
-			// The language's translated strings.
+		do {
+			$this->keep_lock();
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 			$rows = $wpdb->get_results(
 				$wpdb->prepare(
@@ -688,68 +893,69 @@ final class TranslationFileGenerator {
 					INNER JOIN %i g
 						ON g.id = s.group_id AND g.type = 'string'
 					INNER JOIN %i l
-						ON l.group_id = s.group_id AND l.language_id = %d",
-					$strings_table,
-					$groups_table,
-					$links_table,
-					$language_id
+						ON l.group_id = s.group_id AND l.language_id = %d
+					WHERE s.id > %d
+					ORDER BY s.id
+					LIMIT %d",
+					$tables[0],
+					$tables[1],
+					$tables[2],
+					$language_id,
+					$after,
+					self::READ_BATCH
 				)
 			);
 
 			if ( ! is_array( $rows ) || $this->last_read_failed() ) {
-				$failed_language_ids[] = $language_id;
-				continue;
+				return null;
 			}
 
 			if ( $rows === [] ) {
-				continue;
+				break;
 			}
 
 			// One query on the (string_id, language_id) primary key (StringTranslationRepository::get_map()).
-			$string_ids = array_map( static fn( $row ): int => (int) $row->string_id, $rows );
+			$string_ids = array_map( static fn( $row ): int => Scalar::int( Scalar::prop( $row, 'string_id' ) ), $rows );
 			$tr_map     = $translations_repo->get_map( $string_ids, $language_id );
 
 			if ( $this->last_read_failed() ) {
-				$failed_language_ids[] = $language_id;
-				continue;
+				return null;
 			}
 
 			// Plural forms 2..N (Polish, Russian, Arabic), usually none.
 			$extra_map = $translations_repo->get_extra_forms_map( $string_ids, $language_id );
 
 			if ( $this->last_read_failed() ) {
-				$failed_language_ids[] = $language_id;
-				continue;
+				return null;
 			}
 
-			// By domain.
-			foreach ( $rows as $row ) {
-				$value = $tr_map[ (int) $row->string_id ] ?? '';
-
-				if ( $value === '' ) {
-					continue;
-				}
+			foreach ( $rows as $i => $row ) {
+				$value  = $tr_map[ $string_ids[ $i ] ] ?? '';
+				$domain = Scalar::str( Scalar::prop( $row, 'domain' ) );
 
 				// Internal output-buffer domains (leading "_", such as "_pfl_dyn") never go through gettext: no file for them.
-				if ( isset( $row->domain[0] ) && $row->domain[0] === '_' ) {
+				if ( $value === '' || str_starts_with( $domain, '_' ) ) {
 					continue;
 				}
 
-				$domain = $row->domain ?: 'default';
-
 				// A plural row with extra forms is stored NUL-joined (form1\0form2...), which the loader splits per CLDR form.
-				$extra = $extra_map[ (int) $row->string_id ] ?? null;
+				$extra = $extra_map[ $string_ids[ $i ] ] ?? null;
 
 				if ( is_array( $extra ) && $extra !== [] ) {
 					$value = $value . "\0" . implode( "\0", $extra );
 				}
 
 				// `context\x04original` for a string with context.
-				$key = ! empty( $row->context ) ? $row->context . "\x04" . $row->original : $row->original;
+				$context  = Scalar::str( Scalar::prop( $row, 'context' ) );
+				$original = Scalar::str( Scalar::prop( $row, 'original' ) );
+				$key      = ! empty( $context ) ? $context . "\x04" . $original : $original;
 
-				$result[ $locale ][ $domain ][ $key ] = $value;
+				$result[ $domain ?: 'default' ][ $key ] = $value;
 			}
-		}
+
+			$after = (int) end( $string_ids );
+			$full  = self::READ_BATCH === count( $rows );
+		} while ( $full );
 
 		// phpcs:enable PluginCheck.Security.DirectDB.UnescapedDBParameter
 		return $result;

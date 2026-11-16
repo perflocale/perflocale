@@ -261,7 +261,8 @@ final class WpmlSettingsReader {
 		$found = $this->wpdb->get_var( $this->wpdb->prepare( 'SHOW TABLES LIKE %s', $this->wpdb->esc_like( $table ) ) );
 		$this->note_error();
 
-		return is_string( $found ) && $found === $table;
+		// Without case: lower_case_table_names=1 answers an upper-case prefix in lower case.
+		return is_string( $found ) && 0 === strcasecmp( $found, $table );
 	}
 
 	/**

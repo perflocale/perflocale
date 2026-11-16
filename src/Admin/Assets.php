@@ -116,10 +116,14 @@ final class Assets {
 	/**
 	 * Enqueue the admin assets of the current screen.
 	 *
-	 * @param string $hook The current admin page hook.
+	 * @param mixed $hook The current admin page hook (mixed: iframe_header() passes null outside admin.php).
 	 * @return void
 	 */
-	public function enqueue( string $hook ): void {
+	public function enqueue( mixed $hook ): void {
+		if ( ! is_string( $hook ) ) {
+			return;
+		}
+
 		// Only load on PerfLocale admin pages.
 		if ( ! $this->is_perflocale_page( $hook ) ) {
 			$screen = get_current_screen();
@@ -662,6 +666,7 @@ final class Assets {
 			'perflocale_page_perflocale-addons',
 			'perflocale_page_perflocale-settings',
 			'perflocale_page_perflocale-jobs',
+			'admin_page_perflocale-review-update',
 		];
 
 		return in_array( $hook, $perflocale_hooks, true );

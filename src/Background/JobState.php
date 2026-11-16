@@ -92,6 +92,11 @@ final class JobState {
 	private const TERMINAL_STATUSES = [ 'complete', 'failed', 'canceled' ];
 
 	/**
+	 * Why the last reset_for_retry() of a data import was refused ('' otherwise).
+	 */
+	private static string $retry_refused = '';
+
+	/**
 	 * Job type => step for a run that ends outside its execute() (cancel, failure, dead worker).
 	 *
 	 * @var array<string, callable>
@@ -99,6 +104,7 @@ final class JobState {
 	private static array $run_end = [
 		'bulk_string_translate' => [ Jobs\BulkStringTranslateJob::class, 'publish_after_run' ],
 		'auto_translate'        => [ Jobs\AutoTranslateJob::class, 'run_ended' ],
+		'bulk_translate'        => [ Jobs\BulkTranslateJob::class, 'run_ended' ],
 	];
 
 	/**
@@ -328,11 +334,12 @@ final class JobState {
 	 * An identical job still queued or running on this blog: same type and byte-identical stored args, so other work of
 	 * the type runs in parallel and a chain whose cursor advances is never its own repeat. Uses `type_status`.
 	 *
-	 * @param string              $type Job type slug.
-	 * @param array<mixed, mixed> $args Worker args as passed to create().
+	 * @param string              $type       Job type slug.
+	 * @param array<mixed, mixed> $args       Worker args as passed to create().
+	 * @param int                 $created_by Only this user's job; -1 for anyone's.
 	 * @return string|null UUID of the in-flight twin, or null.
 	 */
-	public static function find_active_duplicate( string $type, array $args ): ?string {
+	public static function find_active_duplicate( string $type, array $args, int $created_by = -1 ): ?string {
 		global $wpdb;
 
 		$encoded = wp_json_encode( $args );
@@ -351,12 +358,15 @@ final class JobState {
 			   AND status IN ('queued', 'running')
 			   AND blog_id = %d
 			   AND args = %s
+			   AND ( %d < 0 OR created_by = %d )
 			 ORDER BY id ASC
 			 LIMIT 1",
 				$table,
 				$type,
 				function_exists( 'get_current_blog_id' ) ? (int) get_current_blog_id() : 0,
-				$encoded
+				$encoded,
+				$created_by,
+				$created_by
 			)
 		);
 
@@ -601,7 +611,7 @@ final class JobState {
 	 */
 	public static function store_resume( string $job_id, array $result, bool $count_attempt, int $generation = -1 ): bool {
 		global $wpdb;
-		$json = wp_json_encode( $result );
+		$json = wp_json_encode( self::plain_result( $result ) );
 
 		if ( ! $wpdb instanceof \wpdb || ! self::is_safe_id( $job_id ) ) {
 			return false;
@@ -662,7 +672,7 @@ final class JobState {
 		global $wpdb;
 		$table = Schema::table( 'jobs' );
 		$now   = current_time( 'mysql', true );
-		$json  = null !== $checkpoint ? wp_json_encode( $checkpoint ) : false;
+		$json  = null !== $checkpoint ? wp_json_encode( self::plain_result( $checkpoint ) ) : false;
 
 		// The checkpoint rides in the progress write; one over the cap is left out (the previous one stays).
 		$store = is_string( $json ) && strlen( $json ) <= self::MAX_RESULT_BYTES;
@@ -713,7 +723,7 @@ final class JobState {
 		$table = Schema::table( 'jobs' );
 		$now   = current_time( 'mysql', true );
 
-		$result_json = wp_json_encode( self::truncate_result( $result ) );
+		$result_json = wp_json_encode( self::truncate_result( self::plain_result( $result ) ) );
 		if ( $result_json === false ) {
 			$result_json = '[]';
 		}
@@ -761,7 +771,7 @@ final class JobState {
 		global $wpdb;
 		$table = Schema::table( 'jobs' );
 
-		$result_json = wp_json_encode( self::truncate_result( $result ) );
+		$result_json = wp_json_encode( self::truncate_result( self::plain_result( $result ) ) );
 		if ( $result_json === false ) {
 			return false;
 		}
@@ -837,6 +847,32 @@ final class JobState {
 	}
 
 	/**
+	 * Run a Cancel or Retry of this job (status write plus its event and lock cleanup) under the job's control lock, so
+	 * one cannot land inside the other. Null when another request holds it or the lock could not be written (busy).
+	 *
+	 * @internal
+	 * @since 1.0.8
+	 *
+	 * @template T
+	 * @param string        $job_id UUID.
+	 * @param callable(): T $fn     The transition; never returns null.
+	 * @return T|null
+	 */
+	public static function control( string $job_id, callable $fn ): mixed {
+		$name = 'job_ctl_' . $job_id;
+
+		if ( ! self::is_safe_id( $job_id ) || ! \PerfLocale\Concurrency\Lock::acquire( $name, 60 ) ) {
+			return null;
+		}
+
+		try {
+			return $fn();
+		} finally {
+			\PerfLocale\Concurrency\Lock::release( $name );
+		}
+	}
+
+	/**
 	 * User-initiated cancel: the worker sees it in its progress callback and stops. Unscheduling is the runner's job
 	 * (JobRunnerInterface::cancel()).
 	 *
@@ -874,7 +910,13 @@ final class JobState {
 			return false;
 		}
 
-		self::run_ended( $job_id );
+		$row = self::get( $job_id );
+		self::run_ended( $job_id, $row );
+
+		// An import no worker took keeps a full export in the temp folder; no worker will delete it. A failed read asks.
+		if ( null === $row || 'data_import' === ( $row['type'] ?? null ) ) {
+			Jobs\DataImportJob::canceled_unstarted( $job_id );
+		}
 
 		return true;
 	}
@@ -934,13 +976,50 @@ final class JobState {
 	 * @return bool True if the row existed and was reset.
 	 */
 	public static function reset_for_retry( string $job_id, bool $allow_canceled = false, int $generation = -1, int $owner = -1, int $version = -1 ): bool {
+		self::$retry_refused = '';
+
 		if ( ! self::is_safe_id( $job_id ) ) {
 			return false;
 		}
 
-		// A running row reset here lost its worker: read it first for its end-of-run step.
+		// A running row reset here lost its worker: read it first for its end-of-run step. A failed read resets nothing.
 		$before = self::get( $job_id );
 
+		if ( null === $before ) {
+			return false;
+		}
+
+		$reset = static fn(): bool => self::reset_row( $job_id, $before, $allow_canceled, $generation, $owner, $version );
+
+		// A data import no worker holds goes back to queued under the import lock, only with its staged file there.
+		if ( 'data_import' === ( $before['type'] ?? null ) && 'running' !== ( $before['status'] ?? null ) ) {
+			return Jobs\DataImportJob::requeue( $before, $reset, self::$retry_refused );
+		}
+
+		return $reset();
+	}
+
+	/**
+	 * Why the last reset_for_retry() of a data import was refused ('' otherwise), for the caller's message.
+	 *
+	 * @return string
+	 */
+	public static function retry_refused(): string {
+		return self::$retry_refused;
+	}
+
+	/**
+	 * The reset of reset_for_retry().
+	 *
+	 * @param string               $job_id         UUID.
+	 * @param array<string, mixed> $before         The row read before the reset.
+	 * @param bool                 $allow_canceled See reset_for_retry().
+	 * @param int                  $generation     See reset_for_retry().
+	 * @param int                  $owner          See reset_for_retry().
+	 * @param int                  $version        See reset_for_retry().
+	 * @return bool
+	 */
+	private static function reset_row( string $job_id, array $before, bool $allow_canceled, int $generation, int $owner, int $version ): bool {
 		global $wpdb;
 		$table = Schema::table( 'jobs' );
 		$now   = current_time( 'mysql', true );
@@ -961,7 +1040,7 @@ final class JobState {
 		// A checkpoint of a job that resumes after a kill is kept, closed and with no kills counted.
 		$result = '[]';
 
-		if ( is_array( $before ) && self::resumes( $before ) && is_array( $before['result'] ?? null ) ) {
+		if ( self::resumes( $before ) && is_array( $before['result'] ?? null ) ) {
 			$kept = $before['result'];
 			unset( $kept[ self::REQUEUES_KEY ] );
 			$kept[ self::RESUME_KEY ] = [
@@ -1004,7 +1083,7 @@ final class JobState {
 			return false;
 		}
 
-		if ( is_array( $before ) && 'running' === ( $before['status'] ?? '' ) ) {
+		if ( 'running' === ( $before['status'] ?? '' ) ) {
 			self::run_ended( $job_id, $before );
 		}
 
@@ -1032,7 +1111,7 @@ final class JobState {
 			't' => time(),
 			// mb_substr(): a byte cut can split a multibyte character, which wp_json_encode() then mangles or, without
 			// mbstring, drops the whole message.
-			'm' => mb_substr( $message, 0, 500 ),
+			'm' => mb_substr( self::plain( $message ), 0, 500 ),
 		];
 
 		if ( '' !== $key ) {
@@ -1341,30 +1420,31 @@ final class JobState {
 	 * the polled REST endpoint and the Jobs page. A running row also carries `stage`, the key of its worker's last
 	 * `stage:<key>` log line (WorkerRunner). Callers that need full rows use list_active().
 	 *
+	 * @param array<int, string> $ids Only these job uuids (the Jobs screen's running rows); [] for the newest window.
 	 * @return array<string, array<string, mixed>>  uuid → row (without args/result/log)
 	 */
-	public static function list_active_summary(): array {
+	public static function list_active_summary( array $ids = [] ): array {
 		global $wpdb;
 		$table = Schema::table( 'jobs' );
 		$cap   = self::active_index_max();
+		$where = [] === $ids ? '' : 'WHERE uuid IN (' . implode( ',', array_fill( 0, count( $ids ), '%s' ) ) . ')';
 
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $table is Schema::table('jobs'), class-controlled, and bound via the %i identifier placeholder.
+		// $table bound via %i; $where holds only %s placeholders, one per id.
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber
 		$rows = $wpdb->get_results(
 			$wpdb->prepare(
 				'SELECT id, uuid, type, hook, engine, status, progress, total, processed,
 				        attempts, created_by, blog_id, version, created_at, started_at,
 				        completed_at, updated_at, error,
 				        CASE WHEN status = %s THEN log ELSE %s END AS stage_log
-				 FROM %i
+				 FROM %i ' . $where . '
 				 ORDER BY updated_at DESC, id DESC
 				 LIMIT %d',
-				'running',
-				'',
-				$table,
-				$cap
+				...array_merge( [ 'running', '', $table ], array_values( $ids ), [ $cap ] )
 			),
 			ARRAY_A
 		);
+		// phpcs:enable
 
 		$out = [];
 		foreach ( (array) $rows as $row ) {
@@ -1440,10 +1520,12 @@ final class JobState {
 	 * Delete a job only while it is still finished (complete, failed or canceled) at the DELETE. The row goes first, by
 	 * its read version, so a Retry or a worker claim after the read keeps it; the artifact then goes from that read.
 	 *
-	 * @param string $job_id UUID.
-	 * @return bool False when the job is not finished; true when it was deleted or is gone.
+	 * @param string        $job_id UUID.
+	 * @param callable|null $may    Asked about each row read before it goes; false keeps it.
+	 * @phpstan-param (callable(array<string, mixed>): bool)|null $may
+	 * @return bool False when the job is not finished or $may refused it; true when it was deleted or is gone.
 	 */
-	public static function delete_finished( string $job_id ): bool {
+	public static function delete_finished( string $job_id, ?callable $may = null ): bool {
 		/** @var \wpdb $wpdb */
 		global $wpdb;
 		$table = Schema::table( 'jobs' );
@@ -1458,7 +1540,7 @@ final class JobState {
 			$status  = $state['status'] ?? '';
 			$version = $state['version'] ?? 0;
 
-			if ( ! is_string( $status ) || ! self::is_terminal( $status ) || ! is_int( $version ) ) {
+			if ( ! is_string( $status ) || ! self::is_terminal( $status ) || ! is_int( $version ) || ( null !== $may && ! $may( $state ) ) ) {
 				return false;
 			}
 
@@ -1613,7 +1695,7 @@ final class JobState {
 	 * @internal
 	 *
 	 * @param int $user_id User whose jobs lose their `created_by`.
-	 * @return int|null Number of rows affected, or null when the UPDATE failed.
+	 * @return int|null Number of rows affected, or null when the UPDATE or the log scrub failed.
 	 */
 	public static function try_anonymize_for_user( int $user_id ): ?int {
 		if ( $user_id <= 0 ) {
@@ -1637,11 +1719,52 @@ final class JobState {
 
 		// wpdb returns false on an error and when a `query` filter empties the statement (last_error untouched): the
 		// return value is the only reliable signal.
-		if ( false === $affected ) {
+		if ( false === $affected || ! self::scrub_retry_lines( $user_id ) ) {
 			return null;
 		}
 
 		return max( 0, (int) $affected );
+	}
+
+	/**
+	 * Take the user id out of the Retry line 1.0.7.4 and 1.0.7.5 logged ("Retried by user N; ..."), on every job,
+	 * whoever owns it now; the line then reads as the current one. 100 rows per read, a row changed meanwhile read again.
+	 *
+	 * @param int $user_id User id.
+	 * @return bool False when a read or write failed, or rows are left after 20 reads.
+	 */
+	private static function scrub_retry_lines( int $user_id ): bool {
+		$wpdb  = \PerfLocale\Admin\Typed::wpdb();
+		$table = Schema::table( 'jobs' );
+		$line  = 'Retried by user ' . $user_id . ';';
+
+		for ( $read = 0; $read < 20; $read++ ) {
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $table is Schema::table('jobs'), bound via %i; erasure only.
+			$rows = $wpdb->get_results( $wpdb->prepare( 'SELECT uuid, log, version FROM %i WHERE log LIKE %s LIMIT 100', $table, '%' . $wpdb->esc_like( $line ) . '%' ), ARRAY_A );
+
+			if ( ! is_array( $rows ) || self::last_read_failed() ) {
+				return false;
+			}
+
+			if ( [] === $rows ) {
+				return true;
+			}
+
+			foreach ( $rows as $row ) {
+				$row = (array) $row;
+				// The id ends at the ';', so user 42 never matches user 421; the rest of the line is the current wording.
+				$log = str_replace( $line, 'Retried by another user;', \PerfLocale\Util\Scalar::str( $row['log'] ?? '' ) );
+
+				$sql = $wpdb->prepare( 'UPDATE %i SET log = %s, version = version + 1 WHERE uuid = %s AND version = %d', $table, $log, \PerfLocale\Util\Scalar::str( $row['uuid'] ?? '' ), \PerfLocale\Util\Scalar::int( $row['version'] ?? 0 ) );
+
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $sql is the prepare() result.
+				if ( ! is_string( $sql ) || false === $wpdb->query( $sql ) ) {
+					return false;
+				}
+			}
+		}
+
+		return false;
 	}
 
 	/**
@@ -2218,18 +2341,14 @@ final class JobState {
 
 			// The DELETE re-asserts the SELECT's predicate against the same $now: a lease refreshed or reclaimed in
 			// between has a later expiry and stays, so a live lock is never deleted and $pruned counts what was.
-			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQLPlaceholders, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- $placeholders is a dynamic %s list for IN(); replacements arrive as one array, which WPCS cannot count.
-			$deleted = $wpdb->query(
-				$wpdb->prepare(
-					"DELETE FROM {$wpdb->options}
+			$sql = "DELETE FROM {$wpdb->options}
 					 WHERE option_name IN ({$placeholders})
 					 AND NOT (
 						option_value REGEXP '^[0-9]+\\\\|'
 						AND CAST(CASE WHEN INSTR(option_value, '|') > 0 THEN SUBSTR(option_value, 1, INSTR(option_value, '|') - 1) ELSE option_value END AS UNSIGNED) >= %d
-					 )",
-					array_merge( $names, [ $now ] )
-				)
-			);
+					 )";
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $sql: core's options table and one %s per name for IN().
+			$deleted = $wpdb->query( $wpdb->prepare( $sql, array_merge( $names, [ $now ] ) ) );
 
 			$pruned += (int) $deleted;
 
@@ -2302,12 +2421,59 @@ final class JobState {
 	}
 
 	/**
-	 * Cap error messages so a stack trace can't bloat the row.
+	 * Cap error messages so a stack trace can't bloat the row; stored plain (plain()).
 	 *
 	 * @param string $error
 	 * @return string
 	 */
 	private static function truncate_error( string $error ): string {
-		return mb_substr( $error, 0, self::MAX_ERROR_BYTES );
+		return mb_substr( self::plain( $error ), 0, self::MAX_ERROR_BYTES );
+	}
+
+	/**
+	 * A job text as plain text: exception messages come escaped from where they were thrown, and every output (Jobs
+	 * screen, REST client, notice) escapes it again, so a stored entity would show as one.
+	 *
+	 * @param string $text Message.
+	 * @return string
+	 */
+	private static function plain( string $text ): string {
+		return str_contains( $text, '&' ) ? wp_specialchars_decode( $text, ENT_QUOTES ) : $text;
+	}
+
+	/**
+	 * A result with its messages plain (plain()): first_error, first_warning, errors and failure reasons; other values,
+	 * such as kept translations, stay as they are.
+	 *
+	 * @param array<string, mixed> $result Result.
+	 * @return array<string, mixed>
+	 */
+	private static function plain_result( array $result ): array {
+		foreach ( [ 'first_error', 'first_warning' ] as $key ) {
+			if ( is_string( $result[ $key ] ?? null ) ) {
+				$result[ $key ] = self::plain( $result[ $key ] );
+			}
+		}
+
+		foreach ( [ 'errors', 'failures' ] as $key ) {
+			if ( ! is_array( $result[ $key ] ?? null ) ) {
+				continue;
+			}
+
+			$list = $result[ $key ];
+
+			foreach ( $list as $i => $item ) {
+				if ( is_string( $item ) ) {
+					$list[ $i ] = self::plain( $item );
+				} elseif ( is_array( $item ) && is_string( $item['reason'] ?? null ) ) {
+					$item['reason'] = self::plain( $item['reason'] );
+					$list[ $i ]     = $item;
+				}
+			}
+
+			$result[ $key ] = $list;
+		}
+
+		return $result;
 	}
 }

@@ -10,10 +10,12 @@ declare( strict_types=1 );
 namespace PerfLocale\Api;
 
 use PerfLocale\Concurrency\Lock;
+use PerfLocale\MachineTranslation\AbstractProvider;
 use PerfLocale\MachineTranslation\TranslationService;
 use PerfLocale\Plugin;
 use PerfLocale\Translation\BlockAttributeSource;
 use PerfLocale\Translation\MtRateLimiter;
+use PerfLocale\Util\Utf8;
 
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
@@ -169,7 +171,7 @@ final class BlockTranslateController extends RestController {
 			return true;
 		}
 
-		if ( ! current_user_can( 'edit_post', $target_post_id ) ) {
+		if ( ! \PerfLocale\Util\ObjectPermission::edit_narrowed( $target_post_id ) ) {
 			return new \WP_Error(
 				'cannot_edit_post',
 				__( 'You cannot edit this post.', 'perflocale' ),
@@ -203,6 +205,20 @@ final class BlockTranslateController extends RestController {
 					return $this->error( 'invalid_texts', __( 'Every entry in `texts` must be a string.', 'perflocale' ), 400 );
 				}
 				$texts[ $i ] = $t;
+			}
+		}
+
+		// Before the caps: without mbstring, WordPress before 6.9 counts invalid UTF-8 as 0 characters.
+		foreach ( $is_batch ? $texts : [ $text ] as $i => $t ) {
+			if ( ! Utf8::valid( $t ) ) {
+				return $this->error(
+					'invalid_utf8',
+					$is_batch
+						/* translators: %d: index in batch */
+						? sprintf( __( 'Batch entry #%d is not valid UTF-8. Send the text as UTF-8.', 'perflocale' ), $i )
+						: __( 'The text is not valid UTF-8. Send it as UTF-8.', 'perflocale' ),
+					400
+				);
 			}
 		}
 
@@ -298,11 +314,11 @@ final class BlockTranslateController extends RestController {
 				);
 			}
 
-			// Characters, not bytes (mb_strlen, polyfilled by core), as every other cap in the plugin.
+			// Characters, not bytes (Utf8::length(), explicit UTF-8), as every other cap in the plugin.
 			$total_chars = 0;
 
 			foreach ( $texts as $i => $t ) {
-				if ( mb_strlen( $t ) > self::MAX_INPUT_LENGTH ) {
+				if ( Utf8::length( $t ) > self::MAX_INPUT_LENGTH ) {
 					return $this->error(
 						'text_too_long',
 						sprintf(
@@ -314,7 +330,7 @@ final class BlockTranslateController extends RestController {
 						413
 					);
 				}
-				$total_chars += mb_strlen( $t );
+				$total_chars += Utf8::length( $t );
 			}
 
 			// Batch sum cap is 4x the single cap: a whole post fits, a runaway client cannot drain the monthly quota.
@@ -338,7 +354,7 @@ final class BlockTranslateController extends RestController {
 				return $this->error( 'empty_text', __( 'Text to translate is empty.', 'perflocale' ) );
 			}
 
-			if ( mb_strlen( $text ) > self::MAX_INPUT_LENGTH ) {
+			if ( Utf8::length( $text ) > self::MAX_INPUT_LENGTH ) {
 				return $this->error(
 					'text_too_long',
 					sprintf(
@@ -384,21 +400,25 @@ final class BlockTranslateController extends RestController {
 		);
 
 		try {
+			// The caps above hold for what is sent, after shortcode placeholders and provider filters.
 			if ( $is_batch ) {
 				// Each entry is sanitized for its format, so the response is safe to write to block attributes.
-				$batch_result = $this->translate_by_format(
-					$service,
-					array_values( $texts ),
-					$formats,
-					$source_lang,
-					$target_lang,
-					$provider_id
+				$batch_result = AbstractProvider::with_send_cap(
+					self::MAX_INPUT_LENGTH * 4,
+					fn() => $this->translate_by_format(
+						$service,
+						array_values( $texts ),
+						$formats,
+						$source_lang,
+						$target_lang,
+						$provider_id
+					)
 				);
 			} else {
-				$translated = $service->translate_text( $text, $source_lang, $target_lang, $provider_id, true );
+				$translated = AbstractProvider::with_send_cap( self::MAX_INPUT_LENGTH, fn() => $service->translate_text( $text, $source_lang, $target_lang, $provider_id, true ) );
 			}
 		} catch ( \Throwable $e ) {
-			return $this->error( 'translation_failed', $e->getMessage(), 500 );
+			return $this->error( 'translation_failed', $e->getMessage(), \PerfLocale\MachineTranslation\AbstractProvider::rest_status( $e ) );
 		}
 
 		if ( $is_batch ) {
@@ -536,7 +556,7 @@ final class BlockTranslateController extends RestController {
 		}
 
 		// Edit rights on this target post, not any post.
-		if ( ! current_user_can( 'edit_post', $target_post_id ) ) {
+		if ( ! \PerfLocale\Util\ObjectPermission::edit_narrowed( $target_post_id ) ) {
 			return $this->error( 'cannot_edit_post', __( 'You cannot edit this post.', 'perflocale' ), 403 );
 		}
 
@@ -546,16 +566,11 @@ final class BlockTranslateController extends RestController {
 			return $this->error( 'mt_disabled', __( 'Machine translation is disabled.', 'perflocale' ), 403 );
 		}
 
-		// The source post is the default-language sibling.
+		// The source post is the default-language sibling; one whose text the caller may not read answers as none.
 		$source_post = $this->find_source_sibling_post( $target_post_id );
 
-		if ( ! $source_post instanceof \WP_Post ) {
+		if ( ! $source_post instanceof \WP_Post || ! \PerfLocale\Util\ObjectPermission::read_text( $source_post ) ) {
 			return $this->error( 'no_source_sibling', __( 'This post has no source-language sibling to translate from.', 'perflocale' ), 404 );
-		}
-
-		// The source's text is sent, so the caller must also be able to read the source post.
-		if ( ! current_user_can( 'read_post', (int) $source_post->ID ) ) {
-			return $this->error( 'cannot_read_source', __( 'You do not have permission to read the source post.', 'perflocale' ), 403 );
 		}
 
 		// The source itself is a caller error: it belongs on /block-translate.
@@ -640,7 +655,12 @@ final class BlockTranslateController extends RestController {
 		$total_chars = 0;
 
 		foreach ( $values as $value ) {
-			$chars = mb_strlen( $value );
+			// Before the caps, as on the direct path: without mbstring, WordPress before 6.9 counts invalid UTF-8 as 0.
+			if ( ! Utf8::valid( $value ) ) {
+				return $this->error( 'invalid_source_text', __( 'The source block\'s text is not valid UTF-8, so it cannot be translated. Correct the text in the source post.', 'perflocale' ), 422 );
+			}
+
+			$chars = Utf8::length( $value );
 
 			if ( $chars > self::MAX_INPUT_LENGTH ) {
 				return $this->error(
@@ -699,9 +719,9 @@ final class BlockTranslateController extends RestController {
 			$formats = array_map( static fn( string $name ): string => (string) ( $read['formats'][ $name ] ?? BlockAttributeSource::FORMAT_HTML ), $names );
 
 			try {
-				$results = $this->translate_by_format( $service, array_values( $pending ), $formats, $source_lang, $target_lang, $provider_id, $names );
+				$results = AbstractProvider::with_send_cap( self::MAX_INPUT_LENGTH * 4, fn() => $this->translate_by_format( $service, array_values( $pending ), $formats, $source_lang, $target_lang, $provider_id, $names ) );
 			} catch ( \Throwable $e ) {
-				return $this->error( 'translation_failed', $e->getMessage(), 500 );
+				return $this->error( 'translation_failed', $e->getMessage(), \PerfLocale\MachineTranslation\AbstractProvider::rest_status( $e ) );
 			}
 
 			foreach ( $names as $i => $name ) {

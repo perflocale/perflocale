@@ -28,7 +28,11 @@ final class DataExportJob extends AbstractJob {
 		return 'data_export';
 	}
 
-	/** {@inheritDoc} */
+	/**
+	 * {@inheritDoc}
+	 *
+	 * manage_options too (JobAccess::ALSO_REQUIRES), as the export form.
+	 */
 	public function get_required_capability(): string {
 		return 'perflocale_import_export';
 	}

@@ -51,6 +51,13 @@ final class Lock {
 	private static array $owned = [];
 
 	/**
+	 * After a failed renew(): "blog:option name" => [ value stamped last, value the renewal tried ], for regain().
+	 *
+	 * @var array<string, list<string>>
+	 */
+	private static array $lost = [];
+
+	/**
 	 * Per-blog key for the {@see $owned} map.
 	 *
 	 * @param string $key Lock option name (already DB-prefixed).
@@ -217,6 +224,19 @@ final class Lock {
 	}
 
 	/**
+	 * The option name and stored value of a lock this request holds, or null.
+	 *
+	 * @param string $name Lock name.
+	 * @return array{0: string, 1: string}|null
+	 */
+	public static function row( string $name ): ?array {
+		$key   = self::PREFIX . $name;
+		$value = self::$owned[ self::owned_key( $key ) ] ?? null;
+
+		return null === $value ? null : [ $key, $value ];
+	}
+
+	/**
 	 * Move a held lock's expiry to $ttl seconds from the current time (CAS: a lock taken over is not touched).
 	 *
 	 * Lets a long run keep a short TTL, so a crashed one still frees the lock soon.
@@ -257,6 +277,92 @@ final class Lock {
 	}
 
 	/**
+	 * Like extend(), but a failed renewal forgets the lock (release() then deletes nothing) and keeps both values for regain().
+	 *
+	 * @since 1.0.8
+	 *
+	 * @param string $name Lock name.
+	 * @param int    $ttl  Seconds from the current time.
+	 * @return bool False when this request no longer holds the lock: the caller must stop acting as its owner.
+	 */
+	public static function renew( string $name, int $ttl ): bool {
+		$key       = self::PREFIX . $name;
+		$owned_key = self::owned_key( $key );
+		$owned     = self::$owned[ $owned_key ] ?? null;
+
+		if ( null === $owned ) {
+			return false;
+		}
+
+		$value = self::format_value( time() + max( 1, $ttl ), self::generate_token() );
+
+		if ( self::swap( $key, $owned, $value ) ) {
+			self::$owned[ $owned_key ] = $value;
+
+			return true;
+		}
+
+		unset( self::$owned[ $owned_key ] );
+		self::$lost[ $owned_key ] = [ $owned, $value ];
+
+		return false;
+	}
+
+	/**
+	 * Take back a lock whose renew() just failed: CAS over either kept value (the UPDATE failed, or committed and lost
+	 * its answer), else acquire(). A lock another process holds matches neither and is never taken.
+	 *
+	 * @since 1.0.8
+	 *
+	 * @param string $name Lock name.
+	 * @param int    $ttl  Seconds from the current time.
+	 * @return bool True when this request holds the lock again.
+	 */
+	public static function regain( string $name, int $ttl ): bool {
+		$key       = self::PREFIX . $name;
+		$owned_key = self::owned_key( $key );
+		$kept      = isset( self::$owned[ $owned_key ] ) ? [] : ( self::$lost[ $owned_key ] ?? [] );
+
+		unset( self::$lost[ $owned_key ] );
+
+		foreach ( $kept as $stamped ) {
+			$value = self::format_value( time() + max( 1, $ttl ), self::generate_token() );
+
+			if ( self::swap( $key, $stamped, $value ) ) {
+				self::$owned[ $owned_key ] = $value;
+
+				return true;
+			}
+		}
+
+		return self::acquire( $name, $ttl );
+	}
+
+	/**
+	 * Compare-and-set one lock row from $from to $to; the option caches are dropped either way.
+	 *
+	 * @param string $key  Lock option name.
+	 * @param string $from Expected stored value.
+	 * @param string $to   New value.
+	 * @return bool True when exactly one row changed.
+	 */
+	private static function swap( string $key, string $from, string $to ): bool {
+		$wpdb = $GLOBALS['wpdb'] ?? null;
+
+		if ( ! $wpdb instanceof \wpdb ) {
+			return false;
+		}
+
+		$sql = $wpdb->prepare( 'UPDATE %i SET option_value = %s WHERE option_name = %s AND option_value = %s', $wpdb->options, $to, $key, $from );
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared -- Prepared on the line above.
+		$updated = is_string( $sql ) ? $wpdb->query( $sql ) : false;
+
+		self::invalidate_option_caches( $key );
+
+		return 1 === (int) $updated;
+	}
+
+	/**
 	 * Run a callable under a lock, released in a finally block.
 	 *
 	 * @param string   $name Lock name.
@@ -290,12 +396,25 @@ final class Lock {
 		}
 
 		$held[ $held_key ] = true;
+		$blog_id           = function_exists( 'get_current_blog_id' ) ? (int) get_current_blog_id() : 0;
 
 		try {
 			return $callback();
 		} finally {
 			unset( $held[ $held_key ] );
+
+			// A callback that left the blog: release the row of the blog that took it, then come back.
+			$moved = $blog_id > 0 && (int) get_current_blog_id() !== $blog_id;
+
+			if ( $moved ) {
+				switch_to_blog( $blog_id );
+			}
+
 			self::release( $name );
+
+			if ( $moved ) {
+				restore_current_blog();
+			}
 		}
 	}
 

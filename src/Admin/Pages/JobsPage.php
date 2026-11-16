@@ -26,7 +26,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 final class JobsPage {
 
 	/**
-	 * Job types whose result counts rows kept in the source language (`kept`, `first_warning`).
+	 * Job types whose result counts rows kept in the source language (`kept`, `first_warning`, `redo_notes`).
 	 */
 	private const KEPT_RESULT_TYPES = [ 'bulk_translate', 'site_translate' ];
 
@@ -34,6 +34,11 @@ final class JobsPage {
 	 * Migration job types whose result lists source items left out (`skipped`), by source.
 	 */
 	private const ATTENTION_RESULT_TYPES = [ 'polylang_migration' => 'polylang' ];
+
+	/**
+	 * Import job types whose result can name root posts a language prefix takes (`slug_clashes`).
+	 */
+	private const CLASH_RESULT_TYPES = [ 'data_import', 'wpml_migration', 'polylang_migration', 'translatepress_migration' ];
 
 	/**
 	 * Job types whose finished row reports what they changed, by count.
@@ -125,20 +130,12 @@ final class JobsPage {
 	public function render(): void {
 		// Summary rows have no args, result or log: the kept-rows warning reads results in one batch below, and a row's
 		// Details fetches GET /jobs/{id}.
-		$jobs = JobState::list_active_summary();
+		$jobs = \PerfLocale\Background\JobAccess::visible( JobState::list_active_summary() );
 
-		$current_uid = (int) get_current_user_id();
-		$jobs        = self::shown_rows( $jobs, $current_uid );
-		$status_only = self::status_only_rows( $jobs, $current_uid );
-
-		// One batched result read for the displayed rows that show one; none when no row does.
+		// One batched result read for the displayed rows that show one (kept rows, counts, first error, ReSync notes).
 		$kept_ids = [];
 		foreach ( $jobs as $kept_id => $summary ) {
-			if ( isset( $status_only[ (string) $kept_id ] ) ) {
-				continue;
-			}
-
-			if ( self::shows_kept( $summary['status'] ?? '', $summary['type'] ?? '' ) || self::shows_first_error( $summary['status'] ?? '', $summary['type'] ?? '' ) ) {
+			if ( self::shows_result( $summary['status'] ?? '', $summary['type'] ?? '' ) ) {
 				$kept_ids[] = (string) $kept_id;
 			}
 		}
@@ -230,7 +227,7 @@ final class JobsPage {
 					</thead>
 					<tbody>
 						<?php foreach ( $jobs as $job_id => $row ) : ?>
-							<?php $this->render_row( (string) $job_id, $row, $results[ (string) $job_id ] ?? [], isset( $status_only[ (string) $job_id ] ) ); ?>
+							<?php $this->render_row( (string) $job_id, $row, $results[ (string) $job_id ] ?? [] ); ?>
 						<?php endforeach; ?>
 					</tbody>
 				</table>
@@ -249,11 +246,39 @@ final class JobsPage {
 				</p>
 			<?php endif; ?>
 
+			<?php KeptDraftsPanel::render(); ?>
+
 			<?php $this->render_scheduled_tasks_panel(); ?>
 		</div>
 
 		<?php
 		// The page's styles and refresh script come from enqueue_assets() on `admin_enqueue_scripts`.
+	}
+
+	/**
+	 * Whether a task row shows: its feature is on, or an event for it is still scheduled or running (a leftover shows).
+	 *
+	 * @param bool                                 $feature_on Feature state; core tasks pass true.
+	 * @param array{next: int|null, untimed: bool} $detail     BackgroundEvents::next_run_detail().
+	 * @return bool
+	 */
+	private static function row_shown( bool $feature_on, array $detail ): bool {
+		return $feature_on || null !== $detail['next'] || $detail['untimed'];
+	}
+
+	/**
+	 * Whether automatic exchange-rate sync is on: WooCommerce loaded, its add-on active and the setting enabled.
+	 *
+	 * @return bool
+	 */
+	private static function fx_sync_on(): bool {
+		if ( ! class_exists( 'WooCommerce' ) || ! \PerfLocale\Helper::get_instance()->is_addon_active( 'woocommerce' ) ) {
+			return false;
+		}
+
+		$plugin = \PerfLocale\Plugin::get_instance();
+
+		return $plugin->has( 'settings' ) && (bool) $plugin->settings()->get( 'wc_exchange_rate_auto', false );
 	}
 
 	/**
@@ -274,6 +299,7 @@ final class JobsPage {
 				'label'            => __( 'Exchange-rate sync', 'perflocale' ),
 				'description'      => __( 'WooCommerce multi-currency rate refresh.', 'perflocale' ),
 				'interval_seconds' => DAY_IN_SECONDS,
+				'feature_on'       => self::fx_sync_on(),
 			],
 			[
 				'hook'             => \PerfLocale\Concurrency\Lock::CLEANUP_HOOK,
@@ -304,7 +330,12 @@ final class JobsPage {
 		foreach ( $tasks as $task ) {
 			// A running recurring Action Scheduler task has no next timestamp; `untimed` from the same probe marks it running.
 			// These hooks are only ever scheduled through enqueue_recurring(), never async, so `untimed` means running here.
-			$detail   = BackgroundEvents::next_run_detail( $task['hook'], (array) ( $task['args'] ?? [] ) );
+			$detail = BackgroundEvents::next_run_detail( $task['hook'], $task['args'] );
+
+			if ( ! self::row_shown( $task['feature_on'] ?? true, $detail ) ) {
+				continue;
+			}
+
 			$next     = $detail['next'];
 			$overdue  = false;
 			$drift_by = 0;
@@ -562,7 +593,7 @@ final class JobsPage {
 	}
 
 	/**
-	 * A Polylang job's policy line and left-out items; nothing otherwise, so other rows stay byte for byte the same.
+	 * A Polylang job's policy line and left-out items, and an import's slug clashes; nothing otherwise.
 	 *
 	 * @param string        $policy_line Language conflict policy line, or ''.
 	 * @param array<string> $attention   Lines of items left out.
@@ -599,6 +630,17 @@ final class JobsPage {
 			default:
 				return '';
 		}
+	}
+
+	/**
+	 * Whether a row needs its job's result: the kept count, the first error, or a finished Content ReSync run's note.
+	 *
+	 * @param mixed $status Job status.
+	 * @param mixed $type   Job type slug.
+	 * @return bool
+	 */
+	private static function shows_result( $status, $type ): bool {
+		return self::shows_kept( $status, $type ) || self::shows_first_error( $status, $type ) || ( 'complete' === $status && ( 'content_resync' === $type || in_array( $type, self::CLASH_RESULT_TYPES, true ) ) );
 	}
 
 	/**
@@ -643,77 +685,14 @@ final class JobsPage {
 	}
 
 	/**
-	 * The rows the REST list shows (JobAccess, asked once per type and owner kind).
-	 *
-	 * @param array<int|string, array<string, mixed>> $jobs        Active-index summary rows.
-	 * @param int                                     $current_uid Viewer.
-	 * @return array<int|string, array<string, mixed>>
-	 */
-	private static function shown_rows( array $jobs, int $current_uid ): array {
-		$allowed = [ [], [] ];
-
-		return array_filter(
-			$jobs,
-			static function ( array $row ) use ( $current_uid, &$allowed ): bool {
-				$type = is_string( $row['type'] ?? null ) ? $row['type'] : '';
-				$mine = $current_uid > 0 && (int) ( $row['created_by'] ?? 0 ) === $current_uid ? 1 : 0;
-
-				$allowed[ $mine ][ $type ] ??= $mine ? \PerfLocale\Background\JobAccess::may_handle_own( $type ) : \PerfLocale\Background\JobAccess::may_handle_others( $type );
-
-				return $allowed[ $mine ][ $type ];
-			}
-		);
-	}
-
-	/**
-	 * Ids of another user's translation runs whose posts the viewer may not edit (JobAccess): they show their status only.
-	 *
-	 * @param array<int|string, array<string, mixed>> $jobs        Rows shown.
-	 * @param int                                     $current_uid Viewer.
-	 * @return array<string, true>
-	 */
-	private static function status_only_rows( array $jobs, int $current_uid ): array {
-		$ids = [];
-
-		foreach ( $jobs as $id => $row ) {
-			$owner = is_numeric( $row['created_by'] ?? null ) ? (int) $row['created_by'] : 0;
-
-			if ( in_array( $row['type'] ?? '', \PerfLocale\Background\JobAccess::CONTENT_TYPES, true ) && ( $current_uid <= 0 || $owner !== $current_uid ) ) {
-				$ids[] = (string) $id;
-			}
-		}
-
-		$args = [] === $ids ? [] : JobState::args( $ids );
-		$out  = [];
-
-		foreach ( $ids as $id ) {
-			$state = [
-				'type' => $jobs[ $id ]['type'],
-				'args' => $args[ $id ] ?? null,
-			];
-
-			if ( ! \PerfLocale\Background\JobAccess::may_edit_content( $state ) ) {
-				$out[ $id ] = true;
-			}
-		}
-
-		return $out;
-	}
-
-	/**
 	 * Render a single job row.
 	 *
 	 * @param string                   $job_id
-	 * @param array<string, mixed>     $row         Active-index summary row.
-	 * @param array<int|string, mixed> $result      The job's decoded result when the row shows the kept count, else [].
-	 * @param bool                     $status_only Whether the viewer may not open the job: no texts, no actions.
+	 * @param array<string, mixed>     $row    Active-index summary row.
+	 * @param array<int|string, mixed> $result The job's decoded result when shows_result() holds for the row, else [].
 	 * @return void
 	 */
-	private function render_row( string $job_id, array $row, array $result = [], bool $status_only = false ): void {
-		if ( $status_only ) {
-			$row['error'] = '';
-		}
-
+	private function render_row( string $job_id, array $row, array $result = [] ): void {
 		$status     = (string) ( $row['status'] ?? 'unknown' );
 		$type       = (string) ( $row['type'] ?? '' );
 		$progress   = (int) ( $row['progress'] ?? 0 );
@@ -748,9 +727,20 @@ final class JobsPage {
 		// Finished machine-translation jobs report rows kept in the source language; only those types read the result.
 		$kept          = 0;
 		$first_warning = '';
+		$redo_notes    = [];
+		$redo_more     = 0;
 		if ( self::shows_kept( $status, $type ) ) {
 			$kept          = max( 0, (int) ( $result['kept'] ?? 0 ) );
 			$first_warning = trim( (string) ( $result['first_warning'] ?? '' ) );
+
+			// Every pair an earlier stopped run left gets its own line; the first warning is not repeated.
+			foreach ( is_array( $result['redo_notes'] ?? null ) ? $result['redo_notes'] : [] as $note ) {
+				if ( is_string( $note ) && '' !== trim( $note ) && trim( $note ) !== $first_warning ) {
+					$redo_notes[] = trim( $note );
+				}
+			}
+
+			$redo_more = is_numeric( $result['redo_notes_more'] ?? null ) ? max( 0, (int) $result['redo_notes_more'] ) : 0;
 		}
 
 		// A finished or canceled job whose items failed names the first error.
@@ -762,12 +752,30 @@ final class JobsPage {
 			? \PerfLocale\Migration\MigrationRunner::skipped_lines( self::ATTENTION_RESULT_TYPES[ $type ], array_filter( $result, 'is_string', ARRAY_FILTER_USE_KEY ) )
 			: [];
 
+		// An import's root posts a language prefix now takes.
+		if ( 'complete' === $status && in_array( $type, self::CLASH_RESULT_TYPES, true ) ) {
+			$attention = array_merge( $attention, \PerfLocale\Migration\MigrationRunner::clash_lines( $result ) );
+		}
+
 		// A Polylang job under a non-default conflict policy says so: the policy it ran under, or the one it will read.
 		$policy_line = '';
 
 		if ( 'polylang_migration' === $type ) {
 			$ran         = is_array( $result['conflict_policy'] ?? null ) ? $result['conflict_policy'] : null;
 			$policy_line = \PerfLocale\Migration\PolylangImporter::policy_line( null !== $ran && JobState::is_terminal( (string) $status ) ? $ran : \PerfLocale\Migration\PolylangImporter::conflict_policies() );
+		}
+
+		// A finished Content ReSync run that stopped early or left pairs says why (a fixed stop in the viewer's language);
+		// pairs refused for the PHP memory limit are listed.
+		$resync_note   = '';
+		$resync_memory = [];
+		if ( $status === 'complete' && $type === 'content_resync' && \PerfLocale\Util\ResyncSwitch::on() ) {
+			$resync        = $result;
+			$stop_text     = \PerfLocale\Admin\ResyncNotices::stop_text( \PerfLocale\Util\Scalar::str( $resync['stopped'] ?? '' ) );
+			$resync_note   = ( '' !== \PerfLocale\Util\Scalar::str( $resync['stopped'] ?? '' ) || \PerfLocale\Util\Scalar::int( $resync['not_processed'] ?? 0 ) > 0 )
+				? trim( '' !== $stop_text ? $stop_text : \PerfLocale\Util\Scalar::str( $resync['first_error'] ?? '' ) )
+				: '';
+			$resync_memory = \PerfLocale\Admin\ResyncNotices::memory_refusals( is_array( $resync['items'] ?? null ) ? $resync['items'] : [] );
 		}
 
 		?>
@@ -814,7 +822,18 @@ final class JobsPage {
 						?>
 					</div>
 				<?php endif; ?>
-				<?php self::render_result_notes( $policy_line, $attention, $first_error ); if ( $kept > 0 || $first_warning !== '' ) : ?>
+				<?php self::render_result_notes( $policy_line, $attention, $first_error ); if ( $resync_note !== '' ) : ?>
+					<div class="perflocale-jobs-warning"><?php echo esc_html( $resync_note ); ?></div>
+				<?php endif; if ( [] !== $resync_memory ) : ?>
+					<div class="perflocale-jobs-warning">
+						<?php echo esc_html( \PerfLocale\Admin\ResyncNotices::memory_note( $resync_memory ) ); ?>
+						<ul>
+							<?php foreach ( $resync_memory as $refusal ) : ?>
+								<li><?php echo wp_kses( \PerfLocale\Admin\ResyncNotices::memory_line( $refusal, true ), [ 'a' => [ 'href' => [] ] ] ); ?></li>
+							<?php endforeach; ?>
+						</ul>
+					</div>
+				<?php endif; if ( $kept > 0 || $first_warning !== '' || [] !== $redo_notes || $redo_more > 0 ) : ?>
 					<div class="perflocale-jobs-warning">
 						<?php
 						if ( $kept > 0 ) {
@@ -830,6 +849,17 @@ final class JobsPage {
 						<?php if ( $first_warning !== '' ) : ?>
 							<strong><?php esc_html_e( 'First warning:', 'perflocale' ); ?></strong>
 							<?php echo esc_html( $first_warning ); ?>
+						<?php endif; if ( [] !== $redo_notes ) : ?>
+							<ul>
+								<?php foreach ( $redo_notes as $note ) : ?>
+									<li><?php echo esc_html( $note ); ?></li>
+								<?php endforeach; ?>
+							</ul>
+						<?php endif; if ( $redo_more > 0 ) : ?>
+							<?php
+							/* translators: %d: number of further warnings of the same kind that are not listed. */
+							echo esc_html( sprintf( _n( '%d more is not listed.', '%d more are not listed.', $redo_more, 'perflocale' ), $redo_more ) );
+							?>
 						<?php endif; ?>
 					</div>
 				<?php endif; ?>
@@ -861,11 +891,7 @@ final class JobsPage {
 				?>
 			</td>
 			<td>
-				<?php
-				if ( ! $status_only ) {
-					$this->render_actions( $job_id, $status, $type );
-				}
-				?>
+				<?php $this->render_actions( $job_id, $status, $type ); ?>
 			</td>
 		</tr>
 		<tr class="perflocale-jobs-detail-row" data-perflocale-job-detail="<?php echo esc_attr( $job_id ); ?>" hidden>

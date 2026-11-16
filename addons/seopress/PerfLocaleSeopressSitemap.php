@@ -196,6 +196,24 @@ final class PerfLocaleSeopressSitemap {
 			}
 		}
 
+		// A translated term's entry carries its display slug: one query for every taxonomy and language, then the
+		// same link check (a display slug can repeat across languages).
+		global $wpdb;
+
+		$taxonomies = array_values( array_map( 'strval', $taxonomies ) );
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- Placeholders built from the list.
+		$ids = $wpdb->get_col( $wpdb->prepare( "SELECT object_id FROM %i WHERE object_type = 'term' AND slug = %s AND object_subtype IN (" . implode( ',', array_fill( 0, count( $taxonomies ), '%s' ) ) . ')', array_merge( [ \PerfLocale\Database\Schema::table( 'slug_translations' ), $slug ], $taxonomies ) ) );
+
+		foreach ( is_array( $ids ) ? $ids : [] as $id ) {
+			$term_link = get_term_link( (int) $id );
+
+			if ( is_string( $term_link ) && trim( (string) wp_parse_url( $term_link, PHP_URL_PATH ), '/' ) === $path ) {
+				$cache[ $url ] = (int) $id;
+				return (int) $id;
+			}
+		}
+
 		$cache[ $url ] = 0;
 		return 0;
 	}

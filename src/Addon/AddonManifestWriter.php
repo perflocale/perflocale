@@ -28,10 +28,11 @@ final class AddonManifestWriter {
 	 *
 	 * HasUninstallTargets stores the targets, HasCustomUninstall the flag; an addon with neither gets no manifest.
 	 *
-	 * @param AddonInterface $addon The addon.
+	 * @param AddonInterface          $addon     The addon.
+	 * @param (\Closure(): bool)|null $may_write Asked only before a write; false skips it.
 	 * @return bool True if a write occurred, false if unchanged or skipped.
 	 */
-	public static function refresh( AddonInterface $addon ): bool {
+	public static function refresh( AddonInterface $addon, ?\Closure $may_write = null ): bool {
 		$addon_id = $addon->get_id();
 
 		if ( ! AddonSchemaManager::validate_addon_id( $addon_id ) ) {
@@ -75,7 +76,7 @@ final class AddonManifestWriter {
 		$manifest['checksum'] = sha1( wp_json_encode( $checksum_input ) );
 
 		$existing = self::read( $addon_id );
-		if ( null !== $existing && ( $existing['checksum'] ?? '' ) === $manifest['checksum'] ) {
+		if ( ( null !== $existing && ( $existing['checksum'] ?? '' ) === $manifest['checksum'] ) || ( null !== $may_write && ! $may_write() ) ) {
 			return false;
 		}
 

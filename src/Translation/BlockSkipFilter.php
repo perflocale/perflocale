@@ -46,6 +46,20 @@ final class BlockSkipFilter {
 	private static array $stash = [];
 
 	/**
+	 * Hash of the content being masked: the seed of its tokens.
+	 *
+	 * @var string
+	 */
+	private string $seed = '';
+
+	/**
+	 * Tokens made for that content so far.
+	 *
+	 * @var int
+	 */
+	private int $issued = 0;
+
+	/**
 	 * Runs whose restore found a placeholder missing and put the source content
 	 * back, keyed like self::$stash.
 	 *
@@ -468,6 +482,8 @@ final class BlockSkipFilter {
 	 * @return array{0: array<int, array<string, mixed>>, 1: array<string, string>, 2: array<string, string>, 3: array<string, true>} [ masked blocks, token => serialized subtree, token => parent block chain, token => true for a subtree whose own block is not marked ].
 	 */
 	private function mask_content( string $content, bool &$deep_withheld ): array {
+		$this->seed   = hash( 'sha256', $content );
+		$this->issued = 0;
 		$blocks       = parse_blocks( $content );
 		$placeholders = [];
 		$chains       = [];
@@ -569,8 +585,10 @@ final class BlockSkipFilter {
 	 * @return string The placeholder token that replaced $block.
 	 */
 	private function replace_with_token( array &$block ): string {
-		// An HTML comment passes through providers unchanged in HTML mode.
-		$token = '<!-- perflocale-skip-' . wp_generate_uuid4() . ' -->';
+		// An HTML comment passes through providers unchanged in HTML mode. The same content gives the same tokens, so a
+		// job's next slice sends the same parts (kept answers); a text cannot hold its own hash.
+		$hash  = hash( 'sha256', $this->seed . '|' . $this->issued++ );
+		$token = '<!-- perflocale-skip-' . substr( $hash, 0, 8 ) . '-' . substr( $hash, 8, 4 ) . '-' . substr( $hash, 12, 4 ) . '-' . substr( $hash, 16, 4 ) . '-' . substr( $hash, 20, 12 ) . ' -->';
 
 		// A freeform block serializes as its innerHTML alone, so the original
 		// delimiters and attribute JSON never reach the provider either.

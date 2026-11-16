@@ -98,19 +98,88 @@ final class BlockStructureGuard {
 	}
 
 	/**
-	 * Whether HTML shows a letter or digit (comments, tags, script and style bodies aside).
+	 * Unclosed openers above which the guards' lazy patterns are not run (each would scan to the end).
+	 */
+	public const UNCLOSED_MAX = 8;
+
+	/**
+	 * Openers that can never close: `<!--` after the last `-->` ($comments) and `<script` or `<style` after the last
+	 * closer of their name. One pass each.
 	 *
-	 * @param string $html HTML.
+	 * @param string $html     HTML.
+	 * @param bool   $comments Count comment openers too.
+	 * @return int
+	 */
+	public static function unclosed_raw( string $html, bool $comments = true ): int {
+		$n = 0;
+
+		if ( $comments && str_contains( $html, '<!--' ) ) {
+			$last = strrpos( $html, '-->' );
+			$n   += substr_count( $html, '<!--', false === $last ? 0 : $last + 3 );
+		}
+
+		foreach ( [ 'script', 'style' ] as $name ) {
+			if ( false === stripos( $html, '<' . $name ) ) {
+				continue;
+			}
+
+			$last = preg_match_all( '#</' . $name . '\s*+>#i', $html, $closers, PREG_OFFSET_CAPTURE ) ? end( $closers[0] ) : false;
+			$from = false === $last ? 0 : $last[1];
+			$n   += (int) preg_match_all( '#<' . $name . '\b#i', $html, $openers, 0, $from );
+		}
+
+		return $n;
+	}
+
+	/**
+	 * Whether HTML shows a letter or digit (comments, tags, script and style bodies aside): what a provider is sent.
+	 * Invalid UTF-8 or a failed pattern counts as text, so it is sent as before rather than dropped.
+	 *
+	 * @param string $html       HTML.
+	 * @param bool   $attributes Also alt, title, aria-label and placeholder values (some providers translate them).
 	 * @return bool
 	 */
-	public static function has_text( string $html ): bool {
+	public static function has_text( string $html, bool $attributes = false ): bool {
+		return self::shows( $html, $attributes, '/[\p{L}\p{N}]/u' );
+	}
+
+	/**
+	 * Whether HTML shows a letter, read as has_text() reads it: a string without one keeps its source (bulk strings).
+	 *
+	 * @param string $html       HTML.
+	 * @param bool   $attributes As has_text().
+	 * @return bool
+	 */
+	public static function has_letter( string $html, bool $attributes = false ): bool {
+		return self::shows( $html, $attributes, '/\p{L}/u' );
+	}
+
+	/**
+	 * Whether the visible text of $html (has_text()'s reading) matches $pattern.
+	 *
+	 * @param string $html       HTML.
+	 * @param bool   $attributes Also the attribute values has_text() reads.
+	 * @param string $pattern    Character pattern.
+	 * @return bool
+	 */
+	private static function shows( string $html, bool $attributes, string $pattern ): bool {
 		if ( '' === trim( $html ) ) {
 			return false;
 		}
 
-		$html = (string) preg_replace( '#<(script|style)\b[^>]*+>.*?</\1\s*>#is', '', $html );
+		if ( str_contains( $html, '<' ) || str_contains( $html, '&' ) ) {
+			// Many openers that never close would each scan to the end: then their bodies count as text (linear).
+			$bare = self::unclosed_raw( $html, false ) > self::UNCLOSED_MAX ? $html : preg_replace( '#<(script|style)\b[^>]*+>.*?</\1\s*>#is', '', $html );
 
-		return 1 === preg_match( '/[\p{L}\p{N}]/u', html_entity_decode( strip_tags( $html ), ENT_QUOTES | ENT_HTML5, 'UTF-8' ) ); // phpcs:ignore WordPress.WP.AlternativeFunctions.strip_tags_strip_tags -- A text check, not output; script and style are removed above.
+			if ( null === $bare ) {
+				return true;
+			}
+
+			$said = $attributes && preg_match_all( '#\s(?:alt|title|aria-label|placeholder)\s*=\s*(?:"([^"]*+)"|\'([^\']*+)\')#i', $bare, $m ) ? ' ' . implode( ' ', $m[1] ) . ' ' . implode( ' ', $m[2] ) : '';
+			$html = html_entity_decode( strip_tags( $bare ) . $said, ENT_QUOTES | ENT_HTML5, 'UTF-8' ); // phpcs:ignore WordPress.WP.AlternativeFunctions.strip_tags_strip_tags -- A text check, not output; script and style are removed above.
+		}
+
+		return 0 !== preg_match( $pattern, $html );
 	}
 
 	/**
@@ -414,6 +483,16 @@ final class BlockStructureGuard {
 		}
 
 		return $tokens;
+	}
+
+	/**
+	 * Whether a text holds delimiter text outside a readable delimiter (in masked content: any delimiter text left).
+	 *
+	 * @param string $html Text.
+	 * @return bool
+	 */
+	public static function has_stray( string $html ): bool {
+		return 1 === preg_match( self::STRAY, $html );
 	}
 
 	/**

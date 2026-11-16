@@ -61,6 +61,7 @@ final class GoogleProvider extends AbstractProvider {
 	 */
 	public function translate( string $text, string $source_lang, string $target_lang, bool $fast_fail = false, string $format = 'html' ): string {
 		$text = apply_filters( 'perflocale/machine_translation/text_before_send', $text, 'google', $target_lang );
+		$this->guard_send( \PerfLocale\Util\Utf8::length( \PerfLocale\Util\Scalar::str( $text ) ) );
 
 		$response = $this->make_request(
 			self::API_URL,
@@ -112,7 +113,7 @@ final class GoogleProvider extends AbstractProvider {
 	 * @throws \RuntimeException When Google Translate batch returns an unexpected response or all retries fail.
 	 */
 	public function translate_batch( array $texts, string $source_lang, string $target_lang, bool $fast_fail = false, string $format = 'html' ): array {
-		return $this->without_blank( $texts, fn( array $sent ): array => $this->send_batch( $sent, $source_lang, $target_lang, $fast_fail, $format ) );
+		return $this->without_blank( $texts, fn( array $sent ): array => $this->send_batch( $sent, $source_lang, $target_lang, $fast_fail, $format ), $format );
 	}
 
 	/**
@@ -143,6 +144,8 @@ final class GoogleProvider extends AbstractProvider {
 				$target_lang
 			);
 		}
+
+		$this->guard_send( (int) array_sum( array_map( [ \PerfLocale\Util\Utf8::class, 'length' ], $filtered ) ) );
 
 		$response = $this->make_request(
 			self::API_URL,
@@ -202,7 +205,7 @@ final class GoogleProvider extends AbstractProvider {
 		// Usage is tracked once per batch: one option write, not one per text.
 		$total_chars = 0;
 		foreach ( $filtered as $text ) {
-			$total_chars += mb_strlen( (string) $text );
+			$total_chars += \PerfLocale\Util\Utf8::length( (string) $text );
 		}
 		$this->track_usage_chars( $total_chars );
 

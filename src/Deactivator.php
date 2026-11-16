@@ -158,7 +158,9 @@ final class Deactivator {
 	}
 
 	/**
-	 * Per-blog deactivation cleanup of the current blog: schedules, rewrite rules, the Translator role and caches.
+	 * Per-blog deactivation cleanup of the current blog: schedules, rewrite rules and caches.
+	 *
+	 * Roles and capabilities stay (the owner's edits to them are data, as options are); uninstall removes them.
 	 *
 	 * @return void
 	 */
@@ -172,6 +174,9 @@ final class Deactivator {
 			remove_filter( 'rewrite_rules_array', [ $plugin->get( 'rewrite_manager' ), 'filter_rewrite_rules' ] );
 		}
 
+		// First: deleting the rules below would queue a compile that autoloads the URL bases rows again.
+		\PerfLocale\Router\UrlBases\Lifecycle::stop();
+
 		// Deleted, not flush_rewrite_rules(): switch_to_blog() keeps the first blog's $wp_rewrite, so a flush would write
 		// its rules into this blog, and they would stick. Each blog regenerates its own on its next front-end request.
 		delete_option( 'rewrite_rules' );
@@ -179,8 +184,20 @@ final class Deactivator {
 		// Per-blog flag set by the Activator.
 		delete_option( 'perflocale_flush_rules' );
 
-		// The Translator role and the perflocale_* caps of this blog; the Activator installs them again.
-		\PerfLocale\Admin\TranslatorRole::remove_roles();
+		// Derived: rewritten by the next URL-bases read after reactivation.
+		delete_option( 'perflocale_url_bases_none' );
+
+		// The 6-hour throttle of the recurring-schedule check: the first admin load after reactivation checks the events again.
+		delete_option( 'perflocale_schedules_verified_at' );
+
+		// Kept, but not loaded on every request while inactive; Activator::seed_request_options() autoloads them again.
+		wp_set_option_autoload_values(
+			[
+				'perflocale_url_bases_map'     => false,
+				'perflocale_url_bases_dirty'   => false,
+				'perflocale_url_bases_checked' => false,
+			]
+		);
 
 		// Every plugin cache of this blog, or stale links serve wrong-language content after reactivation.
 		try {
@@ -190,19 +207,68 @@ final class Deactivator {
 				$plugin->get( 'cache' )->flush_all();
 			}
 		} catch ( \Throwable $e ) {
-			// The container may not be initialised: clear this blog's transients directly.
-			global $wpdb;
-
-			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-			$wpdb->query(
-				$wpdb->prepare(
-					"DELETE FROM {$wpdb->options} WHERE option_name LIKE %s OR option_name LIKE %s",
-					$wpdb->esc_like( '_transient_perflocale_' ) . '%',
-					$wpdb->esc_like( '_transient_timeout_perflocale_' ) . '%'
-				)
-			);
-			wp_cache_flush();
+			// The container may not be initialised: flush_all()'s steps without it.
+			self::flush_without_container();
 		}
+	}
+
+	/**
+	 * CacheManager::flush_all() without the container: the generation bumps, the transient rows and, under a persistent
+	 * cache, the fixed-name transients. Never wp_cache_flush(): it empties every site's and plugin's cache.
+	 *
+	 * @return void
+	 */
+	private static function flush_without_container(): void {
+		foreach ( \PerfLocale\Cache\CacheManager::GROUPS as $group ) {
+			\PerfLocale\Cache\CacheManager::bump_group_generation( $group );
+		}
+
+		self::delete_namespace_transients();
+
+		if ( wp_using_ext_object_cache() ) {
+			wp_cache_delete_multiple( \PerfLocale\Cache\CacheManager::FLUSH_DELETED_TRANSIENTS, 'transient' );
+		}
+
+		wp_cache_delete( 'alloptions', 'options' );
+	}
+
+	/**
+	 * Delete this blog's `perflocale_` transient rows without the container, minus the state ones flush_all() keeps (paid
+	 * MT checkpoints, rate limits, breakers), Pro's and every registered add-on's.
+	 *
+	 * @return void
+	 */
+	private static function delete_namespace_transients(): void {
+		global $wpdb;
+		/**
+		 * WordPress database access object.
+		 *
+		 * @var \wpdb $wpdb
+		 */
+
+		// As CacheManager::flush_all(): the state transients, Pro's and every registered add-on's stay.
+		$not = [];
+
+		// An unread add-on list keeps the whole namespace (the DELETE matches nothing).
+		foreach ( array_merge( \PerfLocale\Cache\CacheManager::FLUSH_KEPT_TRANSIENTS, \PerfLocale\Database\SiteCleanup::protected_prefixes() ?? [ 'perflocale_' ] ) as $kept ) {
+			$not[] = $wpdb->esc_like( '_transient_' . $kept ) . '%';
+			$not[] = $wpdb->esc_like( '_transient_timeout_' . $kept ) . '%';
+		}
+
+		$not_sql = implode( '', array_fill( 0, count( $not ), ' AND option_name NOT LIKE %s' ) );
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- The placeholders are built above.
+		$wpdb->query(
+			// phpcs:ignore WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- ...$not fills the NOT LIKE placeholders of $not_sql.
+			$wpdb->prepare(
+				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- $not_sql holds only placeholders.
+				"DELETE FROM %i WHERE ( option_name LIKE %s OR option_name LIKE %s ){$not_sql}",
+				$wpdb->options,
+				$wpdb->esc_like( '_transient_perflocale_' ) . '%',
+				$wpdb->esc_like( '_transient_timeout_perflocale_' ) . '%',
+				...$not
+			) ?? ''
+		);
 	}
 
 	/**

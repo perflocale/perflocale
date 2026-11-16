@@ -35,6 +35,21 @@ final class ExportItems {
 	private const EXPORT_BATCH = 1000;
 
 	/**
+	 * Values an import names in its errors; the rest are counted in one line.
+	 */
+	private const ERRORS_NAMED = 20;
+
+	/**
+	 * Classic menus an export lists by id and slug.
+	 */
+	private const MENUS_MAX = 5000;
+
+	/**
+	 * An option helper's answer for a value the database did not save.
+	 */
+	private const NOT_SAVED = 'not_saved';
+
+	/**
 	 * A machine translation's pending mark (TranslationService::PENDING_META_KEY): "<time>", or "<time>:c" while created,
 	 * either with ":<row fingerprint>".
 	 */
@@ -92,7 +107,8 @@ final class ExportItems {
 				$missing = new \stdClass();
 				$value   = get_option( $name, $missing );
 
-				if ( $value === $missing ) {
+				// An empty redirect map is the row every site keeps, not data: a replace import must not clear the target's.
+				if ( $value === $missing || ( [] === $value && 'perflocale_slug_redirects' === $name ) ) {
 					continue;
 				}
 
@@ -204,6 +220,38 @@ final class ExportItems {
 				}
 			} while ( self::EXPORT_BATCH === $count );
 		}
+	}
+
+	/**
+	 * The envelope's `object_max_ids`: the highest ids, the write time and the classic menus (id => slug) when the file
+	 * was written. No import reads it: it tells content the file knew from later content (ids can be reused).
+	 *
+	 * @return array{post: int, term: int, order: int, at: string, at_local: string, menus: array<int, string>|null}
+	 * @throws \RuntimeException When a read fails.
+	 */
+	public static function object_max_ids(): array {
+		$wpdb = Typed::wpdb();
+
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- One aggregate per table, export header only.
+		$post = Typed::int( $wpdb->get_var( $wpdb->prepare( 'SELECT MAX(ID) FROM %i', $wpdb->posts ) ) );
+		self::fail_on_db_error( 'the highest post id' );
+		$term = Typed::int( $wpdb->get_var( $wpdb->prepare( 'SELECT MAX(term_id) FROM %i', $wpdb->terms ) ) );
+		self::fail_on_db_error( 'the highest term id' );
+		$order = self::hpos() ? Typed::int( $wpdb->get_var( $wpdb->prepare( 'SELECT MAX(id) FROM %i', $wpdb->prefix . 'wc_orders' ) ) ) : $post;
+		self::fail_on_db_error( 'the highest order id' );
+		$menus = Typed::rows( $wpdb->get_results( $wpdb->prepare( 'SELECT t.term_id, t.slug FROM %i t INNER JOIN %i tt ON tt.term_id = t.term_id AND tt.taxonomy = %s LIMIT %d', $wpdb->terms, $wpdb->term_taxonomy, 'nav_menu', self::MENUS_MAX + 1 ), ARRAY_A ) );
+		self::fail_on_db_error( 'the classic menus' );
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+
+		return [
+			'post'     => $post,
+			'term'     => $term,
+			'order'    => $order,
+			'at'       => gmdate( 'Y-m-d H:i:s' ),
+			'at_local' => current_time( 'mysql' ),
+			// Past MENUS_MAX menus none is listed, and no menu loses a value.
+			'menus'    => count( $menus ) > self::MENUS_MAX ? null : array_column( array_map( static fn( array $r ): array => [ Typed::int( $r['term_id'] ?? 0 ), Typed::str( $r['slug'] ?? '' ) ], $menus ), 1, 0 ),
+		];
 	}
 
 	/**
@@ -320,15 +368,17 @@ final class ExportItems {
 	 * @param bool                                                                                                                 $replace Replace mode.
 	 * @param int                                                                                                                  $max_row Largest row read, in bytes.
 	 * @param int                                                                                                                  $size    Rows per piece.
-	 * @return array{imported: int, skipped: int, reasons: array<string, int>, notes: array<int, string>, matched: array<string, int>}
+	 * @param bool                                                                                                                 $same_site The file matched this site or the user confirmed a copy: only then is this site's redirect history replaced.
+	 * @return array{imported: int, skipped: int, reasons: array<string, int>, notes: array<int, string>, matched: array<string, int>, errors: array<int, string>}
 	 */
-	public static function import( ImportReader $reader, array $lists, bool $replace, int $max_row, int $size ): array {
+	public static function import( ImportReader $reader, array $lists, bool $replace, int $max_row, int $size, bool $same_site = false ): array {
 		$out = [
 			'imported' => 0,
 			'skipped'  => 0,
 			'reasons'  => [],
 			'notes'    => [],
 			'matched'  => [],
+			'errors'   => [],
 		];
 
 		foreach ( $lists as $member => $items ) {
@@ -348,14 +398,25 @@ final class ExportItems {
 
 				if ( count( $piece ) >= $size ) {
 					ImportLock::heartbeat();
-					self::import_piece( $pseudo, $items, $piece, $replace, $out );
+					self::import_piece( $pseudo, $items, $piece, $replace, $out, $same_site );
 					$piece = [];
 				}
 			}
 
 			if ( [] !== $piece ) {
-				self::import_piece( $pseudo, $items, $piece, $replace, $out );
+				self::import_piece( $pseudo, $items, $piece, $replace, $out, $same_site );
 			}
+		}
+
+		$failed = count( $out['errors'] );
+
+		if ( $failed > self::ERRORS_NAMED ) {
+			$out['errors']   = array_slice( $out['errors'], 0, self::ERRORS_NAMED );
+			$out['errors'][] = sprintf(
+				/* translators: %d: number of further values */
+				_n( 'And %d more value was not saved. Run the import again.', 'And %d more values were not saved. Run the import again.', $failed - self::ERRORS_NAMED, 'perflocale' ),
+				$failed - self::ERRORS_NAMED
+			);
 		}
 
 		if ( ( $out['reasons']['webhook_secret_new'] ?? 0 ) > 0 ) {
@@ -379,17 +440,18 @@ final class ExportItems {
 	/**
 	 * Import one piece of a row list.
 	 *
-	 * @param string                                                                                                                  $pseudo Row list.
-	 * @param array<int, array{0: string, 1: string, 2: string|null, 3: string|null, 4: callable|null, 5?: string}>                   $items  Items the declared sections carry in it.
-	 * @param array<int, mixed>                                                                                                       $piece  Decoded rows.
-	 * @param bool                                                                                                                    $replace Replace mode.
-	 * @param array{imported: int, skipped: int, reasons: array<string, int>, notes: array<int, string>, matched: array<string, int>} $out Result (updated).
+	 * @param string                                                                                                                                                            $pseudo Row list.
+	 * @param array<int, array{0: string, 1: string, 2: string|null, 3: string|null, 4: callable|null, 5?: string}>                                                             $items  Items the declared sections carry in it.
+	 * @param array<int, mixed>                                                                                                                                                 $piece  Decoded rows.
+	 * @param bool                                                                                                                                                              $replace Replace mode.
+	 * @param array{imported: int, skipped: int, reasons: array<string, int>, notes: array<int, string>, matched: array<string, int>, errors: array<int, string>} $out Result (updated).
+	 * @param bool                                                                                                                                                              $same_site The file matched this site or a copy was confirmed.
 	 * @return void
 	 */
-	private static function import_piece( string $pseudo, array $items, array $piece, bool $replace, array &$out ): void {
+	private static function import_piece( string $pseudo, array $items, array $piece, bool $replace, array &$out, bool $same_site ): void {
 		if ( 'options' === $pseudo ) {
 			foreach ( $piece as $row ) {
-				self::import_option( $row, $items, $replace, $out );
+				self::import_option( $row, $items, $replace, $out, $same_site );
 			}
 
 			return;
@@ -422,7 +484,6 @@ final class ExportItems {
 		$fps     = ObjectFingerprint::for_ids( $kind, $ids );
 
 		foreach ( $rows as [ $id, $key, $row, $item ] ) {
-
 			if ( ! self::object_fits( $item[2], $objects[ $id ] ?? null ) ) {
 				self::skip( $out, 'object_changed' );
 				continue;
@@ -450,10 +511,14 @@ final class ExportItems {
 				continue;
 			}
 
-			if ( self::write_meta( $pseudo, $id, $key, $value, $replace ) ) {
+			$written = self::write_meta( $pseudo, $id, $key, $value, $replace );
+
+			if ( 1 === $written ) {
 				++$out['imported'];
-			} else {
+			} elseif ( 0 === $written ) {
 				++$out['skipped'];
+			} else {
+				$out['errors'][] = self::not_saved( $pseudo, $id, $key );
 			}
 		}
 
@@ -461,15 +526,47 @@ final class ExportItems {
 	}
 
 	/**
+	 * The error for one meta value the database did not save.
+	 *
+	 * @param string $pseudo Row list.
+	 * @param int    $id     Object ID.
+	 * @param string $key    Meta key.
+	 * @return string
+	 */
+	private static function not_saved( string $pseudo, int $id, string $key ): string {
+		/* translators: 1: meta key, 2: post, term or order, 3: its ID */
+		return sprintf( __( 'Not imported: %1$s of %2$s %3$d. The database did not save it. Run the import again.', 'perflocale' ), $key, self::object_kind( $pseudo ), $id );
+	}
+
+	/**
+	 * The stored values of one meta key of one object, read from its table (no cache); null when the read fails.
+	 *
+	 * @param string $pseudo Meta kind.
+	 * @param int    $id     Object ID.
+	 * @param string $key    Meta key.
+	 * @return array<int, string>|null
+	 */
+	private static function stored_values( string $pseudo, int $id, string $key ): ?array {
+		$wpdb = Typed::wpdb();
+
+		[ $table, , $object_col ] = self::meta_storage( $pseudo );
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The check of an import write: the stored rows, not a cache.
+		$values = $wpdb->get_col( $wpdb->prepare( 'SELECT meta_value FROM %i WHERE %i = %d AND meta_key = %s', $table, $object_col, $id, $key ) );
+
+		return '' === $wpdb->last_error ? array_map( static fn( $v ): string => is_scalar( $v ) ? (string) $v : '', array_values( (array) $values ) ) : null;
+	}
+
+	/**
 	 * Import one option row.
 	 *
-	 * @param mixed                                                                                                                   $row     Decoded row.
-	 * @param array<int, array{0: string, 1: string, 2: string|null, 3: string|null, 4: callable|null, 5?: string}>                   $items   Option items of the declared sections.
-	 * @param bool                                                                                                                    $replace Replace mode.
-	 * @param array{imported: int, skipped: int, reasons: array<string, int>, notes: array<int, string>, matched: array<string, int>} $out Result (updated).
+	 * @param mixed                                                                                                                                                             $row     Decoded row.
+	 * @param array<int, array{0: string, 1: string, 2: string|null, 3: string|null, 4: callable|null, 5?: string}>                                                             $items   Option items of the declared sections.
+	 * @param bool                                                                                                                                                              $replace Replace mode.
+	 * @param array{imported: int, skipped: int, reasons: array<string, int>, notes: array<int, string>, matched: array<string, int>, errors: array<int, string>} $out Result (updated).
 	 * @return void
 	 */
-	private static function import_option( $row, array $items, bool $replace, array &$out ): void {
+	private static function import_option( $row, array $items, bool $replace, array &$out, bool $same_site = false ): void {
 		$row  = Typed::map( $row );
 		$name = Typed::str( $row['name'] ?? null );
 		$item = '' !== $name ? self::item_for( $items, $name ) : null;
@@ -489,10 +586,14 @@ final class ExportItems {
 
 		switch ( true ) {
 			case 'perflocale_slug_redirects' === $name:
-				$written = self::import_slug_redirects( $value, $replace );
+				// Another site's old language codes are not this site's: its own redirects stay.
+				$written = $same_site ? self::import_slug_redirects( $value, $replace ) : false;
 				break;
 			case 'perflocale_webhooks' === $name:
 				$written = self::import_webhooks( $value, $out );
+				break;
+			case \PerfLocale\Router\UrlBases\Values::OPTION === $name:
+				$written = self::urlbases_import_option( $value, $out, $same_site );
 				break;
 			case 'perflocale_translator_caps' === $name:
 				$written = self::import_translator_ledger( $value );
@@ -514,9 +615,37 @@ final class ExportItems {
 			++$out['imported'];
 		} elseif ( false === $written ) {
 			++$out['skipped'];
+		} elseif ( self::NOT_SAVED === $written ) {
+			$out['errors'][] = \PerfLocale\Router\UrlBases\Values::OPTION === $name
+				/* translators: %s: option name */
+				? sprintf( __( 'Not imported: option %s. Another save of the URL bases was running, or the database did not save them. Run the import again.', 'perflocale' ), $name )
+				/* translators: %s: option name */
+				: sprintf( __( 'Not imported: option %s. The database did not save it. Run the import again.', 'perflocale' ), $name );
 		} else {
 			self::skip( $out, 'bad_value' );
 		}
+	}
+
+	/**
+	 * Store one imported option: false from update_option() is also core's answer for the value already stored, so a
+	 * read of its row tells an unchanged value (false) from one the database did not save (NOT_SAVED).
+	 *
+	 * @param string    $name     Option name.
+	 * @param mixed     $value    Value.
+	 * @param bool|null $autoload Autoload.
+	 * @return bool|string
+	 */
+	private static function save_option( string $name, $value, ?bool $autoload ) {
+		if ( update_option( $name, $value, $autoload ) ) {
+			return true;
+		}
+
+		$wpdb = Typed::wpdb();
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The check of an import write: the stored row, not a cache.
+		$raw = $wpdb->get_var( $wpdb->prepare( 'SELECT option_value FROM %i WHERE option_name = %s', $wpdb->options, $name ) );
+
+		return is_string( $raw ) && '' === $wpdb->last_error && ( maybe_serialize( $value ) === $raw || maybe_unserialize( $raw ) === $value ) ? false : self::NOT_SAVED;
 	}
 
 	/**
@@ -529,9 +658,9 @@ final class ExportItems {
 	 * @param callable                                                                                  $sanitizer The entry's import sanitizer (the item's fifth member).
 	 * @param array{0: string, 1: string, 2: string|null, 3: string|null, 4: callable|null, 5?: string} $item      Registry item.
 	 * @param bool                                                                                      $replace   Replace mode.
-	 * @return bool|null True when written, false when nothing changed, null when the sanitizer refused the value.
+	 * @return bool|string|null True when written, false when nothing changed, null when the sanitizer refused the value. NOT_SAVED when the database did not save it.
 	 */
-	private static function import_extension_option( string $name, $value, callable $sanitizer, array $item, bool $replace ): ?bool {
+	private static function import_extension_option( string $name, $value, callable $sanitizer, array $item, bool $replace ) {
 		$clean = call_user_func( $sanitizer, $value, $name );
 
 		if ( null === $clean || is_object( $clean ) ) {
@@ -553,7 +682,7 @@ final class ExportItems {
 			return false;
 		}
 
-		return update_option( $name, $clean, false );
+		return self::save_option( $name, $clean, false );
 	}
 
 	/**
@@ -561,9 +690,9 @@ final class ExportItems {
 	 *
 	 * @param mixed $value   File value.
 	 * @param bool  $replace Replace mode.
-	 * @return bool|null True when written, false when nothing changed, null when the value is not a map.
+	 * @return bool|string|null True when written, false when nothing changed, null when the value is not a map. NOT_SAVED when the database did not save it.
 	 */
-	private static function import_slug_redirects( $value, bool $replace ): ?bool {
+	private static function import_slug_redirects( $value, bool $replace ) {
 		if ( ! is_array( $value ) ) {
 			return null;
 		}
@@ -590,7 +719,212 @@ final class ExportItems {
 			return false;
 		}
 
-		return update_option( \PerfLocale\Database\Repository\LanguageRepository::REDIRECTS_OPTION, $next );
+		return self::save_option( \PerfLocale\Database\Repository\LanguageRepository::REDIRECTS_OPTION, $next, true );
+	}
+
+	/**
+	 * The URL bases values: a replace writes the file's and forgets this site's old bases (a merge never gets here: the
+	 * registry's merge rule is `never`). Syntax only here; the compile that ends the import runs every other rule.
+	 *
+	 * @param mixed                                                                                                                                                             $value File value.
+	 * @param array{imported: int, skipped: int, reasons: array<string, int>, notes: array<int, string>, matched: array<string, int>, errors: array<int, string>} $out   Result (updated).
+	 * @return bool|string|null True when written, false when nothing changed, null when the value is not a value set. NOT_SAVED when the database did not save it.
+	 */
+	private static function urlbases_import_option( $value, array &$out, bool $same_site = false ) {
+		if ( ! is_array( $value ) ) {
+			return null;
+		}
+
+		$incoming = \PerfLocale\Router\UrlBases\Values::shape( $value );
+		$dropped  = self::urlbases_invalid( $value );
+
+		foreach ( $incoming['keys'] as $key => $entry ) {
+			foreach ( $entry['tr'] ?? [] as $lang => $segs ) {
+				if ( '' !== \PerfLocale\Router\UrlBases\Validator::syntax( $segs ) ) {
+					unset( $incoming['keys'][ $key ]['tr'][ $lang ] );
+					++$dropped;
+				}
+			}
+
+			foreach ( $entry['hist'] ?? [] as $lang => $list ) {
+				$keep     = array_values( array_filter( $list, static fn( string $segs ): bool => '' === \PerfLocale\Router\UrlBases\Validator::syntax( $segs ) ) );
+				$dropped += count( $list ) - count( $keep );
+
+				if ( [] === $keep ) {
+					unset( $incoming['keys'][ $key ]['hist'][ $lang ] );
+				} else {
+					$incoming['keys'][ $key ]['hist'][ $lang ] = $keep;
+				}
+			}
+
+			$reg      = $entry['reg'] ?? [];
+			$keep     = array_values( array_filter( $reg, static fn( string $segs ): bool => '' === \PerfLocale\Router\UrlBases\Validator::syntax( $segs ) ) );
+			$dropped += count( $reg ) - count( $keep );
+
+			if ( [] === $keep ) {
+				unset( $incoming['keys'][ $key ]['reg'] );
+			} else {
+				$incoming['keys'][ $key ]['reg'] = $keep;
+			}
+		}
+
+		if ( $dropped > 0 ) {
+			$out['notes'][] = sprintf(
+				/* translators: %d: number of URL base values */
+				_n( '%d URL base value was not imported: it is not a valid URL base.', '%d URL base values were not imported: they are not valid URL bases.', $dropped, 'perflocale' ),
+				$dropped
+			);
+		}
+
+		// The file's old bases and record only; the next compile carries none of this site's stored map forward. Another
+		// site's file: its old bases are not this site's, so this site's history and record stay. Only languages this site
+		// has, locked in the write's transaction: data under any other slug would bind to a language added later.
+		$absent = 0;
+		$stored = \PerfLocale\Router\UrlBases\Values::update(
+			static function ( array $current, array $live ) use ( $incoming, $same_site, &$absent ): array {
+				[ $file, $absent ] = self::urlbases_live_only( $incoming, $live );
+
+				return $same_site ? [ 'forget' => [ '*' ] ] + $file : self::urlbases_keep_history( $file, $current, \PerfLocale\Router\UrlBases\Values::published(), $live );
+			}
+		);
+
+		if ( null !== $stored && $absent > 0 ) {
+			$out['notes'][] = sprintf(
+				/* translators: %d: number of URL base values */
+				_n( '%d URL base value was not imported: this site has no language with its code.', '%d URL base values were not imported: this site has no language with their codes.', $absent, 'perflocale' ),
+				$absent
+			);
+		}
+
+		return null === $stored ? self::NOT_SAVED : $stored;
+	}
+
+	/**
+	 * A file's value set without the values, history and recorded addresses of slugs that are no language here, and how
+	 * many values and history entries that dropped.
+	 *
+	 * @param array<string, mixed> $incoming The file's value set, shaped.
+	 * @param list<string>         $live     Language slugs of this site.
+	 * @return array{0: array<string, mixed>, 1: int}
+	 */
+	private static function urlbases_live_only( array $incoming, array $live ): array {
+		$dropped = 0;
+		$keys    = is_array( $incoming['keys'] ?? null ) ? $incoming['keys'] : [];
+
+		foreach ( $keys as $key => $entry ) {
+			$entry = is_array( $entry ) ? $entry : [];
+
+			foreach ( [ 'tr', 'hist' ] as $field ) {
+				$by_lang = is_array( $entry[ $field ] ?? null ) ? $entry[ $field ] : [];
+
+				foreach ( $by_lang as $lang => $value ) {
+					if ( ! in_array( (string) $lang, $live, true ) ) {
+						$dropped += 'tr' === $field ? 1 : count( Typed::arr( $value ) );
+						unset( $by_lang[ $lang ] );
+					}
+				}
+
+				if ( isset( $entry[ $field ] ) ) {
+					$entry[ $field ] = $by_lang;
+				}
+			}
+
+			$keys[ $key ] = $entry;
+		}
+
+		$incoming['keys'] = $keys;
+		$pub              = is_array( $incoming['pub'] ?? null ) ? $incoming['pub'] : [];
+
+		// Recorded addresses are no values (no count), but under a slug that is no language they would refuse its later rename.
+		foreach ( $pub as $key => $by_lang ) {
+			$pub[ $key ] = array_intersect_key( Typed::arr( $by_lang ), array_flip( $live ) );
+		}
+
+		$incoming['pub'] = $pub;
+
+		return [ \PerfLocale\Router\UrlBases\Values::shape( $incoming ), $dropped ];
+	}
+
+	/**
+	 * $incoming with this site's history, registered bases, published record and pending forget instead of the file's
+	 * (another site's are no evidence here): a value of this site that was live and that the file replaces joins the
+	 * history. Runs in the values write's transaction (Values::update()).
+	 *
+	 * @param array<string, mixed>                            $incoming The file's value set, shaped.
+	 * @param array<string, mixed>                            $current  This site's stored value set, shaped.
+	 * @param array<string, array<string, list<string>>>|null $served   What this site's map serves; null when unread.
+	 * @param list<string>                                    $slugs    Language slugs of this site, locked in the transaction.
+	 * @return array<string, mixed>
+	 */
+	private static function urlbases_keep_history( array $incoming, array $current, ?array $served, array $slugs ): array {
+		$mine = \PerfLocale\Router\UrlBases\Values::shape( $current );
+		$out  = \PerfLocale\Router\UrlBases\Values::shape( $incoming );
+
+		foreach ( array_keys( $out['keys'] ) as $key ) {
+			unset( $out['keys'][ $key ]['hist'], $out['keys'][ $key ]['reg'] );
+		}
+
+		foreach ( $mine['keys'] as $key => $entry ) {
+			// History only for languages this site has: a removed slug's data never waits for a language added later.
+			if ( isset( $entry['hist'] ) ) {
+				$entry['hist'] = array_intersect_key( $entry['hist'], array_flip( $slugs ) );
+			}
+
+			$own = array_filter( array_intersect_key( $entry, [ 'hist' => 0, 'reg' => 0 ] ), static fn( $part ): bool => [] !== $part );
+
+			if ( [] !== $own ) {
+				$out['keys'][ $key ] = $own + ( $out['keys'][ $key ] ?? [] );
+			}
+		}
+
+		$out['v']      = $mine['v'];
+		$out['pub']    = array_map( static fn( array $by_lang ): array => array_intersect_key( $by_lang, array_flip( $slugs ) ), $mine['pub'] );
+		$out['forget'] = $mine['forget'] ?? [];
+		$live          = \PerfLocale\Router\UrlBases\Values::witnesses( $mine, $served );
+
+		foreach ( $mine['keys'] as $key => $entry ) {
+			foreach ( array_intersect_key( $entry['tr'] ?? [], array_flip( $slugs ) ) as $lang => $old ) {
+				$new = $out['keys'][ $key ]['tr'][ $lang ] ?? '';
+
+				if ( $new !== $old ) {
+					$out['keys'][ $key ]['tr'][ $lang ] = $old;
+					$out = \PerfLocale\Router\UrlBases\Values::with_value( $out, $key, $lang, $new, $out['keys'][ $key ]['grp'] ?? $entry['grp'] ?? 'core', \PerfLocale\Router\UrlBases\Values::was_live( $live, $key, $lang, $old, $slugs ) );
+				}
+			}
+		}
+
+		return $out;
+	}
+
+	/**
+	 * Values and history entries of a raw URL bases value set that are not in the stored form.
+	 *
+	 * @param mixed $value Value set.
+	 * @return int
+	 */
+	private static function urlbases_invalid( $value ): int {
+		$n     = 0;
+		$valid = static fn( $segs ): bool => is_string( $segs ) && null !== \PerfLocale\Router\UrlBases\Values::clean_segments( $segs );
+
+		foreach ( is_array( $value ) ? (array) ( $value['keys'] ?? [] ) : [] as $key => $entry ) {
+			$key_ok = is_string( $key ) && 1 === preg_match( \PerfLocale\Router\UrlBases\Registry::KEY_PATTERN, $key ) && is_array( $entry );
+
+			foreach ( is_array( $entry ) ? (array) ( $entry['tr'] ?? [] ) : [] as $lang => $segs ) {
+				$n += ( $key_ok && is_string( $lang ) && \PerfLocale\Router\UrlBases\Values::is_lang( $lang ) && $valid( $segs ) ) ? 0 : 1;
+			}
+
+			foreach ( is_array( $entry ) ? (array) ( $entry['hist'] ?? [] ) : [] as $lang => $list ) {
+				foreach ( (array) $list as $segs ) {
+					$n += ( $key_ok && is_string( $lang ) && \PerfLocale\Router\UrlBases\Values::is_lang( $lang ) && $valid( $segs ) ) ? 0 : 1;
+				}
+			}
+
+			foreach ( is_array( $entry ) ? (array) ( $entry['reg'] ?? [] ) : [] as $segs ) {
+				$n += ( $key_ok && $valid( $segs ) ) ? 0 : 1;
+			}
+		}
+
+		return $n;
 	}
 
 	/**
@@ -598,11 +932,11 @@ final class ExportItems {
 	 *
 	 * The file carries no secrets: a known address keeps this site's secret, any other gets a new random one.
 	 *
-	 * @param mixed                                                                                                                   $value File value.
-	 * @param array{imported: int, skipped: int, reasons: array<string, int>, notes: array<int, string>, matched: array<string, int>} $out   Result (updated).
-	 * @return bool|null
+	 * @param mixed                                                                                                                                                             $value File value.
+	 * @param array{imported: int, skipped: int, reasons: array<string, int>, notes: array<int, string>, matched: array<string, int>, errors: array<int, string>} $out   Result (updated).
+	 * @return bool|string|null
 	 */
-	private static function import_webhooks( $value, array &$out ): ?bool {
+	private static function import_webhooks( $value, array &$out ) {
 		if ( ! is_array( $value ) ) {
 			return null;
 		}
@@ -643,7 +977,7 @@ final class ExportItems {
 				continue;
 			}
 
-			$id = is_string( $hook['id'] ?? null ) && 1 === preg_match( '/^[A-Za-z0-9-]{1,64}$/', $hook['id'] ) ? $hook['id'] : wp_generate_uuid4();
+			$id = is_string( $hook['id'] ?? null ) && 1 === preg_match( '/^[A-Za-z0-9-]{1,64}\z/', $hook['id'] ) ? $hook['id'] : wp_generate_uuid4();
 
 			if ( isset( $secrets[ $url ] ) ) {
 				$secret = $secrets[ $url ];
@@ -657,7 +991,7 @@ final class ExportItems {
 				'url'        => $url,
 				'events'     => $hook_events,
 				'secret'     => $secret,
-				'created_at' => is_string( $hook['created_at'] ?? null ) && 1 === preg_match( '/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/', $hook['created_at'] ) ? $hook['created_at'] : gmdate( 'Y-m-d H:i:s' ),
+				'created_at' => is_string( $hook['created_at'] ?? null ) && 1 === preg_match( '/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\z/', $hook['created_at'] ) ? $hook['created_at'] : gmdate( 'Y-m-d H:i:s' ),
 			];
 		}
 
@@ -665,17 +999,17 @@ final class ExportItems {
 			return false;
 		}
 
-		// Not autoloaded, as WebhookController stores it: the secrets stay out of alloptions.
-		return update_option( 'perflocale_webhooks', $next, false );
+		// As WebhookController stores it: autoloaded only while empty, so the secrets stay out of alloptions.
+		return self::save_option( 'perflocale_webhooks', $next, [] === $next );
 	}
 
 	/**
 	 * The Translator capability ledger (replace only), limited to the capabilities a roles restore may grant.
 	 *
 	 * @param mixed $value File value.
-	 * @return bool|null
+	 * @return bool|string|null
 	 */
-	private static function import_translator_ledger( $value ): ?bool {
+	private static function import_translator_ledger( $value ) {
 		if ( ! is_array( $value ) ) {
 			return null;
 		}
@@ -690,16 +1024,16 @@ final class ExportItems {
 			return false;
 		}
 
-		return update_option( 'perflocale_translator_caps', $next, false );
+		return self::save_option( 'perflocale_translator_caps', $next, false );
 	}
 
 	/**
 	 * The Shop Manager grant record (replace only).
 	 *
 	 * @param mixed $value File value.
-	 * @return bool|null
+	 * @return bool|string|null
 	 */
-	private static function import_shop_manager_record( $value ): ?bool {
+	private static function import_shop_manager_record( $value ) {
 		if ( ! is_array( $value ) ) {
 			return null;
 		}
@@ -715,7 +1049,7 @@ final class ExportItems {
 		}
 
 		// Autoloaded, as TranslatorRole stores it: read on every admin_init of a WooCommerce site.
-		return update_option( 'perflocale_shop_manager_caps', $next, true );
+		return self::save_option( 'perflocale_shop_manager_caps', $next, true );
 	}
 
 	/**
@@ -772,10 +1106,10 @@ final class ExportItems {
 	/**
 	 * One form's Gravity Forms translations, through the add-on's own save, which sanitizes every value.
 	 *
-	 * @param int                                                                                                                     $form_id Form ID.
-	 * @param mixed                                                                                                                   $value   Language code => translations.
-	 * @param bool                                                                                                                    $replace Replace mode.
-	 * @param array{imported: int, skipped: int, reasons: array<string, int>, notes: array<int, string>, matched: array<string, int>} $out     Result (updated).
+	 * @param int                                                                                                                                                               $form_id Form ID.
+	 * @param mixed                                                                                                                                                             $value   Language code => translations.
+	 * @param bool                                                                                                                                                              $replace Replace mode.
+	 * @param array{imported: int, skipped: int, reasons: array<string, int>, notes: array<int, string>, matched: array<string, int>, errors: array<int, string>} $out     Result (updated).
 	 * @return bool|null
 	 */
 	private static function import_gf_translations( int $form_id, $value, bool $replace, array &$out ): ?bool {
@@ -885,48 +1219,70 @@ final class ExportItems {
 	}
 
 	/**
-	 * Write one meta value: a merge adds it when the object has none; a replace writes the file's value over this site's.
+	 * Write one meta value: a merge adds it when the object has none; a replace writes the file's non-empty value over this site's.
 	 *
 	 * @param string $pseudo  Meta kind.
 	 * @param int    $id      Object ID.
 	 * @param string $key     Meta key.
 	 * @param string $value   Value.
 	 * @param bool   $replace Replace mode.
-	 * @return bool True when written.
+	 * @return int 1 written, 0 nothing to write (same value, merge conflict, no WooCommerce), -1 not saved.
 	 */
-	private static function write_meta( string $pseudo, int $id, string $key, string $value, bool $replace ): bool {
+	private static function write_meta( string $pseudo, int $id, string $key, string $value, bool $replace ): int {
 		if ( 'order_meta' === $pseudo ) {
 			$order = function_exists( 'wc_get_order' ) ? wc_get_order( $id ) : false;
 
 			// WC_Order's meta API, checked by method, so the check needs no WooCommerce class here.
 			if ( ! is_object( $order ) || ! method_exists( $order, 'get_meta' ) || ! method_exists( $order, 'update_meta_data' ) || ! method_exists( $order, 'save_meta_data' ) ) {
-				return false;
+				return 0;
 			}
 
 			$current = Typed::str( $order->get_meta( $key, true ) );
 
-			if ( $current === $value || ( ! $replace && '' !== $current ) ) {
-				return false;
+			if ( $current === $value || ( '' !== $current && ( ! $replace || '' === $value ) ) ) {
+				return 0;
 			}
 
-			// save_meta_data(), not save(): one meta row, no order resave (as EmailTranslation does).
+			// save_meta_data(), not save(): one meta row, no order resave (as EmailTranslation does). It returns nothing.
 			$order->update_meta_data( $key, $value );
 			$order->save_meta_data();
 
-			return true;
+			return self::saved( $pseudo, $id, $key, $value ) ? 1 : -1;
 		}
 
 		$type = 'term_meta' === $pseudo ? 'term' : 'post';
 
 		if ( metadata_exists( $type, $id, $key ) ) {
-			if ( ! $replace || Typed::str( get_metadata( $type, $id, $key, true ) ) === $value ) {
-				return false;
+			$current = Typed::str( get_metadata( $type, $id, $key, true ) );
+
+			// An empty value is no value (the attachment screen stores '' for every language it shows): Merge fills one, and
+			// a file's empty value never erases this site's.
+			if ( $current === $value || ( '' !== $current && ( ! $replace || '' === $value ) ) ) {
+				return 0;
 			}
 
-			return false !== update_metadata( $type, $id, $key, wp_slash( $value ) );
+			$done = false !== update_metadata( $type, $id, $key, wp_slash( $value ) );
+		} else {
+			$done = false !== add_metadata( $type, $id, $key, wp_slash( $value ), true );
 		}
 
-		return false !== add_metadata( $type, $id, $key, wp_slash( $value ), true );
+		// False is also core's answer for a value already stored: only a value not stored is a failure.
+		return $done ? 1 : ( self::saved( $pseudo, $id, $key, $value ) ? 0 : -1 );
+	}
+
+	/**
+	 * Whether every stored row of one meta key of one object holds $value (and one does).
+	 *
+	 * @param string $pseudo Meta kind.
+	 * @param int    $id     Object ID.
+	 * @param string $key    Meta key.
+	 * @param string $value  Value.
+	 * @return bool
+	 */
+	private static function saved( string $pseudo, int $id, string $key, string $value ): bool {
+		$stored = self::stored_values( $pseudo, $id, $key );
+
+		return null !== $stored && [ $value ] === array_values( array_unique( $stored ) );
 	}
 
 	/**
@@ -1018,9 +1374,9 @@ final class ExportItems {
 	/**
 	 * Count a row left out, by reason.
 	 *
-	 * @param array{imported: int, skipped: int, reasons: array<string, int>, notes: array<int, string>, matched: array<string, int>} $out     Result (updated).
-	 * @param string                                                                                                                  $reason  Reason key.
-	 * @param bool                                                                                                                    $skipped Also count it as skipped.
+	 * @param array{imported: int, skipped: int, reasons: array<string, int>, notes: array<int, string>, matched: array<string, int>, errors: array<int, string>} $out     Result (updated).
+	 * @param string                                                                                                                                                            $reason  Reason key.
+	 * @param bool                                                                                                                                                              $skipped Also count it as skipped.
 	 * @return void
 	 */
 	private static function skip( array &$out, string $reason, bool $skipped = true ): void {
@@ -1077,6 +1433,7 @@ final class ExportItems {
 			$re .= self::PLACEHOLDERS[ $part ] ?? preg_quote( (string) $part, '/' );
 		}
 
-		return '/^' . $re . '$/';
+		// \z, not $: a name with a trailing newline is another name.
+		return '/^' . $re . '\z/';
 	}
 }

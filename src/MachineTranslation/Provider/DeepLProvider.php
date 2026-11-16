@@ -10,6 +10,7 @@ declare( strict_types=1 );
 namespace PerfLocale\MachineTranslation\Provider;
 
 use PerfLocale\MachineTranslation\AbstractProvider;
+use PerfLocale\MachineTranslation\ContextAwareProviderInterface;
 
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
@@ -17,8 +18,10 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 /**
  * Machine translation via the DeepL API.
+ *
+ * Context travels in DeepL's `context` parameter: one per request, not billed.
  */
-final class DeepLProvider extends AbstractProvider {
+final class DeepLProvider extends AbstractProvider implements ContextAwareProviderInterface {
 
 	/**
 	 * DeepL API base URL.
@@ -63,6 +66,7 @@ final class DeepLProvider extends AbstractProvider {
 		 * @param string $lang Target language.
 		 */
 		$text = apply_filters( 'perflocale/machine_translation/text_before_send', $text, 'deepl', $target_lang );
+		$this->guard_send( \PerfLocale\Util\Utf8::length( \PerfLocale\Util\Scalar::str( $text ) ) );
 
 		$is_html = 'text' !== $format;
 
@@ -132,21 +136,121 @@ final class DeepLProvider extends AbstractProvider {
 	 * @throws \RuntimeException When DeepL batch returns an unexpected response or all retries fail.
 	 */
 	public function translate_batch( array $texts, string $source_lang, string $target_lang, bool $fast_fail = false, string $format = 'html' ): array {
-		return $this->without_blank( $texts, fn( array $sent ): array => $this->send_batch( $sent, $source_lang, $target_lang, $fast_fail, $format ) );
+		return $this->without_blank( $texts, fn( array $sent ): array => $this->send_batch( $sent, $source_lang, $target_lang, $fast_fail, $format, '' ), $format );
+	}
+
+	/**
+	 * Translate texts, each with its context: one request per distinct context, in order of first appearance; the
+	 * context passes `perflocale/machine_translation/text_before_send` as the texts do.
+	 *
+	 * @since 1.0.8
+	 *
+	 * @param array<int, string> $texts       Texts to translate.
+	 * @param array<int, string> $contexts    Context per text, parallel to `$texts`; '' for none.
+	 * @param string             $source_lang Source language code.
+	 * @param string             $target_lang Target language code.
+	 * @param bool               $fast_fail   Cap retries and timeout.
+	 * @param string             $format      'html' or 'text'.
+	 * @return array<int, string> Translated texts, in the order of `$texts`.
+	 *
+	 * @throws \RuntimeException When DeepL returns an unexpected response or all retries fail.
+	 */
+	public function translate_batch_with_context( array $texts, array $contexts, string $source_lang, string $target_lang, bool $fast_fail = false, string $format = 'html' ): array {
+		$texts    = array_values( $texts );
+		$contexts = array_values( $contexts );
+		$groups   = [];
+
+		foreach ( $texts as $i => $text ) {
+			$groups[ $contexts[ $i ] ?? '' ][] = $i;
+		}
+
+		$results = [];
+
+		foreach ( $groups as $context => $positions ) {
+			$batch = [];
+
+			foreach ( $positions as $i ) {
+				$batch[] = $texts[ $i ];
+			}
+
+			$context = (string) $context;
+
+			if ( '' !== $context ) {
+				/** This filter is documented in DeepLProvider::translate() above. */
+				$context = \PerfLocale\Util\Scalar::str( apply_filters( 'perflocale/machine_translation/text_before_send', $context, 'deepl', $target_lang ) );
+			}
+
+			$replies = $this->without_blank( $batch, fn( array $sent ): array => $this->send_batch( $sent, $source_lang, $target_lang, $fast_fail, $format, $context ), $format );
+
+			foreach ( $positions as $k => $i ) {
+				$results[ $i ] = (string) ( $replies[ $k ] ?? '' );
+			}
+		}
+
+		ksort( $results );
+
+		return array_values( $results );
+	}
+
+	/**
+	 * Whether the context is billed: DeepL does not bill its context parameter.
+	 *
+	 * @since 1.0.8
+	 *
+	 * @return bool
+	 */
+	public function context_billed(): bool {
+		return false;
+	}
+
+	/**
+	 * The request body of a batch: texts, language codes, tag handling, formality and the context when there is one.
+	 *
+	 * @param array<int, string> $request_texts Texts as sent.
+	 * @param string             $source_lang   Source language code.
+	 * @param string             $target_lang   Target language code.
+	 * @param bool               $is_html       HTML mode.
+	 * @param string             $context       Context, '' for none.
+	 * @return array<string, mixed>
+	 */
+	private function batch_body( array $request_texts, string $source_lang, string $target_lang, bool $is_html, string $context ): array {
+		$body = [
+			'text'        => $request_texts,
+			'source_lang' => $this->map_language_code( $source_lang, false ),
+			'target_lang' => $this->map_language_code( $target_lang, true ),
+		];
+
+		if ( $is_html ) {
+			$body['tag_handling'] = 'html';
+		}
+
+		$formality = $this->formality_param();
+
+		if ( $formality !== '' ) {
+			$body['formality'] = $formality;
+		}
+
+		if ( '' !== $context ) {
+			$body['context'] = $context;
+		}
+
+		return $body;
 	}
 
 	/**
 	 * One request for a list of texts that are not whitespace.
 	 *
-	 * @param array<int, string> $texts       Texts.
-	 * @param string             $source_lang Source language.
-	 * @param string             $target_lang Target language.
-	 * @param bool               $fast_fail   Fewer retries, shorter timeout.
+	 * @param array<int, string> $texts       Texts to translate.
+	 * @param string             $source_lang Source language code.
+	 * @param string             $target_lang Target language code.
+	 * @param bool               $fast_fail   Cap retries and timeout.
 	 * @param string             $format      'html' or 'text'.
+	 * @param string             $context     Context already filtered, '' for none.
 	 * @return array<int, string>
-	 * @throws \RuntimeException When the request or its answer fails.
+	 *
+	 * @throws \RuntimeException When DeepL batch returns an unexpected response or all retries fail.
 	 */
-	private function send_batch( array $texts, string $source_lang, string $target_lang, bool $fast_fail, string $format ): array {
+	private function send_batch( array $texts, string $source_lang, string $target_lang, bool $fast_fail, string $format, string $context ): array {
 		if ( empty( $texts ) ) {
 			return [];
 		}
@@ -163,6 +267,8 @@ final class DeepLProvider extends AbstractProvider {
 			);
 		}
 
+		$this->guard_send( (int) array_sum( array_map( [ \PerfLocale\Util\Utf8::class, 'length' ], $filtered ) ) );
+
 		$is_html = 'text' !== $format;
 
 		// The parent-tag wrap of translate(), only for the tag-handling path.
@@ -170,21 +276,7 @@ final class DeepLProvider extends AbstractProvider {
 			? array_map( [ self::class, 'wrap_for_tag_handling' ], $filtered )
 			: $filtered;
 
-		$body = [
-			'text'        => $request_texts,
-			'source_lang' => $this->map_language_code( $source_lang, false ),
-			'target_lang' => $this->map_language_code( $target_lang, true ),
-		];
-
-		if ( $is_html ) {
-			$body['tag_handling'] = 'html';
-		}
-
-		$formality = $this->formality_param();
-
-		if ( $formality !== '' ) {
-			$body['formality'] = $formality;
-		}
+		$body = $this->batch_body( $request_texts, $source_lang, $target_lang, $is_html, $context );
 
 		$response = $this->make_request(
 			$this->get_api_url() . '/translate',
@@ -243,7 +335,7 @@ final class DeepLProvider extends AbstractProvider {
 		// Usage counts the filtered texts: what was sent.
 		$total_chars = 0;
 		foreach ( $filtered as $text ) {
-			$total_chars += mb_strlen( (string) $text );
+			$total_chars += \PerfLocale\Util\Utf8::length( (string) $text );
 		}
 		$this->track_usage_chars( $total_chars );
 

@@ -16,6 +16,8 @@ use PerfLocale\Database\Repository\StringRepository;
 use PerfLocale\Database\Repository\TranslationLinkRepository;
 use PerfLocale\Helper;
 use PerfLocale\Plugin;
+use PerfLocale\Util\Scalar;
+use PerfLocale\Util\StateHash;
 
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
@@ -106,6 +108,10 @@ final class StringsPage {
 		$save_unchecked = ! empty( $_GET['save_unchecked'] );
 		// Edited cells the database could not compare byte for byte.
 		$save_mismatch = isset( $_GET['save_mismatch'] ) ? absint( $_GET['save_mismatch'] ) : 0;
+		// Edited cells not written because their string was deleted since the page was loaded.
+		$save_gone = max( 0, Scalar::query_int( 'save_gone' ) ?? 0 );
+		// Cells the save skipped: their domain is restricted for this user (no ext-filter needed).
+		$restricted_saved = max( 0, Scalar::query_int( 'restricted' ) ?? 0 );
 
 		$allowed_modes = [ 'contains', 'not_contains', 'exact', 'starts_with', 'not_starts_with', 'ends_with', 'not_ends_with' ];
 		if ( ! in_array( $search_mode, $allowed_modes, true ) ) {
@@ -118,13 +124,17 @@ final class StringsPage {
 		$per_page = $this->cap_per_page_to_input_vars( $this->get_per_page(), $languages );
 		$offset   = ( $page_num - 1 ) * $per_page;
 
+		// The domains this user may not see (perflocale/strings/domain_capability): the list, the count, both dropdowns.
+		$restricted = \PerfLocale\Strings\Domains::restricted_for_current_user();
+
 		$filter_args = [
-			'domain'           => $domain,
-			'context'          => $context,
-			'search'           => $search,
-			'search_mode'      => $search_mode,
-			'status'           => $status,
-			'language_id'      => $lang_filter,
+			'domain'          => $domain,
+			'context'         => $context,
+			'search'          => $search,
+			'search_mode'     => $search_mode,
+			'status'          => $status,
+			'language_id'     => $lang_filter,
+			'exclude_domains' => $restricted,
 		];
 
 		$total_items = $string_repo->count( $filter_args );
@@ -144,8 +154,9 @@ final class StringsPage {
 		$translation_map = $this->preload_translations( $strings, $languages, $link_repo );
 		$text_map        = $this->preload_translation_texts( $strings, $languages );
 		$mo_hints        = $this->get_mo_translation_hints( $strings, $languages );
-		$domains         = $this->get_available_domains( $cache );
-		$contexts        = $this->get_available_contexts( $cache );
+		$domains         = array_values( array_diff( $this->get_available_domains( $cache ), $restricted ) );
+		$contexts        = $this->get_available_contexts( $cache, $restricted );
+		$map_notices     = $this->map_size_notices( $plugin->cache(), $plugin->lang_repo()->get_active() );
 		$base_url        = admin_url( 'admin.php?page=perflocale-strings' );
 
 		// Build sort URLs - preserve all active filters.
@@ -261,6 +272,17 @@ final class StringsPage {
 			</div>
 			<hr class="wp-header-end">
 
+			<?php
+			// Outdated strings held for review, and the outcome of a decision (Content ReSync, only while it is on).
+			if ( \PerfLocale\Util\ResyncSwitch::on() ) {
+				echo wp_kses( \PerfLocale\Admin\StringReview::html(), \PerfLocale\Admin\StringReview::allowed_html() );
+
+				if ( $mt_show_toolbar && current_user_can( 'perflocale_manage_translations' ) ) {
+					$this->render_update_panel( $mt_non_default );
+				}
+			}
+			?>
+
 			<?php if ( $scan_new >= 0 ) : ?>
 				<div class="notice notice-success is-dismissible">
 					<p>
@@ -294,11 +316,29 @@ final class StringsPage {
 				</div>
 			<?php endif; ?>
 
+			<?php if ( $save_gone > 0 ) : ?>
+				<div class="notice notice-error is-dismissible">
+					<p><?php /* translators: %d: number of translations that were not saved */ printf( esc_html( _n( '%d translation was not saved: its string no longer exists (merged with an identical string, or removed). Search for the text and enter the translation again.', '%d translations were not saved: their strings no longer exist (merged with identical strings, or removed). Search for the texts and enter the translations again.', $save_gone, 'perflocale' ) ), esc_html( (string) $save_gone ) ); ?></p>
+				</div>
+			<?php endif; ?>
+
 			<?php if ( $save_unchecked ) : ?>
 				<div class="notice notice-error is-dismissible">
 					<p><?php echo esc_html__( 'Translations not saved: the form lacked the data needed to check for changes others made since you opened it (for example a page opened before an update). Reload the page, then edit and save again.', 'perflocale' ); ?></p>
 				</div>
 			<?php endif; ?>
+
+			<?php if ( $restricted_saved > 0 ) : ?>
+				<div class="notice notice-warning is-dismissible">
+					<p><?php /* translators: %d: number of translations that were not saved */ printf( esc_html( _n( '%d translation was not saved: its text domain is not available to your account.', '%d translations were not saved: their text domain is not available to your account.', $restricted_saved, 'perflocale' ) ), esc_html( (string) $restricted_saved ) ); ?></p>
+				</div>
+			<?php endif; ?>
+
+			<?php foreach ( $map_notices as $map_notice ) : ?>
+				<div class="notice notice-warning perflocale-strings-map-size">
+					<p><?php echo esc_html( $map_notice ); ?></p>
+				</div>
+			<?php endforeach; ?>
 
 			<?php if ( $save_failed > 0 ) : ?>
 				<div class="notice notice-error is-dismissible">
@@ -539,7 +579,7 @@ final class StringsPage {
 						<select name="domain_filter" aria-label="<?php echo esc_attr__( 'Filter by domain', 'perflocale' ); ?>">
 							<option value=""><?php echo esc_html__( 'All Domains', 'perflocale' ); ?></option>
 							<?php foreach ( $domains as $d ) : ?>
-								<option value="<?php echo esc_attr( $d ); ?>" <?php selected( $domain, $d ); ?>><?php echo esc_html( $d ); ?></option>
+								<option value="<?php echo esc_attr( $d ); ?>" <?php selected( $domain, $d ); ?>><?php echo esc_html( \PerfLocale\Strings\Domains::label( $d ) ); ?></option>
 							<?php endforeach; ?>
 						</select>
 
@@ -785,7 +825,8 @@ final class StringsPage {
 										<?php endif; ?>
 									</td>
 									<td class="perflocale-str-col-domain">
-										<code class="perflocale-str-domain"><?php echo esc_html( $string->domain ); ?></code>
+										<?php $string_domain = Scalar::str( Scalar::prop( $string, 'domain' ) ); ?>
+										<code class="perflocale-str-domain" title="<?php echo esc_attr( $string_domain ); ?>"><?php echo esc_html( \PerfLocale\Strings\Domains::label( $string_domain ) ); ?></code>
 									</td>
 									<?php
 									foreach ( $languages as $lang ) :
@@ -924,6 +965,59 @@ final class StringsPage {
 	}
 
 	/**
+	 * "Translate outdated and missing strings": target languages, missing strings (written) and outdated ones (their
+	 * new machine translation held for review). Its only button is Estimate; the estimate step offers Start.
+	 *
+	 * @param array<int|string, mixed> $languages The non-default active languages.
+	 * @return void
+	 */
+	private function render_update_panel( array $languages ): void {
+		?>
+		<details class="perflocale-strings-update" id="perflocale-strings-update">
+			<summary class="button"><?php echo esc_html__( 'Translate outdated and missing strings', 'perflocale' ); ?></summary>
+			<form method="post" action="<?php echo esc_url( admin_url( 'admin.php?page=perflocale-strings' ) ); ?>" class="perflocale-strings-update__form">
+				<?php wp_nonce_field( 'perflocale_strings_update' ); ?>
+				<input type="hidden" name="perflocale_strings_action" value="update_strings">
+				<fieldset class="perflocale-strings-update__group">
+					<legend><?php echo esc_html__( 'Target languages', 'perflocale' ); ?></legend>
+					<?php
+					foreach ( $languages as $lang ) :
+						if ( ! is_object( $lang ) ) {
+							continue;
+						}
+
+						$lang_label = Scalar::str( Scalar::prop( $lang, 'native_name' ) );
+						$lang_label = '' !== $lang_label ? $lang_label : Scalar::str( Scalar::prop( $lang, 'name' ) );
+						$lang_label = '' !== $lang_label ? $lang_label : Scalar::str( Scalar::prop( $lang, 'slug' ) );
+						?>
+						<label>
+							<input type="checkbox" name="strings_lang_ids[]" value="<?php echo esc_attr( (string) Scalar::int( Scalar::prop( $lang, 'id' ) ) ); ?>" checked>
+							<?php echo esc_html( Helper::get_flag_emoji( $lang ) . ' ' . $lang_label ); ?>
+						</label>
+					<?php endforeach; ?>
+				</fieldset>
+				<fieldset class="perflocale-strings-update__group">
+					<legend><?php echo esc_html__( 'Strings', 'perflocale' ); ?></legend>
+					<label>
+						<input type="checkbox" name="strings_missing" value="1" checked>
+						<?php echo esc_html__( 'Missing strings: machine translate them', 'perflocale' ); ?>
+					</label>
+					<label>
+						<input type="checkbox" name="strings_outdated" value="1" checked>
+						<?php echo esc_html__( 'Outdated strings: machine translate them again and hold each one for review', 'perflocale' ); ?>
+					</label>
+				</fieldset>
+				<p class="perflocale-strings-update__actions">
+					<button type="submit" class="button button-primary"><?php echo esc_html__( 'Estimate', 'perflocale' ); ?></button>
+				</p>
+				<p class="description"><?php echo esc_html__( 'The estimate shows how many strings and characters would be sent. Nothing is sent until you press Start.', 'perflocale' ); ?></p>
+				<input type="hidden" name="perflocale_form_end" value="1">
+			</form>
+		</details>
+		<?php
+	}
+
+	/**
 	 * Render standard WP tablenav pagination.
 	 *
 	 * @param int                  $current Current page.
@@ -934,7 +1028,7 @@ final class StringsPage {
 	 */
 	private function render_tablenav( int $current, int $total_pages, int $total_items, array $base_args ): void {
 		// Ensure transient scan params never leak into pagination links.
-		unset( $base_args['scan_new'], $base_args['scan_total'], $base_args['saved'], $base_args['save_failed'], $base_args['save_stale'], $base_args['save_stale_n'], $base_args['save_unchecked'], $base_args['save_mismatch'] );
+		unset( $base_args['scan_new'], $base_args['scan_total'], $base_args['saved'], $base_args['save_failed'], $base_args['save_stale'], $base_args['save_stale_n'], $base_args['save_unchecked'], $base_args['save_mismatch'], $base_args['save_gone'], $base_args['restricted'] );
 
 		$page_links = paginate_links(
 			[
@@ -1327,16 +1421,21 @@ final class StringsPage {
 	}
 
 	/**
-	 * Get distinct context values from the strings table.
+	 * Get distinct context values from the strings table, without the lookup-only domains (thousands of machine ids)
+	 * and the user's restricted ones.
 	 *
 	 * Generation-folded cache key; the 5-minute TTL covers contexts the scanner adds.
 	 *
-	 * @param CacheManager $cache Unused; kept for signature parity with the sibling getters.
+	 * @param CacheManager       $cache      Unused; kept for signature parity with the sibling getters.
+	 * @param array<int, string> $restricted Domains the current user may not see.
 	 * @return array<int,string>
 	 */
 	// phpcs:ignore Generic.CodeAnalysis.UnusedFunctionParameter.Found -- Signature parity with sibling page-data getters.
-	private function get_available_contexts( CacheManager $cache ): array {
-		$contexts_key = \PerfLocale\Cache\CacheManager::l2_key( 'available_contexts', 'perflocale_strings' );
+	private function get_available_contexts( CacheManager $cache, array $restricted = [] ): array {
+		$excluded = array_values( array_unique( array_merge( \PerfLocale\Strings\Domains::LOOKUP_ONLY, $restricted ) ) );
+		sort( $excluded );
+
+		$contexts_key = \PerfLocale\Cache\CacheManager::l2_key( 'available_contexts_' . StateHash::plain( ...array_map( 'strval', $excluded ) ), 'perflocale_strings' );
 		$cached       = wp_cache_get( $contexts_key, 'perflocale_strings' );
 
 		if ( is_array( $cached ) ) {
@@ -1346,13 +1445,14 @@ final class StringsPage {
 		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
 		global $wpdb;
 
-		$table = \PerfLocale\Database\Schema::table( 'strings' );
+		$table        = \PerfLocale\Database\Schema::table( 'strings' );
+		$placeholders = implode( ',', array_fill( 0, count( $excluded ), '%s' ) );
 
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- The NOT IN list is placeholders only.
 		$result = $wpdb->get_col(
 			$wpdb->prepare(
-				"SELECT DISTINCT context FROM %i WHERE context != '' ORDER BY context ASC",
-				$table
+				"SELECT DISTINCT context FROM %i WHERE context != '' AND domain NOT IN ({$placeholders}) ORDER BY context ASC",
+				array_merge( [ $table ], $excluded )
 			)
 		);
 
@@ -1362,6 +1462,101 @@ final class StringsPage {
 		wp_cache_set( $contexts_key, $result, 'perflocale_strings', 5 * MINUTE_IN_SECONDS );
 
 		return $result;
+	}
+
+	/**
+	 * One notice per active non-default language whose cached string map is over StringTranslation::MAP_NOTICE_BYTES.
+	 * Reads the stored row sizes in one query, never a map; under an external object cache a map is read and measured
+	 * once (measured_map_bytes()).
+	 *
+	 * @param CacheManager       $cache     Cache.
+	 * @param array<int, object> $languages Active languages.
+	 * @return array<int, string>
+	 */
+	private function map_size_notices( CacheManager $cache, array $languages ): array {
+		$notices = [];
+		$keys    = [];
+
+		foreach ( $languages as $language ) {
+			if ( Scalar::int( Scalar::prop( $language, 'is_default' ) ) === 0 ) {
+				$keys[] = 'all_str2_translations_' . Scalar::int( Scalar::prop( $language, 'id' ) );
+			}
+		}
+
+		require_once __DIR__ . '/../../Cache/CacheDiagnostics.php';
+		$stored = \PerfLocale\Cache\CacheDiagnostics::stored_bytes( $cache, $keys, 'perflocale_strings' );
+
+		foreach ( $languages as $language ) {
+			if ( Scalar::int( Scalar::prop( $language, 'is_default' ) ) > 0 ) {
+				continue;
+			}
+
+			$key   = 'all_str2_translations_' . Scalar::int( Scalar::prop( $language, 'id' ) );
+			$bytes = $stored[ $key ] ?? ( wp_using_ext_object_cache() ? self::measured_map_bytes( $cache, Scalar::int( Scalar::prop( $language, 'id' ) ) ) : 0 );
+
+			if ( $bytes <= \PerfLocale\Strings\StringTranslation::MAP_NOTICE_BYTES ) {
+				continue;
+			}
+
+			$name = Scalar::str( Scalar::prop( $language, 'native_name' ) );
+
+			$notices[] = sprintf(
+				/* translators: 1: language name, 2: size in KB */
+				__( 'The string translations for %1$s are %2$s KB; files mode serves them with no size limit.', 'perflocale' ),
+				'' !== $name ? $name : Scalar::str( Scalar::prop( $language, 'name' ) ),
+				number_format_i18n( $bytes / 1024 )
+			);
+		}
+
+		return $notices;
+	}
+
+	/**
+	 * A language map's size under an external object cache, measured once and kept beside the map for an hour, so a
+	 * page view fetches no map. Each map delete drops it (CacheDiagnostics::forget_map_sizes()).
+	 *
+	 * @param CacheManager $cache       Cache.
+	 * @param int          $language_id Language id.
+	 * @return int 0 when no map is cached.
+	 */
+	private static function measured_map_bytes( CacheManager $cache, int $language_id ): int {
+		require_once __DIR__ . '/../../Cache/CacheDiagnostics.php';
+		$size_key = \PerfLocale\Cache\CacheDiagnostics::STRING_MAP_BYTES_PREFIX . $language_id;
+		$measured = $cache->get_cached( $size_key, 'perflocale_strings' );
+
+		// Redis Object Cache returns a stored int as its digits.
+		if ( is_string( $measured ) && \PerfLocale\Helper::is_ascii_digits( $measured ) ) {
+			$measured = (int) $measured;
+		}
+
+		if ( is_int( $measured ) && $measured > 0 ) {
+			return $measured;
+		}
+
+		$bytes = self::peeked_map_bytes( $cache->get_cached( 'all_str2_translations_' . $language_id, 'perflocale_strings' ) );
+
+		if ( $bytes > 0 ) {
+			$cache->set( $size_key, $bytes, HOUR_IN_SECONDS, 'perflocale_strings' );
+		}
+
+		return $bytes;
+	}
+
+	/**
+	 * The serialized size of a map read from the cache: the size it carries (StringTranslation::MAP_BYTES_KEY), else
+	 * the size of its serialized form.
+	 *
+	 * @param mixed $map A map read from the cache, or null.
+	 * @return int 0 when no map was read.
+	 */
+	private static function peeked_map_bytes( mixed $map ): int {
+		if ( ! is_array( $map ) ) {
+			return 0;
+		}
+
+		$recorded = \PerfLocale\Strings\StringTranslation::map_bytes( $map );
+
+		return $recorded > 0 ? $recorded : strlen( serialize( $map ) ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_serialize -- The size the cache stores, measured for the notice, never stored.
 	}
 
 	/**

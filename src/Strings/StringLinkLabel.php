@@ -31,10 +31,9 @@ final class StringLinkLabel {
 	private const CELL_LOCK_WAIT = 5.0;
 
 	/**
-	 * Label the link translated with $source while it is as $read (else: while it has another label) and form 1 is
-	 * byte-equal $text. MySQL/MariaDB lock the link row first (alone, the UPDATE may test the value before it waits) and
-	 * relabel nothing when the lock fails; there never inside a caller's transaction. On SQLite one statement, which may
-	 * run inside the caller's transaction (StringCellWrite).
+	 * Label the link translated with $source while it is as $read and form 1 is byte-equal $text. MySQL/MariaDB lock the
+	 * link row first (alone, the UPDATE may test before it waits; never inside a caller's transaction); SQLite runs one
+	 * statement, possibly inside the caller's.
 	 *
 	 * @param TranslationGroupRepository                                 $group_repo  Group/link repository.
 	 * @param int                                                        $group_id    String group.

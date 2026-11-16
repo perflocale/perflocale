@@ -697,10 +697,8 @@ final class PolylangImporter {
 	}
 
 	/**
-	 * Log a database error's own text to the PHP error log, when WP_DEBUG_LOG is on.
-	 *
-	 * The text can hold prefixed table names and row values, and results are shown to every user
-	 * with Jobs access, so stored messages only say that a database error happened.
+	 * Log a database error when WP_DEBUG_LOG is on: what was running and a fixed code, never the database's text, which
+	 * can hold prefixed table names and row values; stored messages only say a database error happened.
 	 *
 	 * @param string $where What was running, for the log line.
 	 * @param string $error The database error.
@@ -712,7 +710,7 @@ final class PolylangImporter {
 		}
 
 		// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic, only when WP_DEBUG_LOG is on.
-		error_log( '[PerfLocale] Polylang import: database error while ' . $where . ' - ' . $error );
+		error_log( '[PerfLocale] Polylang import: database error while ' . $where . ' - code ' . \PerfLocale\Util\DbErrorCode::of( $error ) );
 	}
 
 	/**
@@ -749,9 +747,10 @@ final class PolylangImporter {
 	 * @return void
 	 */
 	private function import_site_strings( PolylangSiteData $site_data, array &$result ): void {
-		$failed   = [];
-		$db_error = '';
-		$stored   = $site_data->import_strings( $result['notices'], $failed, $db_error );
+		$failed    = [];
+		$db_error  = '';
+		$too_large = [];
+		$stored    = $site_data->import_strings( $result['notices'], $failed, $db_error, $too_large );
 
 		if ( null === $stored ) {
 			$this->incomplete = true;
@@ -761,6 +760,15 @@ final class PolylangImporter {
 		}
 
 		$result['strings'] = $stored;
+
+		if ( $too_large !== [] ) {
+			$this->incomplete   = true;
+			$result['errors'][] = sprintf(
+				/* translators: %s: comma-separated language slugs */
+				__( 'The Polylang string translations of %s were not imported: reading them needs more memory than the PHP memory limit leaves. Raise the memory limit or run the import with WP-CLI, then re-run it.', 'perflocale' ),
+				implode( ', ', $too_large )
+			);
+		}
 
 		if ( $failed === [] ) {
 			return;

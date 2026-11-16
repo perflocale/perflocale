@@ -72,7 +72,7 @@ final class ImportedOptionStrings {
 		$plugin       = Plugin::get_instance();
 		$strings      = new StringRepository( $plugin->get( 'cache' ) );
 		$translations = new StringTranslationRepository( $plugin->get( 'cache' ) );
-		$row          = $strings->find_by_hash( OptionStrings::DOMAIN, $option, $raw );
+		$row          = \PerfLocale\Strings\StrIdentMigration::find_or_rehash( $strings, OptionStrings::DOMAIN, $option, $raw );
 
 		// sources() registered the option's string, so a missing row is a failed write or read.
 		if ( $row === null ) {

@@ -39,15 +39,24 @@ final class AddonSchemaManager {
 	 * @return bool True if fully migrated to target, false if halted or waiting.
 	 */
 	public static function migrate( HasSchema&AddonInterface $addon, bool $force = false ): bool {
-		$addon_id = $addon->get_id();
-		$target   = (int) $addon->get_schema_version();
-
-		// Schema version 0 means "no schema managed"; never downgrade.
-		if ( self::validate_addon_id( $addon_id ) && ( $target < 1 || self::get_stored_version( $addon_id ) >= $target ) ) {
+		if ( self::is_current( $addon ) ) {
 			return true;
 		}
 
-		return ( new \PerfLocale\Database\UpgradeRunner() )->addon( $addon, $addon_id, $force );
+		return ( new \PerfLocale\Database\UpgradeRunner() )->addon( $addon, $addon->get_id(), $force );
+	}
+
+	/**
+	 * Whether an add-on's stored schema version is at its target (schema version 0: none managed; never downgrade).
+	 *
+	 * @param HasSchema&AddonInterface $addon The addon.
+	 * @return bool
+	 */
+	public static function is_current( HasSchema&AddonInterface $addon ): bool {
+		$addon_id = $addon->get_id();
+		$target   = (int) $addon->get_schema_version();
+
+		return self::validate_addon_id( $addon_id ) && ( $target < 1 || self::get_stored_version( $addon_id ) >= $target );
 	}
 
 	/**
@@ -94,11 +103,11 @@ final class AddonSchemaManager {
 			return false;
 		}
 
-		// The admin-visible record carries no server text (it can name tables and values); that goes to the debug log.
+		// Neither the admin-visible record nor the debug log carries the server's text (it can name tables and values).
 		if ( null === $missing ) {
 			if ( '' !== $read_error && defined( 'WP_DEBUG_LOG' ) && WP_DEBUG_LOG ) {
 				// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic, only when WP_DEBUG_LOG is on.
-				error_log( '[PerfLocale] Addon ' . $addon_id . ': database error while listing its tables - ' . $read_error );
+				error_log( '[PerfLocale] Addon ' . $addon_id . ': database error while listing its tables - code ' . \PerfLocale\Util\DbErrorCode::of( $read_error ) );
 			}
 
 			AddonMigrationErrors::record(

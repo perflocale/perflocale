@@ -51,6 +51,13 @@ final class TranslationsPage {
 	private int $view_checks = 0;
 
 	/**
+	 * The waiting updates of the page's linked posts, by post id.
+	 *
+	 * @var array<int, array{id: int, url: string}>
+	 */
+	private array $updates = [];
+
+	/**
 	 * Constructor.
 	 *
 	 * @param Settings $settings Plugin settings instance.
@@ -152,13 +159,15 @@ final class TranslationsPage {
 		if ( $filter_active ) {
 			$active_language_ids = array_map( static fn( $l ) => (int) $l->id, $languages );
 
+			// A linked post the user may not view counts as missing, in the filters as in the cells.
 			$matching_ids = $this->resolve_filtered_object_ids(
 				$group_repo,
 				$filter_language,
 				$filter_status,
 				$active_language_ids,
 				$filter_source,
-				$source_language_id
+				$source_language_id,
+				$this->sibling_rules( $post_types )
 			);
 
 			if ( empty( $matching_ids ) ) {
@@ -202,6 +211,9 @@ final class TranslationsPage {
 
 			if ( ! empty( $linked_ids ) ) {
 				_prime_post_caches( array_keys( $linked_ids ), false, false );
+
+				// The "update waiting" read: one indexed query for every linked post of the page's rows.
+				$this->updates = \PerfLocale\Util\ResyncSwitch::on() ? \PerfLocale\Admin\ReviewUpdate::pending_updates( array_keys( $linked_ids ) ) : [];
 			}
 
 			// The same status definition as TranslationLinkRepository::effective_status_sql(), so the Dashboard, `wp
@@ -217,7 +229,13 @@ final class TranslationsPage {
 			}
 
 			if ( is_array( $batch_map ) ) {
+				$unmasked  = $batch_map;
 				$batch_map = self::mask_unviewable_siblings( $batch_map );
+
+				// A host refusal the SQL cannot see: a listed row the masked links no longer match makes the count unreliable.
+				if ( $filter_active && $unmasked !== $batch_map ) {
+					$this->count_hidden = $this->count_hidden || $this->mask_drops_row( $posts, $batch_map, $filter_language, $filter_status, (array) $languages, $source_language_id );
+				}
 			}
 		}
 
@@ -266,6 +284,11 @@ final class TranslationsPage {
 				}
 			}
 
+			// Content ReSync: the bulk option and the dialog for the users their handler accepts; no query.
+			$can_update   = \PerfLocale\Util\ResyncSwitch::on() && current_user_can( 'perflocale_manage_translations' );
+			$machine_fill = $can_update && \PerfLocale\Admin\ResyncLinks::machine_fill_allowed( $mt_available );
+			$default_fill = $machine_fill ? 'machine' : 'empty';
+
 			?>
 		<div class="wrap perflocale-strings-page perflocale-translations">
 			<h1 class="wp-heading-inline"><?php echo esc_html__( 'Translations', 'perflocale' ); ?></h1>
@@ -277,10 +300,14 @@ final class TranslationsPage {
 				if ( $mt_first_error ) {
 					delete_transient( 'perflocale_bulk_mt_error_' . get_current_user_id() );
 				}
-				$mt_first_warning = get_transient( 'perflocale_bulk_mt_warning_' . get_current_user_id() );
-				if ( $mt_first_warning ) {
+				$mt_warnings = get_transient( 'perflocale_bulk_mt_warning_' . get_current_user_id() );
+				if ( $mt_warnings ) {
 					delete_transient( 'perflocale_bulk_mt_warning_' . get_current_user_id() );
 				}
+				// The first warning, then one line per further pair an earlier stopped run left.
+				$mt_warnings      = array_values( array_filter( is_array( $mt_warnings ) ? $mt_warnings : [ $mt_warnings ], static fn( mixed $w ): bool => is_string( $w ) && '' !== $w ) );
+				$mt_first_warning = (string) array_shift( $mt_warnings );
+
 				$notice_class = ( $bulk_failed > 0 || $bulk_no_access > 0 || $bulk_kept > 0 || $mt_first_warning ) ? 'notice-warning' : 'notice-success';
 				?>
 				<div class="notice <?php echo esc_attr( $notice_class ); ?> is-dismissible"><p>
@@ -315,6 +342,9 @@ final class TranslationsPage {
 				}
 				if ( $mt_first_warning ) {
 					echo ( $bulk_kept > 0 ? ' ' : '<br>' ) . '<strong>' . esc_html__( 'First warning:', 'perflocale' ) . '</strong> ' . esc_html( (string) $mt_first_warning );
+				}
+				foreach ( $mt_warnings as $mt_warning ) {
+					echo '<br>' . esc_html( $mt_warning );
 				}
 				?>
 				</p></div>
@@ -448,7 +478,7 @@ final class TranslationsPage {
 							);
 							?>
 							<a href="<?php echo esc_url( admin_url( 'admin.php?page=perflocale-settings&tab=translation' ) ); ?>">
-								<?php echo esc_html__( 'Switch them on under Advanced content types', 'perflocale' ); ?></a>.
+								<?php echo esc_html__( 'Switch them on under Site parts', 'perflocale' ); ?></a>.
 						</p>
 					</div>
 					<?php
@@ -484,6 +514,18 @@ final class TranslationsPage {
 				</div>
 				<div class="perflocale-str-toolbar__right">
 					<!-- Count moved to the bulk-actions tablenav row below. -->
+					<?php if ( $can_update && 'needs_update' === $filter_status ) : ?>
+						<?php
+						$update_link = add_query_arg(
+							[
+								'page'              => 'perflocale-translations',
+								'perflocale_update' => 'open',
+							],
+							admin_url( 'admin.php' )
+						) . '#perflocale-update-translations';
+						?>
+						<a class="button" href="<?php echo esc_url( $update_link ); ?>"><?php echo esc_html__( 'Update translations', 'perflocale' ); ?></a>
+					<?php endif; ?>
 				</div>
 			</div>
 
@@ -529,7 +571,7 @@ final class TranslationsPage {
 			</form>
 
 			<div class="tablenav top perflocale-bulk-tablenav-top">
-				<?php $this->render_bulk_actions( $bulk_form_id, $mt_available, $mt_provider_name, $languages ); ?>
+				<?php $this->render_bulk_actions( $bulk_form_id, $mt_available, $mt_provider_name, $languages, $can_update, $machine_fill, $default_fill ); ?>
 				<div class="alignright perflocale-str-toolbar__count perflocale-str-toolbar__count--inline">
 				<?php
 				if ( ! $this->count_hidden ) {
@@ -666,6 +708,18 @@ final class TranslationsPage {
 												| <?php endif; ?>
 											<span class="view"><a href="<?php echo esc_url( $view_url ); ?>" rel="bookmark" aria-label="<?php echo esc_attr( sprintf( /* translators: %s: post title */ __( 'View &#8220;%s&#8221;', 'perflocale' ), $post_title ) ); ?>"><?php echo esc_html__( 'View', 'perflocale' ); ?></a></span>
 										<?php endif; ?>
+										<?php
+										// "Resync from source": a source row with a translation, for a user and type the handler accepts.
+										$resync_link = $this->resync_link( $post, $translation_map, $source_language_id );
+
+										if ( '' !== $resync_link ) :
+											?>
+											<?php
+											if ( $edit_url !== '' || $view_url !== '' ) :
+												?>
+												| <?php endif; ?>
+											<span class="perflocale-resync"><a href="<?php echo esc_url( $resync_link ); ?>"<?php echo \PerfLocale\Admin\ResyncLinks::post_link_attributes( $resync_link ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- The attribute is escaped where it is built. ?> aria-label="<?php echo esc_attr( sprintf( /* translators: %s: post title */ __( 'Resync the translations of &#8220;%s&#8221; from the source', 'perflocale' ), $post_title ) ); ?>"><?php echo esc_html__( 'Resync', 'perflocale' ); ?></a></span>
+										<?php endif; ?>
 									</div>
 								</td>
 								<td class="perflocale-col-type"><?php echo esc_html( $type_label ); ?></td>
@@ -687,6 +741,12 @@ final class TranslationsPage {
 			<?php $this->render_tablenav_bottom( $paged, $total_pages, $total, $base_args ); ?>
 
 			<?php $this->render_site_translate_panel( $mt_available, $mt_provider_name, $languages ); ?>
+
+			<?php
+			if ( $can_update ) {
+				$this->render_update_panel( is_array( $languages ) ? $languages : [], $machine_fill );
+			}
+			?>
 		</div>
 		<?php
 	}
@@ -704,9 +764,7 @@ final class TranslationsPage {
 		$badge_tone    = 'empty';
 		$cross_link_id = 0;
 
-		if ( $link && ! empty( $link->perflocale_hidden ) ) {
-			$badge_label = __( 'Translated', 'perflocale' );
-		} elseif ( $link && ! empty( $link->object_id ) ) {
+		if ( $link && ! empty( $link->object_id ) ) {
 			// A linked post that is gone or trashed: the link is orphaned, show Empty.
 			$linked_post = get_post( (int) $link->object_id );
 
@@ -771,6 +829,7 @@ final class TranslationsPage {
 					]
 				)
 			);
+			$this->print_update_pill( $cross_link_id );
 			return;
 		}
 
@@ -778,6 +837,26 @@ final class TranslationsPage {
 			'<span class="perflocale-status-badge perflocale-status-badge--%s"><span class="perflocale-status-badge__label">%s</span></span>',
 			esc_attr( $badge_tone ),
 			esc_html( $badge_label )
+		);
+		$this->print_update_pill( $cross_link_id );
+	}
+
+	/**
+	 * The "Update waiting" pill after a sibling's status badge, for a user who may decide the update; nothing otherwise.
+	 *
+	 * @param int $post_id The sibling translation (0 for the row's own column).
+	 * @return void
+	 */
+	private function print_update_pill( int $post_id ): void {
+		if ( $post_id <= 0 || ! isset( $this->updates[ $post_id ] ) ) {
+			return;
+		}
+
+		printf(
+			'<a class="perflocale-status-badge perflocale-status-badge--update-waiting" href="%1$s" aria-label="%2$s"><span class="perflocale-status-badge__label">%3$s</span></a>',
+			esc_url( $this->updates[ $post_id ]['url'] ),
+			esc_attr__( 'Review the update waiting for this translation', 'perflocale' ),
+			esc_html__( 'Update waiting', 'perflocale' )
 		);
 	}
 
@@ -799,9 +878,43 @@ final class TranslationsPage {
 	}
 
 	/**
-	 * Replace each linked sibling the user may not view with a link that names only its language.
+	 * Whether a row the language or status filter selected in SQL fails it on its masked links.
 	 *
-	 * The cell then shows "Translated" with no ID, status, source or link, and no status or source filter matches it.
+	 * @param array<mixed> $posts              Listed posts.
+	 * @param array<mixed> $masked             Links after masking, by post ID.
+	 * @param int          $filter_language    Language filter.
+	 * @param string       $filter_status      Status filter.
+	 * @param array<mixed> $languages          Active languages.
+	 * @param int          $source_language_id Default language ID.
+	 * @return bool
+	 */
+	private function mask_drops_row( array $posts, array $masked, int $filter_language, string $filter_status, array $languages, int $source_language_id ): bool {
+		$ids = array_values( array_map( static fn( $l ): int => is_object( $l ) ? \PerfLocale\Util\Scalar::int( get_object_vars( $l )['id'] ?? 0 ) : 0, $languages ) );
+		$map = static function ( $links ): array {
+			$out = [];
+
+			foreach ( is_array( $links ) ? $links : [] as $link ) {
+				if ( is_object( $link ) ) {
+					$out[ \PerfLocale\Util\Scalar::int( get_object_vars( $link )['language_id'] ?? 0 ) ] = $link;
+				}
+			}
+
+			return $out;
+		};
+
+		foreach ( $posts as $post ) {
+			$id = $post instanceof \WP_Post ? $post->ID : 0;
+
+			if ( ! $this->matches_filters( $map( $masked[ $id ] ?? [] ), $filter_language, $filter_status, $ids, '', $source_language_id ) ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Leave out each linked sibling the user may not view: its cell and the filters treat the language as missing.
 	 *
 	 * @param array<mixed> $batch_map Source post ID => its translation links.
 	 * @return array<mixed>
@@ -817,17 +930,11 @@ final class TranslationsPage {
 				$object_id = is_numeric( $vars['object_id'] ?? null ) ? (int) $vars['object_id'] : 0;
 
 				if ( $object_id > 0 && $object_id !== (int) $source_id && ! self::sibling_viewable( $object_id ) ) {
-					$links[ $i ] = (object) [
-						'language_id'       => is_numeric( $vars['language_id'] ?? null ) ? (int) $vars['language_id'] : 0,
-						'object_id'         => 0,
-						'status'            => '',
-						'source'            => '',
-						'perflocale_hidden' => true,
-					];
+					unset( $links[ $i ] );
 				}
 			}
 
-			$batch_map[ $source_id ] = $links;
+			$batch_map[ $source_id ] = array_values( $links );
 		}
 
 		return $batch_map;
@@ -1000,17 +1107,12 @@ final class TranslationsPage {
 	}
 
 	/**
-	 * WHERE condition leaving out posts the user may not read ('' when they may read all of these types).
+	 * Per mapped type, the statuses of other users' posts the user may not read (as unreadable_rows_where() hides them).
 	 *
-	 * Core's read_post mapping for other users' non-public posts, once per type: private needs read_private_posts,
-	 * others edit_others_posts (`future` also edit_published_posts); no map_meta_cap: non_mapped_unreadable_where().
-	 *
-	 * @param array<int, string> $post_types Post types the list queries.
-	 * @return string `' AND NOT ( … )'` or ''.
+	 * @param array<int, string> $post_types Post types.
+	 * @return array<string, array<int, string>>
 	 */
-	private function unreadable_rows_where( array $post_types ): string {
-		global $wpdb;
-
+	private static function hidden_statuses( array $post_types ): array {
 		$private_statuses = [];
 		$other_statuses   = [];
 
@@ -1026,8 +1128,7 @@ final class TranslationsPage {
 			}
 		}
 
-		$user_id = get_current_user_id();
-		$clauses = [];
+		$out = [];
 
 		foreach ( $post_types as $post_type ) {
 			$type_object = get_post_type_object( (string) $post_type );
@@ -1044,10 +1145,58 @@ final class TranslationsPage {
 				$hidden[] = 'future';
 			}
 
-			if ( $hidden === [] ) {
-				continue;
+			if ( $hidden !== [] ) {
+				$out[ (string) $post_type ] = $hidden;
 			}
+		}
 
+		return $out;
+	}
+
+	/**
+	 * The rules a linked post must pass to count as present for this user: other users' posts in the hidden statuses
+	 * of a mapped type, and the view sets of the types without map_meta_cap (the same reads as the listed rows).
+	 *
+	 * @param array<int, string> $post_types Post types.
+	 * @return array{user: int, hide: array<string, array<int, string>>, sets: array<string, array{0: bool, 1: int, 2: array<int, int>}>}
+	 */
+	private function sibling_rules( array $post_types ): array {
+		$sets  = [];
+		$ahead = null;
+
+		foreach ( $post_types as $post_type ) {
+			$type_object = get_post_type_object( (string) $post_type );
+
+			if ( $type_object && ! $type_object->map_meta_cap ) {
+				$ahead ??= $this->view_sets_ahead( $post_types );
+
+				$sets[ (string) $post_type ] = $this->non_mapped_view_set( (string) $post_type, $ahead );
+			}
+		}
+
+		return [
+			'user' => get_current_user_id(),
+			'hide' => self::hidden_statuses( $post_types ),
+			'sets' => $sets,
+		];
+	}
+
+	/**
+	 * WHERE condition leaving out posts the user may not read ('' when they may read all of these types).
+	 *
+	 * Core's read_post mapping for other users' non-public posts, once per type: private needs read_private_posts,
+	 * others edit_others_posts (`future` also edit_published_posts); no map_meta_cap: non_mapped_unreadable_where().
+	 *
+	 * @param array<int, string> $post_types Post types the list queries.
+	 * @return string `' AND NOT ( … )'` or ''.
+	 */
+	private function unreadable_rows_where( array $post_types ): string {
+		global $wpdb;
+
+		$user_id = get_current_user_id();
+		$clauses = [];
+
+		foreach ( self::hidden_statuses( $post_types ) as $post_type => $hidden ) {
 			$placeholders = implode( ',', array_fill( 0, count( $hidden ), '%s' ) );
 
 			// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders -- $placeholders is a generated %s list bound to $hidden.
@@ -1616,9 +1765,12 @@ final class TranslationsPage {
 	 * @param bool                      $mt_available     Whether bulk MT can run.
 	 * @param string                    $mt_provider_name Active provider display name.
 	 * @param array<int|string, object> $languages        Active language rows.
+	 * @param bool                      $can_update       Whether Update translations (Content ReSync) is offered.
+	 * @param bool                      $machine_fill     Whether missing translations may be created machine translated.
+	 * @param string                    $default_fill     The preselected way missing translations are created.
 	 * @return void
 	 */
-	private function render_bulk_actions( string $bulk_form_id, bool $mt_available, string $mt_provider_name, array $languages ): void {
+	private function render_bulk_actions( string $bulk_form_id, bool $mt_available, string $mt_provider_name, array $languages, bool $can_update = false, bool $machine_fill = false, string $default_fill = 'empty' ): void {
 		// The bulk form handler requires this capability for every action.
 		if ( ! current_user_can( 'perflocale_manage_translations' ) ) {
 			return;
@@ -1644,6 +1796,9 @@ final class TranslationsPage {
 						</option>
 					<?php endif; ?>
 					<option value="mark_needs_update"><?php echo esc_html__( 'Mark as Needs Update', 'perflocale' ); ?></option>
+					<?php if ( $can_update ) : ?>
+						<option value="update_translations"><?php echo esc_html__( 'Update translations', 'perflocale' ); ?></option>
+					<?php endif; ?>
 				</select>
 
 				<select name="bulk_value" form="<?php echo esc_attr( $bulk_form_id ); ?>" data-perflocale-bulk-value-target-lang hidden aria-label="<?php echo esc_attr__( 'Target language', 'perflocale' ); ?>">
@@ -1660,6 +1815,19 @@ final class TranslationsPage {
 					<?php endforeach; ?>
 				</select>
 
+				<?php if ( $can_update ) : ?>
+					<label class="perflocale-bulk-fill" data-perflocale-bulk-extra="update_translations" hidden>
+						<span class="screen-reader-text"><?php echo esc_html__( 'Missing translations', 'perflocale' ); ?></span>
+						<select name="resync_fill" form="<?php echo esc_attr( $bulk_form_id ); ?>">
+							<?php if ( $machine_fill ) : ?>
+								<option value="machine" <?php selected( 'machine', $default_fill ); ?>><?php echo esc_html__( 'Missing translations: create as machine translated drafts', 'perflocale' ); ?></option>
+							<?php endif; ?>
+							<option value="empty" <?php selected( 'empty', $default_fill ); ?>><?php echo esc_html__( 'Missing translations: create as empty drafts', 'perflocale' ); ?></option>
+							<option value="skip"><?php echo esc_html__( 'Missing translations: skip', 'perflocale' ); ?></option>
+						</select>
+					</label>
+				<?php endif; ?>
+
 				<button type="submit" class="button action" form="<?php echo esc_attr( $bulk_form_id ); ?>" data-perflocale-bulk-apply>
 					<?php echo esc_html__( 'Apply', 'perflocale' ); ?>
 				</button>
@@ -1671,6 +1839,163 @@ final class TranslationsPage {
 					</label>
 				<?php endif; ?>
 			</div>
+		<?php
+	}
+
+	/**
+	 * The "Resync" row action's link, '' when the row gets none: a source row with a translation, of a type the user
+	 * may resync, whose text the user may read, in scope.
+	 *
+	 * @param mixed                    $post               The row's post.
+	 * @param array<int|string, mixed> $translation_map    Its links by language id.
+	 * @param int                      $source_language_id The default language.
+	 * @return string
+	 */
+	private function resync_link( mixed $post, array $translation_map, int $source_language_id ): string {
+		if ( ! $post instanceof \WP_Post || ! \PerfLocale\Util\ResyncSwitch::on() ) {
+			return '';
+		}
+
+		$own = \PerfLocale\Util\Scalar::int( \PerfLocale\Util\Scalar::prop( $translation_map[ $source_language_id ] ?? null, 'object_id' ) );
+
+		if ( $own !== $post->ID ) {
+			return '';
+		}
+
+		$translated = false;
+
+		foreach ( $translation_map as $language_id => $link ) {
+			if ( \PerfLocale\Util\Scalar::int( $language_id ) !== $source_language_id && \PerfLocale\Util\Scalar::int( \PerfLocale\Util\Scalar::prop( $link, 'object_id' ) ) > 0 ) {
+				$translated = true;
+				break;
+			}
+		}
+
+		if ( ! $translated || ! \PerfLocale\Admin\ResyncLinks::allowed_for_type( $post->post_type ) || ! \PerfLocale\Util\ObjectPermission::read_text( $post ) || ! \PerfLocale\Admin\ResyncLinks::covers( $post ) ) {
+			return '';
+		}
+
+		return \PerfLocale\Admin\ResyncLinks::resync_url( $post->ID, 'all', 'translations' );
+	}
+
+	/**
+	 * The "Update translations" dialog: languages, content types, what to update, the changed-parts setting read-only.
+	 * Its only button is Estimate (the estimate step offers Start); `perflocale_update=missing` presets empty drafts.
+	 *
+	 * @param array<int|string, mixed> $languages    Active language rows.
+	 * @param bool                     $machine_fill Whether machine translated drafts may be chosen.
+	 * @return void
+	 */
+	private function render_update_panel( array $languages, bool $machine_fill ): void {
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended, WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Display preset only; sanitize_key() is the sanitiser.
+		$preset       = isset( $_GET['perflocale_update'] ) ? sanitize_key( \PerfLocale\Util\Scalar::str( wp_unslash( $_GET['perflocale_update'] ) ) ) : '';
+		$from_missing = 'missing' === $preset;
+		$fill         = $machine_fill && ! $from_missing ? 'machine' : 'empty';
+		$types        = [];
+
+		foreach ( \PerfLocale\Admin\ResyncLinks::scope_types() as $type ) {
+			$type_object = get_post_type_object( $type );
+
+			if ( $type_object instanceof \WP_Post_Type ) {
+				$types[ $type ] = \PerfLocale\Util\Scalar::str( \PerfLocale\Util\Scalar::prop( $type_object->labels, 'name' ) );
+				$types[ $type ] = '' !== $types[ $type ] ? $types[ $type ] : $type;
+			}
+		}
+
+		$machine_parts = 'machine' === \PerfLocale\Resync\ResyncSettings::changed_parts( $this->settings );
+		?>
+		<details class="perflocale-update-translations" id="perflocale-update-translations" data-perflocale-update-translations<?php echo in_array( $preset, [ 'open', 'missing' ], true ) ? ' open' : ''; ?>>
+			<summary><?php echo esc_html__( 'Update translations', 'perflocale' ); ?></summary>
+			<form method="post" action="<?php echo esc_url( admin_url( 'admin.php?page=perflocale-translations' ) ); ?>" class="perflocale-update-translations__form">
+				<?php wp_nonce_field( 'perflocale_translations_bulk' ); ?>
+				<input type="hidden" name="perflocale_translations_action" value="update_translations">
+
+				<fieldset class="perflocale-update-translations__group">
+					<legend><?php echo esc_html__( 'Target languages', 'perflocale' ); ?></legend>
+					<?php
+					foreach ( $languages as $l ) :
+						if ( ! is_object( $l ) || ! empty( \PerfLocale\Util\Scalar::prop( $l, 'is_default' ) ) ) {
+							continue;
+						}
+
+						$l_label = \PerfLocale\Util\Scalar::str( \PerfLocale\Util\Scalar::prop( $l, 'native_name' ) );
+						$l_label = '' !== $l_label ? $l_label : \PerfLocale\Util\Scalar::str( \PerfLocale\Util\Scalar::prop( $l, 'name' ) );
+						?>
+						<label>
+							<input type="checkbox" name="resync_lang_ids[]" value="<?php echo esc_attr( (string) \PerfLocale\Util\Scalar::int( \PerfLocale\Util\Scalar::prop( $l, 'id' ) ) ); ?>" checked>
+							<?php echo esc_html( \PerfLocale\Helper::get_flag_emoji( $l ) . ' ' . $l_label ); ?>
+						</label>
+					<?php endforeach; ?>
+				</fieldset>
+
+				<fieldset class="perflocale-update-translations__group">
+					<legend><?php echo esc_html__( 'Content types', 'perflocale' ); ?></legend>
+					<?php foreach ( $types as $type => $label ) : ?>
+						<label>
+							<input type="checkbox" name="resync_post_types[]" value="<?php echo esc_attr( $type ); ?>" checked>
+							<?php echo esc_html( $label ); ?>
+						</label>
+					<?php endforeach; ?>
+				</fieldset>
+
+				<fieldset class="perflocale-update-translations__group">
+					<legend><?php echo esc_html__( 'What to update', 'perflocale' ); ?></legend>
+					<label>
+						<input type="checkbox" name="resync_outdated" value="1" <?php checked( ! $from_missing ); ?>>
+						<?php echo esc_html__( 'Outdated translations: resync them with their source', 'perflocale' ); ?>
+					</label>
+					<label>
+						<input type="checkbox" name="resync_missing" value="1" checked>
+						<?php echo esc_html__( 'Missing translations: create them as drafts', 'perflocale' ); ?>
+					</label>
+					<fieldset class="perflocale-update-translations__fill">
+						<legend class="screen-reader-text"><?php echo esc_html__( 'How missing translations are created', 'perflocale' ); ?></legend>
+						<?php if ( $machine_fill ) : ?>
+							<label>
+								<input type="radio" name="resync_fill" value="machine" <?php checked( 'machine', $fill ); ?>>
+								<?php echo esc_html__( 'machine translated', 'perflocale' ); ?>
+							</label>
+						<?php endif; ?>
+						<label>
+							<input type="radio" name="resync_fill" value="empty" <?php checked( 'empty', $fill ); ?>>
+							<?php echo esc_html__( 'empty drafts', 'perflocale' ); ?>
+						</label>
+					</fieldset>
+					<label>
+						<input type="checkbox" name="resync_record" value="1">
+						<?php echo esc_html__( 'Also record translations that are up to date', 'perflocale' ); ?>
+					</label>
+				</fieldset>
+
+				<p class="description">
+					<?php
+					// Machine mode refused for this person says so before the estimate.
+					$machine_refused = $machine_parts ? \PerfLocale\Admin\ResyncEntry::mt_refusal_text( \PerfLocale\Admin\ResyncEntry::mt_unavailable() ) : '';
+					echo esc_html(
+						'' !== $machine_refused
+							? $machine_refused
+							: ( $machine_parts
+								? __( 'Changed and new parts are machine translated.', 'perflocale' )
+								: __( 'Changed and new parts are left in the source language for a translator.', 'perflocale' ) )
+					);
+					if ( current_user_can( 'manage_options' ) ) :
+						?>
+						<a href="<?php echo esc_url( admin_url( 'admin.php?page=perflocale-settings&tab=translation&subtab=content-resync' ) ); ?>"><?php echo esc_html__( 'Change this in the settings', 'perflocale' ); ?></a>
+						<?php
+					endif;
+					?>
+				</p>
+
+				<p class="perflocale-update-translations__actions">
+					<button type="submit" class="button button-primary"><?php echo esc_html__( 'Estimate', 'perflocale' ); ?></button>
+				</p>
+				<p class="description"><?php echo esc_html__( 'The estimate shows what the run would change and send to machine translation. Nothing changes until you press Start. The run continues in the background; follow it under Jobs.', 'perflocale' ); ?></p>
+				<?php
+				// The completeness marker is the form's last field.
+				?>
+				<input type="hidden" name="perflocale_form_end" value="1">
+			</form>
+		</details>
 		<?php
 	}
 
@@ -1916,6 +2241,9 @@ final class TranslationsPage {
 	 * @param int                        $filter_language Language filter.
 	 * @param string                     $filter_status Status filter.
 	 * @param array<int, int>            $active_language_ids All active lang IDs.
+	 * @param string                     $filter_source Source filter (unused here).
+	 * @param int                        $source_language_id Default language ID.
+	 * @param array<string, mixed>       $visible sibling_rules(): a linked post failing them counts as missing.
 	 * @return array<int, int> Matching post IDs. Empty = no matches.
 	 */
 	private function resolve_filtered_object_ids(
@@ -1924,7 +2252,8 @@ final class TranslationsPage {
 		string $filter_status,
 		array $active_language_ids,
 		string $filter_source = '',
-		int $source_language_id = 0
+		int $source_language_id = 0,
+		array $visible = []
 	): array {
 		$type = \PerfLocale\Enum\ObjectType::Post;
 
@@ -1933,7 +2262,8 @@ final class TranslationsPage {
 				$type,
 				$filter_language,
 				$filter_status,
-				$source_language_id
+				$source_language_id,
+				$visible
 			);
 		}
 
@@ -1941,7 +2271,8 @@ final class TranslationsPage {
 			return $group_repo->find_source_object_ids_missing_any_language(
 				$type,
 				$active_language_ids,
-				$source_language_id
+				$source_language_id,
+				$visible
 			);
 		}
 
@@ -1949,7 +2280,8 @@ final class TranslationsPage {
 			return $group_repo->find_source_object_ids_by_status_any_language(
 				$type,
 				$filter_status,
-				$source_language_id
+				$source_language_id,
+				$visible
 			);
 		}
 
@@ -1971,7 +2303,6 @@ final class TranslationsPage {
 	 *                                               skips it.
 	 * @return bool True if the post matches all active filters.
 	 */
-
 	private function matches_filters(
 		array $translation_map,
 		int $filter_language,

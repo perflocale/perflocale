@@ -66,8 +66,14 @@ final class EditorSidebar {
 			'perflocale-site-editor-sidebar',
 			'perflocaleSiteEditor',
 			[
-				'postTypes' => $site_editor_types,
-				'i18n'      => [
+				'postTypes'    => $site_editor_types,
+				// "Resync from source": only for a user and types the handler accepts; the previous press's result or estimate
+				// step only when the redirect carries its flag.
+				'resync'       => \PerfLocale\Util\ResyncSwitch::on() ? ResyncLinks::editor_config( '', \PerfLocale\Util\Scalar::strings( $site_editor_types ) ) : null,
+				'resyncNotice' => self::resync_notice(),
+				// SCRIPT_DEBUG reports a failing JavaScript hook callback once per hook in the console.
+				'debug'        => defined( 'SCRIPT_DEBUG' ) && SCRIPT_DEBUG,
+				'i18n'         => [
 					'panelTitle'    => __( 'Translations', 'perflocale' ),
 					'current'       => __( 'Current', 'perflocale' ),
 					'published'     => __( 'Published', 'perflocale' ),
@@ -95,6 +101,10 @@ final class EditorSidebar {
 					'publish'       => __( 'Publish', 'perflocale' ),
 					'publishedNote' => __( 'Translation published.', 'perflocale' ),
 					'publishError'  => __( 'Could not publish the translation.', 'perflocale' ),
+					'resync'        => __( 'Resync', 'perflocale' ),
+					'resyncAll'     => __( 'Resync all translations', 'perflocale' ),
+					'resyncSource'  => __( 'Resync from source', 'perflocale' ),
+					'saveFirst'     => __( 'Save first: Resync uses the saved version.', 'perflocale' ),
 				],
 			]
 		);
@@ -166,6 +176,24 @@ final class EditorSidebar {
 			? strtolower( (string) $post_type_obj->labels->singular_name )
 			: __( 'post', 'perflocale' );
 
+		// The "update waiting" read: one indexed query for this post and its translations.
+		$post_id = (int) get_the_ID();
+		$updates = [];
+		$map     = [];
+
+		if ( $post_id > 0 && \PerfLocale\Util\ResyncSwitch::on() ) {
+			$plugin  = \PerfLocale\Plugin::get_instance();
+			$manager = new \PerfLocale\Translation\PostTranslationManager( $plugin->cache(), $plugin->settings() );
+			$map     = $manager->get_translations( $post_id );
+			$ids     = array_merge( [ $post_id ], array_map( 'intval', array_values( $map ) ) );
+
+			$waiting = \PerfLocale\Util\ResyncSwitch::waiting_updates( $ids );
+
+			foreach ( [] !== $waiting ? ReviewUpdate::links( $waiting ) : [] as $id => $update ) {
+				$updates[ (string) $id ] = [ 'url' => $update['url'] ];
+			}
+		}
+
 		wp_localize_script(
 			'perflocale-editor-sidebar',
 			'perflocaleEditor',
@@ -175,6 +203,12 @@ final class EditorSidebar {
 				'postId'          => get_the_ID(),
 				'postType'        => $screen->post_type,
 				'mtCreateNotice' => AdminController::mt_create_notice_waiting( (int) get_the_ID() ) ? MtCreateNotice::editor_message( (int) get_the_ID() ) : '',
+				// The copy warning MetaBox prints as an admin notice, which the block editor hides.
+				'copyWarning'     => MetaBox::copy_errors_editor( $post_id ),
+				'updates'         => (object) $updates,
+				// Resync from source: only for a user and type the handler accepts; the previous press's notice only with its flag.
+				'resync'          => self::resync_config( (string) $screen->post_type, $post_id, $map ),
+				'resyncNotice'    => self::resync_notice(),
 				// SCRIPT_DEBUG reports a failing JavaScript hook callback once per hook in the console.
 				'debug'           => defined( 'SCRIPT_DEBUG' ) && SCRIPT_DEBUG,
 				'i18n'            => [
@@ -188,6 +222,13 @@ final class EditorSidebar {
 					'empty'          => __( 'Empty', 'perflocale' ),
 					'needsUpdate'    => __( 'Needs Update', 'perflocale' ),
 					'setAs'          => __( 'Set as', 'perflocale' ),
+					'updateWaiting'  => __( 'Update waiting', 'perflocale' ),
+					'updateNote'     => __( 'An update from the source is waiting for review.', 'perflocale' ),
+					'reviewUpdate'   => __( 'Review update', 'perflocale' ),
+					'resync'         => __( 'Resync', 'perflocale' ),
+					'resyncAll'      => __( 'Resync all translations', 'perflocale' ),
+					'resyncSource'   => __( 'Resync from source', 'perflocale' ),
+					'saveFirst'      => __( 'Save first: Resync uses the saved version.', 'perflocale' ),
 					'unassignedNote' => $this->safe_sprintf_singular(
 						/* translators: %s: singular post-type label, already lowercased (e.g. "post", "page", "movie", "product"). MUST contain exactly one %s placeholder. */
 						__( 'This %s has no language yet. Pick the language it is written in:', 'perflocale' ),
@@ -300,6 +341,37 @@ final class EditorSidebar {
 				'targetPostId'   => $current_post_id,
 			]
 		);
+	}
+
+	/**
+	 * The block editor's "Resync from source" data, null for a user, type or post the handler refuses; the translations
+	 * come from the map the screen already read.
+	 *
+	 * @param string               $post_type The edited type.
+	 * @param int                  $post_id   The edited post.
+	 * @param array<string, mixed> $map       Its translations by language slug.
+	 * @return array{url: string, nonce: string, types: list<string>}|null
+	 */
+	private static function resync_config( string $post_type, int $post_id, array $map ): ?array {
+		// An empty map: editor_config() would refuse (no source), so ResyncLinks need not load.
+		$post = [] !== $map && $post_id > 0 && \PerfLocale\Util\ResyncSwitch::on() ? get_post( $post_id ) : null;
+
+		return $post instanceof \WP_Post ? ResyncLinks::editor_config( $post_type, [], $post, $map ) : null;
+	}
+
+	/**
+	 * The editor's Content ReSync notice of the previous press, read only when the redirect carries one of its flags.
+	 *
+	 * @return array{status: string, text: string, actions: list<array{label: string, url: string, nonce: string}>, outcome: string}|null
+	 */
+	private static function resync_notice(): ?array {
+		// Literal names, not ResyncNotices' constants: reading one would load the class on every editor screen.
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Display flags only.
+		if ( ( ! isset( $_GET['perflocale_resync_confirm'] ) && ! isset( $_GET['perflocale_resync_done'] ) ) || ! \PerfLocale\Util\ResyncSwitch::on() ) {
+			return null;
+		}
+
+		return ResyncNotices::for_editor();
 	}
 
 	/**

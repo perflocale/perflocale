@@ -85,6 +85,23 @@
 	color: #a7aaad !important;
 	cursor: default;
 }
+.perflocale-mb-pill--update {
+	background: #fcf3d9;
+	color: #7a5b00 !important;
+}
+.perflocale-mb-pill--update:hover {
+	background: #f8e9b8;
+	color: #7a5b00 !important;
+}
+.perflocale-mb-update {
+	margin: 0;
+	padding: 10px 14px;
+	border-bottom: 1px solid #f0f0f1;
+	background: #fcf3d9;
+	color: #7a5b00;
+	font-size: 12px;
+}
+.perflocale-mb-update a { color: #7a5b00; font-weight: 600; }
 .perflocale-mb-footer {
 	padding: 12px 14px;
 	border-top: 1px solid #f0f0f1;
@@ -101,3 +118,28 @@
 }
 .perflocale-mb-footer select { width: 100%; max-width: 100%; }
 
+
+/* ---- Content ReSync: the estimate step and the result ---- */
+.perflocale-resync-notice__lines {
+	margin: 0 0 8px;
+}
+
+.perflocale-resync-notice__lines li {
+	margin: 2px 0;
+}
+
+.perflocale-resync-notice__actions {
+	display: flex;
+	gap: 8px;
+	flex-wrap: wrap;
+}
+
+.perflocale-mb-pill--resync {
+	background: #e7f0f9;
+	color: #135e96 !important;
+}
+
+.perflocale-mb-pill--resync:hover {
+	background: #d4e4f5;
+	color: #135e96 !important;
+}

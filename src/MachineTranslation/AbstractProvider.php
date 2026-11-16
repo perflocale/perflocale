@@ -44,6 +44,16 @@ abstract class AbstractProvider implements ProviderInterface {
 	private string $pending_success_key = '';
 
 	/**
+	 * Characters reserved under the monthly cap and not yet counted (reserve_usage()), with the month row they sit in.
+	 *
+	 * @var array{key: string, chars: int}
+	 */
+	private static array $reserved = [
+		'key'   => '',
+		'chars' => 0,
+	];
+
+	/**
 	 * Constructor.
 	 *
 	 * @param Settings $settings Plugin settings.
@@ -99,7 +109,8 @@ abstract class AbstractProvider implements ProviderInterface {
 				}
 
 				return $results;
-			}
+			},
+			$format
 		);
 	}
 
@@ -114,22 +125,24 @@ abstract class AbstractProvider implements ProviderInterface {
 	}
 
 	/**
-	 * Send only the texts that are not whitespace; those come back unchanged and are not billed.
+	 * Send only the texts with text ({@see BlockStructureGuard::has_text()}, attribute values in html); the rest come back
+	 * unchanged and are not billed.
 	 *
 	 * @since 1.0.7.5
 	 * @param array<int, string> $texts Texts.
-	 * @param callable           $send  Translates a list of texts, answers in order.
+	 * @param callable           $send   Translates a list of texts, answers in order.
+	 * @param string             $format 'html' or 'text'.
 	 * @phpstan-param callable(array<int, string>): array<int, string> $send
 	 * @return array<int, string> Parallel to $texts.
 	 * @throws \RuntimeException When $send answers a different number of texts.
 	 * @throws ItemsFailedException With positions in $texts, when $send names failed texts.
 	 */
-	protected function without_blank( array $texts, callable $send ): array {
+	protected function without_blank( array $texts, callable $send, string $format = 'html' ): array {
 		$texts = array_values( $texts );
 		$at    = [];
 
 		foreach ( $texts as $i => $text ) {
-			if ( '' !== trim( (string) $text ) ) {
+			if ( BlockStructureGuard::has_text( (string) $text, 'text' !== $format ) ) {
 				$at[] = $i;
 			}
 		}
@@ -214,6 +227,10 @@ abstract class AbstractProvider implements ProviderInterface {
 		// Drop a success armed by an earlier call whose caller never confirmed it.
 		$this->pending_success_key = '';
 
+		// The send guard_send() admitted is this request's; a later request (a poll) sends no text.
+		$sending       = $this->sending;
+		$this->sending = 0;
+
 		if ( \PerfLocale\Concurrency\Breaker::is_open( $breaker_key ) ) {
 			$status = \PerfLocale\Concurrency\Breaker::status( $breaker_key );
 			// The key is a sanitized slug; esc_html() satisfies the escaped-exception rule.
@@ -280,13 +297,20 @@ abstract class AbstractProvider implements ProviderInterface {
 		$last_error     = null;
 		$failure_reason = '';
 
+		$last_code      = 0;
+
 		for ( $attempt = 1; $attempt <= $retries; $attempt++ ) {
 			// A retry judges the host again (after a transport error the cached DNS answers are dropped below).
 			if ( $attempt > 1 ) {
 				$pinned_ip = $this->validate_url( $url );
 			}
 
-			// Clamped after the filter, so no filtered timeout outlasts a slice's request.
+			// A retry is a new send: covered again under the monthly cap (a refusal ends the call here).
+			if ( $attempt > 1 && $sending > 0 ) {
+				self::reserve_send( $sending );
+			}
+
+			// Clamped after the filter, so no filtered timeout outlasts a slice or an interactive request.
 			$call_args = $args;
 			$timeout   = CallDeadline::timeout( $requested );
 
@@ -297,10 +321,25 @@ abstract class AbstractProvider implements ProviderInterface {
 			$response = Helper::remote_request_pinned( $url, $call_args, $pinned_ip );
 
 			if ( is_wp_error( $response ) ) {
+				$raw       = $response->get_error_message();
+				$timed_out = 1 === preg_match( '/cURL error 28\b|timed out/i', $raw );
+
+				// Only a failure to reach the host proves nothing was sent (resolve, connect, TLS handshake); any other
+				// transport error may have been received and billed.
+				if ( 1 !== preg_match( '/cURL error (6|7|35|51|58|60)\b/', $raw ) ) {
+					self::bill_attempt( $sending );
+				}
+
+				// Cut by an interactive request's clamp: the post goes to a job (or fails named), the provider is not at fault.
+				if ( $timed_out && $timeout < $requested && null === CallDeadline::window() ) {
+					throw new DeadlineReachedException();
+				}
+
 				// Raw transport text can carry the request URL or headers: only its cURL error number is kept.
-				$last_error     = self::transport_error( $response->get_error_message() );
+				$last_error     = self::transport_error( $raw, $timed_out ? $timeout : 0.0 );
+				$last_code      = $timed_out ? 504 : 0;
 				$failure_reason = 'transient';
-				$this->log_error( 1 === preg_match( '/cURL error (\d+)/', $response->get_error_message(), $m ) ? 'transport error (cURL error ' . (int) $m[1] . ')' : 'transport error', $failure_reason );
+				$this->log_error( 1 === preg_match( '/cURL error (\d+)/', $raw, $m ) ? 'transport error (cURL error ' . (int) $m[1] . ')' : 'transport error', $failure_reason );
 
 				// The host may have moved: drop its cached DNS answers.
 				if ( '' !== $pinned_ip ) {
@@ -321,30 +360,45 @@ abstract class AbstractProvider implements ProviderInterface {
 				break;
 			}
 
-			$code = wp_remote_retrieve_response_code( $response );
+			$code      = (int) wp_remote_retrieve_response_code( $response );
+			$last_code = $code;
 
-			// 429: wait for Retry-After, capped (default 300 s) so a hostile value cannot hold the worker for hours.
-			if ( $code === 429 && $attempt < $retries ) {
-				$retry_after_header = wp_remote_retrieve_header( $response, 'retry-after' );
-				$retry_after        = self::parse_retry_after( $retry_after_header );
-				$wait               = max( $retry_after, (int) pow( 2, $attempt ) );
-				/**
-				 * Filter the upper cap on the Retry-After sleep (seconds).
-				 *
-				 * @hook perflocale/mt/retry_after_max_seconds
-				 * @param int $max_seconds Default 300.
-				 */
-				$max_wait = (int) apply_filters( 'perflocale/mt/retry_after_max_seconds', 300 );
-				$wait     = min( $wait, max( 1, $max_wait ) );
+			// Received: a 2xx (usable or not) and a 5xx may be billed; a 4xx or 429 refusal is not.
+			if ( ( $code >= 200 && $code < 300 ) || $code >= 500 ) {
+				self::bill_attempt( $sending );
+			}
 
-				// A wait past the slice's deadline: the job continues at the provider's time.
+			// 429 or 503 with a usable Retry-After: slept when it fits (at most 60 s), else a paced stop at the provider's
+			// time, never a failure of the item and never a breaker record (a provider pacing us is working).
+			if ( 429 === $code || 503 === $code ) {
+				$retry_after = self::retry_after( wp_remote_retrieve_header( $response, 'retry-after' ), wp_remote_retrieve_header( $response, 'date' ) );
+
+				if ( null !== $retry_after && $retry_after >= 1 ) {
+					$wait = min( max( $retry_after, (int) pow( 2, 429 === $code ? $attempt : $attempt - 1 ) ), self::retry_after_max() );
+
+					if ( CallDeadline::pause( $wait, $attempt < $retries && ! $fast_fail ) ) {
+						// A provider's wait does not count toward the call's window.
+						$started       += $wait;
+						$failure_reason = 'rate_limit';
+						continue;
+					}
+
+					\PerfLocale\Concurrency\Breaker::record_paced( $breaker_key );
+
+					throw new DeadlineReachedException( time() + $wait, true, '', $retry_after ); // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- Ints; the message is escaped in the class.
+				}
+			}
+
+			// 429 without a usable Retry-After: today's backoff, counted on the breaker when it cannot be slept.
+			if ( 429 === $code && $attempt < $retries ) {
+				$wait = min( (int) pow( 2, $attempt ), self::retry_after_max() );
+
 				if ( ! CallDeadline::wait( $wait ) ) {
 					\PerfLocale\Concurrency\Breaker::record_failure( $breaker_key, 'rate_limit' );
 
-					throw new DeadlineReachedException( time() + $wait, true ); // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- An int; the message is escaped in the class.
+					throw new DeadlineReachedException( time() + $wait, true, '', 0 ); // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- Ints; the message is escaped in the class.
 				}
 
-				// A rate-limit wait is not the provider failing: it does not count toward the call's window.
 				$started       += $wait;
 				$failure_reason = 'rate_limit';
 				continue;
@@ -411,8 +465,58 @@ abstract class AbstractProvider implements ProviderInterface {
 					$failure_reason !== '' ? $failure_reason : 'unknown',
 					$last_error ?? __( 'Unknown error', 'perflocale' )
 				)
-			)
+			),
+			$last_code // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- An int: the provider's HTTP status (504: timed out), read by REST callers.
 		);
+	}
+
+	/**
+	 * The REST status for a machine translation failure: the provider's refusal of the item as its own 4xx (400, 413,
+	 * 422), a provider wait as 429, a timeout as 504, any other provider failure as 502; 500 for the site's own.
+	 *
+	 * @since 1.0.8
+	 * @param \Throwable $e The failure.
+	 * @return int
+	 */
+	public static function rest_status( \Throwable $e ): int {
+		if ( $e instanceof DeadlineReachedException && $e->paced() ) {
+			return 429;
+		}
+
+		$code = $e->getCode();
+
+		return match ( true ) {
+			! is_int( $code ) || $e instanceof NotSavedException => 500,
+			in_array( $code, [ 400, 413, 422, 429, 504 ], true ) => $code,
+			$code >= 400 && $code < 600 => 502,
+			default => 500,
+		};
+	}
+
+	/**
+	 * The longest wait a provider's Retry-After is honoured for, in seconds (a job continues then).
+	 *
+	 * @return int 1 to 3600.
+	 */
+	protected static function retry_after_max(): int {
+		/**
+		 * Filter the longest provider wait (Retry-After) honoured, in seconds: a background job continues after it. At
+		 * most 60 s are slept inside one request; a longer wait stops the job until then or hands the post to a job.
+		 *
+		 * @hook perflocale/mt/retry_after_max_seconds
+		 * @param int $max_seconds Default 300; clamped to 1-3600.
+		 */
+		return self::clamp_wait( apply_filters( 'perflocale/mt/retry_after_max_seconds', 300 ) );
+	}
+
+	/**
+	 * A filtered longest wait clamped to 1-3600 s; 300 for anything not a finite number.
+	 *
+	 * @param mixed $max Filter result.
+	 * @return int
+	 */
+	private static function clamp_wait( mixed $max ): int {
+		return is_numeric( $max ) && is_finite( (float) $max ) ? (int) max( 1, min( 3600, (float) $max ) ) : 300;
 	}
 
 	/**
@@ -425,6 +529,7 @@ abstract class AbstractProvider implements ProviderInterface {
 		$hint = match ( true ) {
 			401 === $code || 403 === $code => __( 'The provider refused the key or access: check the key under PerfLocale → Settings.', 'perflocale' ),
 			429 === $code => __( 'The provider is limiting requests: try again later.', 'perflocale' ),
+			413 === $code => __( 'The request is larger than the provider accepts.', 'perflocale' ),
 			$code >= 500 => __( 'The provider had a server error: try again later.', 'perflocale' ),
 			default => __( 'The provider refused this request.', 'perflocale' ),
 		};
@@ -434,18 +539,39 @@ abstract class AbstractProvider implements ProviderInterface {
 	}
 
 	/**
-	 * The shown text of a transport error: its cURL error number, if any, and a fixed hint.
+	 * The shown text of a transport error: a timeout with its seconds, else its cURL error number, if any, and a hint.
 	 *
-	 * @param string $raw Transport error message.
+	 * @param string $raw     Transport error message.
+	 * @param float  $seconds The call's timeout when it timed out; 0 otherwise.
 	 * @return string
 	 */
-	private static function transport_error( string $raw ): string {
+	private static function transport_error( string $raw, float $seconds = 0.0 ): string {
+		if ( $seconds > 0 ) {
+			return self::timeout_error( $seconds );
+		}
+
 		if ( 1 === preg_match( '/cURL error (\d+)/', $raw, $m ) ) {
 			/* translators: %d: cURL error number */
 			return sprintf( __( 'Could not reach the provider (cURL error %d). Check the network or try again later.', 'perflocale' ), (int) $m[1] );
 		}
 
 		return __( 'Could not reach the provider. Check the network or try again later.', 'perflocale' );
+	}
+
+	/**
+	 * The shown text of a call that timed out: the cause, its seconds and the next step.
+	 *
+	 * @param float $seconds The call's timeout.
+	 * @return string
+	 */
+	public static function timeout_error( float $seconds ): string {
+		$seconds = (int) max( 1, round( $seconds ) );
+
+		return sprintf(
+			/* translators: %d: seconds */
+			_n( 'The provider did not answer within %d second (the request timed out). Try again later; a slow provider needs a longer timeout (perflocale/mt/request_args) or smaller parts (perflocale/mt/piece_chars).', 'The provider did not answer within %d seconds (the request timed out). Try again later; a slow provider needs a longer timeout (perflocale/mt/request_args) or smaller parts (perflocale/mt/piece_chars).', $seconds, 'perflocale' ),
+			$seconds
+		);
 	}
 
 	/**
@@ -651,7 +777,7 @@ abstract class AbstractProvider implements ProviderInterface {
 			: $host;
 
 		// Judge an IPv4-mapped IPv6 address as the IPv4 it carries (both spellings get the same rule), as
-		// WebhookController::is_url_safe() does; keep them in sync.
+		// Webhook\Delivery::is_url_safe() does; keep them in sync.
 		if ( Helper::is_ipv6( $host_ip ) ) {
 			$host_bin = inet_pton( $host_ip );
 
@@ -671,7 +797,7 @@ abstract class AbstractProvider implements ProviderInterface {
 				throw new \RuntimeException( 'Provider URL targets a private or reserved IP address. To use a provider on an internal network, add its host to the perflocale/mt/trusted_hosts filter.' );
 			}
 
-			// Unique-local fc00::/7 and link-local fe80::/10, again as a second layer (as WebhookController::is_url_safe()).
+			// Unique-local fc00::/7 and link-local fe80::/10, again as a second layer (as Webhook\Delivery::is_url_safe()).
 			if ( Helper::is_ipv6( $host_ip ) ) {
 				$bin = inet_pton( $host_ip );
 
@@ -703,7 +829,7 @@ abstract class AbstractProvider implements ProviderInterface {
 			set_transient( $cache_key, $ip, 5 * MINUTE_IN_SECONDS );
 		}
 
-		// Fail closed (as WebhookController::is_url_safe()): gethostbyname() returns its input on failure and does not
+		// Fail closed (as Webhook\Delivery::is_url_safe()): gethostbyname() returns its input on failure and does not
 		// canonicalise hex or octal literals, so a real public address is required.
 		if ( ! is_string( $ip ) || $ip === $host || ! Helper::is_ip( $ip ) ) {
 			throw new \RuntimeException( 'Provider URL could not be resolved to a verifiable public IP.' );
@@ -713,7 +839,7 @@ abstract class AbstractProvider implements ProviderInterface {
 			throw new \RuntimeException( 'Provider URL resolves to a private or reserved IP address. To use a provider on an internal network, add its host to the perflocale/mt/trusted_hosts filter.' );
 		}
 
-		// Loopback 127.0.0.0/8, a second layer as in WebhookController::is_url_safe().
+		// Loopback 127.0.0.0/8, a second layer as in Webhook\Delivery::is_url_safe().
 		if ( str_starts_with( $ip, '127.' ) ) {
 			throw new \RuntimeException( 'Provider URL resolves to a loopback address.' );
 		}
@@ -780,7 +906,7 @@ abstract class AbstractProvider implements ProviderInterface {
 
 	/**
 	 * A hostname's AAAA records, cached like the A lookup. Fails open (dns_get_record() is disabled on some hosts; the
-	 * A check still applies). Mirrored in WebhookController: keep them in sync.
+	 * A check still applies). Mirrored in Webhook\Delivery: keep them in sync.
 	 *
 	 * @param string $host Hostname (never an IP literal - the caller returns first).
 	 * @return array<int, string> IPv6 literals; empty when there are none or the
@@ -867,7 +993,7 @@ abstract class AbstractProvider implements ProviderInterface {
 	 * @return void
 	 */
 	protected function track_usage( string $text ): void {
-		$this->track_usage_chars( mb_strlen( $text ) );
+		$this->track_usage_chars( \PerfLocale\Util\Utf8::length( $text ) );
 	}
 
 	/**
@@ -882,7 +1008,31 @@ abstract class AbstractProvider implements ProviderInterface {
 		}
 		$this->session_usage += $chars;
 
+		// The success counts its own send, which bill_attempt() had marked.
+		self::$billed -= min( $chars, self::$billed );
+
+		self::count_chars( $chars );
+	}
+
+	/**
+	 * Add characters to the month's counter: from this call's reservation first, the rest in one atomic write.
+	 *
+	 * @param int $chars Characters.
+	 * @return void
+	 */
+	private static function count_chars( int $chars ): void {
 		$month_key = 'perflocale_mt_usage_' . gmdate( 'Y_m' );
+
+		// Characters reserved for this call are in the counter already.
+		if ( $month_key === self::$reserved['key'] ) {
+			$counted                  = min( $chars, self::$reserved['chars'] );
+			self::$reserved['chars'] -= $counted;
+			$chars                   -= $counted;
+
+			if ( 0 === $chars ) {
+				return;
+			}
+		}
 
 		global $wpdb;
 
@@ -900,8 +1050,236 @@ abstract class AbstractProvider implements ProviderInterface {
 			)
 		);
 
-		// As add_option() does: drop the name from core's `notoptions` (else every get_option() answers 0 and the cap is
-		// off) and the cached value, so the cap check reads the committed total.
+		self::forget_usage_cache( $month_key );
+	}
+
+	/**
+	 * Characters the current request may still send after shortcode placeholders and filters ([ cap, left ]; cap 0 =
+	 * none), set by with_send_cap().
+	 *
+	 * @var array{0: int, 1: int}
+	 */
+	private static array $send = [ 0, 0 ];
+
+	/**
+	 * Characters guard_send() reserved beyond the caller's reservation, returned by the next release_usage().
+	 */
+	private static int $guarded = 0;
+
+	/**
+	 * Characters of sends that reached the provider and may be billed but were not counted by a success; counted as used
+	 * when the capped service call closes.
+	 */
+	private static int $billed = 0;
+
+	/**
+	 * Characters of this provider's current send (guard_send()), for its attempts.
+	 */
+	protected int $sending = 0;
+
+	/**
+	 * Monthly caps of the TranslationService calls in flight, innermost last (0 = no cap); empty outside one.
+	 *
+	 * @var list<int>
+	 */
+	private static array $caps = [];
+
+	/**
+	 * Open a service call under the monthly cap $limit (TranslationService::reserve_cap()); release_usage( ..., true )
+	 * closes it.
+	 *
+	 * @param int $limit Monthly cap, 0 for none.
+	 * @return void
+	 */
+	public static function open_cap( int $limit ): void {
+		self::$caps[] = max( 0, $limit );
+	}
+
+	/**
+	 * Run $fn with a cap on what its provider calls send in total, measured on the final provider-bound text.
+	 *
+	 * @template T
+	 * @param int           $chars Characters (> 0).
+	 * @param callable(): T $fn    The work.
+	 * @return T What $fn returns.
+	 */
+	public static function with_send_cap( int $chars, callable $fn ): mixed {
+		$was        = self::$send;
+		self::$send = [ max( 1, $chars ), max( 1, $chars ) ];
+
+		try {
+			return $fn();
+		} finally {
+			self::$send = $was;
+		}
+	}
+
+	/**
+	 * Before a provider call, on the text it sends (after shortcode placeholders and text_before_send): refuse when it
+	 * passes the request's cap or, for the part the caller did not reserve, the monthly cap. Nothing is sent then.
+	 *
+	 * @param int $chars Characters the call sends, counted as track_usage() counts them.
+	 * @return void
+	 * @throws \RuntimeException When a cap would be passed.
+	 */
+	protected function guard_send( int $chars ): void {
+		$this->sending = $chars;
+
+		if ( self::$send[0] > 0 ) {
+			if ( $chars > self::$send[1] ) {
+				throw new \RuntimeException(
+					esc_html(
+						sprintf(
+							/* translators: 1: characters, 2: the request's limit */
+							__( 'Machine translation refused: with shortcode placeholders and filters the text to send is %1$s characters, over this request\'s limit of %2$s. Translate less text at once.', 'perflocale' ),
+							number_format_i18n( $chars ),
+							number_format_i18n( self::$send[0] )
+						)
+					)
+				);
+			}
+
+			self::$send[1] -= $chars;
+		}
+
+		self::reserve_send( $chars );
+	}
+
+	/**
+	 * A send reached the provider: inside a service call it counts as used unless a success counts it.
+	 *
+	 * @param int $chars Characters of the send.
+	 * @return void
+	 */
+	protected static function bill_attempt( int $chars ): void {
+		if ( [] !== self::$caps ) {
+			self::$billed += max( 0, $chars );
+		}
+	}
+
+	/**
+	 * Inside a capped service call, cover $chars more (plus the attempts already billed) from the reservation while it
+	 * lasts, then by a new one; refuse when the monthly cap would be passed. A direct call (a connection test) has none.
+	 *
+	 * @param int $chars Characters about to be sent.
+	 * @return void
+	 * @throws \RuntimeException When the monthly cap would be passed.
+	 */
+	protected static function reserve_send( int $chars ): void {
+		$limit = [] === self::$caps ? 0 : (int) end( self::$caps );
+		$extra = $chars + self::$billed - ( 'perflocale_mt_usage_' . gmdate( 'Y_m' ) === self::$reserved['key'] ? self::$reserved['chars'] : 0 );
+
+		if ( $limit <= 0 || $extra <= 0 ) {
+			return;
+		}
+
+		if ( ! self::reserve_usage( $extra, $limit ) ) {
+			throw new \RuntimeException(
+				esc_html(
+					sprintf(
+						/* translators: %1$s: Characters required, %2$s: Monthly limit */
+						__( 'Monthly character limit would be exceeded (~%1$s characters required, limit %2$s). Translation blocked to prevent overage charges.', 'perflocale' ),
+						number_format_i18n( $chars ),
+						number_format_i18n( $limit )
+					)
+				)
+			);
+		}
+
+		self::$guarded += $extra;
+	}
+
+	/**
+	 * Reserve characters under the monthly cap before a provider call: one conditional UPDATE, so parallel runs cannot
+	 * pass the cap together. The call's own count consumes the reservation; release_usage() returns the rest.
+	 *
+	 * @param int $chars Characters about to be sent.
+	 * @param int $limit The monthly cap (> 0).
+	 * @return bool False when the cap would be passed or a statement failed (nothing reserved).
+	 */
+	public static function reserve_usage( int $chars, int $limit ): bool {
+		if ( $chars <= 0 ) {
+			return true;
+		}
+
+		$wpdb      = \PerfLocale\Admin\Typed::wpdb();
+		$month_key = 'perflocale_mt_usage_' . gmdate( 'Y_m' );
+
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared -- The counter row, as track_usage_chars(); prepared just before.
+		$row = $wpdb->prepare( "INSERT INTO %i (option_name, option_value, autoload) VALUES (%s, 0, 'no') ON DUPLICATE KEY UPDATE option_value = option_value + 0", $wpdb->options, $month_key );
+		// phpcs:ignore PluginCheck.Security.DirectDB.UnescapedDBParameter -- $row is the prepare() result just above.
+		$row = null === $row ? false : $wpdb->query( $row );
+		$won = $wpdb->prepare( 'UPDATE %i SET option_value = option_value + %d WHERE option_name = %s AND option_value + %d <= %d', $wpdb->options, $chars, $month_key, $chars, $limit );
+		// phpcs:ignore PluginCheck.Security.DirectDB.UnescapedDBParameter -- $won is the prepare() result just above.
+		$won = false === $row || null === $won ? false : $wpdb->query( $won );
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared
+
+		self::forget_usage_cache( $month_key );
+
+		if ( 1 !== $won ) {
+			return false;
+		}
+
+		if ( $month_key !== self::$reserved['key'] ) {
+			self::release_usage( PHP_INT_MAX );
+			self::$reserved['key'] = $month_key;
+		}
+
+		self::$reserved['chars'] += $chars;
+
+		return true;
+	}
+
+	/**
+	 * Return the part of a reservation the provider call did not count (a failed call returns all of it).
+	 *
+	 * @param int  $chars The reservation's size.
+	 * @param bool $close Also close the service call open_cap() opened.
+	 * @return void
+	 */
+	public static function release_usage( int $chars, bool $close = false ): void {
+		if ( $close ) {
+			array_pop( self::$caps );
+
+			// Sends that reached the provider without a success count as used, retries included.
+			if ( self::$billed > 0 ) {
+				$billed       = self::$billed;
+				self::$billed = 0;
+				self::count_chars( $billed );
+			}
+		}
+
+		// guard_send()'s extra reservations go too: a successful call has counted them already.
+		$want          = max( 0, $chars );
+		$left          = min( $want > PHP_INT_MAX - self::$guarded ? PHP_INT_MAX : $want + self::$guarded, self::$reserved['chars'] );
+		self::$guarded = 0;
+
+		if ( $left <= 0 ) {
+			return;
+		}
+
+		self::$reserved['chars'] -= $left;
+
+		$wpdb = \PerfLocale\Admin\Typed::wpdb();
+
+		$sql = $wpdb->prepare( 'UPDATE %i SET option_value = option_value - %d WHERE option_name = %s', $wpdb->options, $left, self::$reserved['key'] );
+
+		if ( null !== $sql ) {
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared -- The counter row, as track_usage_chars(); prepared above.
+			$wpdb->query( $sql );
+		}
+
+		self::forget_usage_cache( self::$reserved['key'] );
+	}
+
+	/**
+	 * As add_option() does: drop the counter from core's `notoptions` (else every get_option() answers 0 and the cap is
+	 * off) and its cached value, so the cap check reads the committed total.
+	 *
+	 * @param string $month_key The month's counter option.
+	 * @return void
+	 */
+	private static function forget_usage_cache( string $month_key ): void {
 		$notoptions = wp_cache_get( 'notoptions', 'options' );
 		if ( is_array( $notoptions ) && isset( $notoptions[ $month_key ] ) ) {
 			unset( $notoptions[ $month_key ] );
@@ -911,30 +1289,63 @@ abstract class AbstractProvider implements ProviderInterface {
 	}
 
 	/**
-	 * Retry-After in seconds: delta-seconds or an HTTP date (RFC 7231 7.1.3), which an int cast would read as 0.
+	 * Retry-After in seconds (RFC 9110 10.2.3): 1*DIGIT (more than 10 digits = PHP_INT_MAX), or an HTTP-date (IMF-fixdate,
+	 * rfc850, asctime) taken against the response's own Date when it parses; null for anything else (never strtotime()).
 	 *
-	 * @param mixed $header Raw header value (string or empty).
-	 * @return int Seconds to wait, 0 if unparseable.
+	 * @param mixed $header Retry-After value; an array (repeated header) is null.
+	 * @param mixed $date   The response's Date header.
+	 * @return int|null Seconds, 0 for a past date; null when unusable.
 	 */
-	private static function parse_retry_after( $header ): int {
-		if ( ! is_string( $header ) || '' === $header ) {
-			return 0;
+	public static function retry_after( mixed $header, mixed $date = null ): ?int {
+		if ( ! is_string( $header ) ) {
+			return null;
 		}
 
-		$trimmed = trim( $header );
+		$value = trim( $header );
 
-		// Delta-seconds.
-		if ( Helper::is_ascii_digits( $trimmed ) ) {
-			return (int) $trimmed;
+		if ( '' === $value || strlen( $value ) > 64 ) {
+			return null;
 		}
 
-		// HTTP date.
-		$ts = strtotime( $trimmed );
-		if ( false === $ts ) {
-			return 0;
+		if ( 1 === preg_match( '/^[0-9]++$/D', $value ) ) {
+			$digits = ltrim( $value, '0' );
+
+			return strlen( $digits ) > 10 ? PHP_INT_MAX : (int) $digits;
 		}
 
-		$delta = $ts - time();
-		return $delta > 0 ? $delta : 0;
+		$at = self::http_date( $value );
+
+		if ( null === $at ) {
+			return null;
+		}
+
+		$now = is_string( $date ) && strlen( $date ) <= 64 ? self::http_date( trim( $date ) ) : null;
+
+		return max( 0, $at - ( $now ?? time() ) );
+	}
+
+	/**
+	 * Unix time of an HTTP-date in one of the three forms; null for any other text or an impossible date.
+	 *
+	 * @param string $value Date text.
+	 * @return int|null
+	 */
+	private static function http_date( string $value ): ?int {
+		$value = (string) preg_replace( '/ {2,}+/', ' ', $value );
+		$utc   = new \DateTimeZone( 'UTC' );
+
+		foreach ( [ 'D, d M Y H:i:s \G\M\T', 'l, d-M-y H:i:s \G\M\T', 'D M j H:i:s Y' ] as $format ) {
+			$parsed = \DateTimeImmutable::createFromFormat( '!' . $format, $value, $utc );
+			$errors = \DateTimeImmutable::getLastErrors();
+
+			// PHP 8.2+ answers false when there was nothing to report.
+			if ( false === $parsed || ( is_array( $errors ) && ( $errors['warning_count'] > 0 || $errors['error_count'] > 0 ) ) || $parsed->format( $format ) !== $value ) {
+				continue;
+			}
+
+			return $parsed->getTimestamp();
+		}
+
+		return null;
 	}
 }

@@ -110,9 +110,10 @@ final class SlugTranslationRepository implements RepositoryInterface {
 			if ( $this->cache->l2_enabled() ) {
 				wp_cache_set( 'has_any_slugs', 1, 'perflocale_trans', 0 );
 			}
-
-			update_option( 'perflocale_has_any_slugs', '1', true );
 		}
+
+		// '' when none (still "check the table"): a missing row is a query per request. A no-op when stored.
+		update_option( 'perflocale_has_any_slugs', $exists ? '1' : '', true );
 
 		self::$has_any_slugs_memo = $exists;
 		return self::$has_any_slugs_memo;

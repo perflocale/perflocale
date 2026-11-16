@@ -89,6 +89,13 @@ final class WpmlImporter {
 	private array $read_errors = [];
 
 	/**
+	 * Whether a string batch failed on a lookup (after its retry) during this run.
+	 *
+	 * @var bool
+	 */
+	private bool $string_lookup_failed = false;
+
+	/**
 	 * Reader for WPML's settings and locale tables.
 	 *
 	 * @var WpmlSettingsReader|null
@@ -172,6 +179,13 @@ final class WpmlImporter {
 	 * @var int
 	 */
 	private int $strings_rejected = 0;
+
+	/**
+	 * String translations of this run held back: another string's row holds their hash (strings_by_hash()).
+	 *
+	 * @var int
+	 */
+	private int $strings_held = 0;
 
 	/**
 	 * Originals of the first REJECTED_EXAMPLES rejected translations, cut to REJECTED_EXAMPLE_CHARS characters.
@@ -752,10 +766,8 @@ final class WpmlImporter {
 	}
 
 	/**
-	 * Log a database error's own text to the PHP error log, when WP_DEBUG_LOG is on.
-	 *
-	 * The text can hold prefixed table names and row values, and results are shown to every user
-	 * with Jobs access, so stored messages only say that a database error happened.
+	 * Log a database error when WP_DEBUG_LOG is on: what was running and a fixed code, never the database's text, which
+	 * can hold prefixed table names and row values; stored messages only say a database error happened.
 	 *
 	 * @param string $where What was running, for the log line.
 	 * @param string $error The database error.
@@ -767,7 +779,7 @@ final class WpmlImporter {
 		}
 
 		// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Diagnostic, only when WP_DEBUG_LOG is on.
-		error_log( '[PerfLocale] WPML import: database error while ' . $where . ' - ' . $error );
+		error_log( '[PerfLocale] WPML import: database error while ' . $where . ' - code ' . \PerfLocale\Util\DbErrorCode::of( $error ) );
 	}
 
 	/**
@@ -1510,6 +1522,9 @@ final class WpmlImporter {
 				'stale_source_map' =>
 					/* translators: %d: number of WPML translation sets */
 					_n( '%d record of an earlier WPML import pointed to a translation group that no longer matches its set (a group of another kind, or one holding other items in its languages); it was not used.', '%d records of an earlier WPML import pointed to translation groups that no longer match their sets (groups of another kind, or holding other items in their languages); they were not used.', $count, 'perflocale' ),
+				'held_string' =>
+					/* translators: %d: number of WPML string translations */
+					_n( '%d WPML string translation was skipped: a different string holds its identity in PerfLocale.', '%d WPML string translations were skipped: different strings hold their identities in PerfLocale.', $count, 'perflocale' ),
 				'split_groups' =>
 					/* translators: %d: number of WPML rows */
 					_n( '%d WPML row was not linked: the items of its translation set belong to different PerfLocale translation groups that also hold other items.', '%d WPML rows were not linked: the items of their translation sets belong to different PerfLocale translation groups that also hold other items.', $count, 'perflocale' ),
@@ -1729,7 +1744,11 @@ final class WpmlImporter {
 			$batch_size = 500;
 		}
 
+		$this->string_lookup_failed = false;
+		$this->strings_held         = 0;
+
 		$last_id          = 0;
+		$read_failed      = false;
 		$skipped_unmapped = 0;
 		$skipped_insert   = 0;
 		$domains          = [];
@@ -1766,12 +1785,7 @@ final class WpmlImporter {
 			// A failed batch SELECT (schema mismatch, missing table) is reported, not taken as the end.
 			if ( $this->wpdb->last_error !== '' ) {
 				self::log_db_error( 'reading string translations', $this->wpdb->last_error );
-
-				$result['errors'][] = sprintf(
-					/* translators: %s: source plugin name */
-					__( 'Some %s string translations could not be read because of a database error and were not imported. Re-run the import.', 'perflocale' ),
-					'WPML'
-				);
+				$read_failed = true;
 				break;
 			}
 
@@ -1807,6 +1821,15 @@ final class WpmlImporter {
 
 		$this->beat( 'strings', $done, $done );
 
+		// Once per run, also for a batch that failed on its string lookup.
+		if ( $read_failed || $this->string_lookup_failed ) {
+			$result['errors'][] = sprintf(
+				/* translators: %s: source plugin name */
+				__( 'Some %s string translations could not be read because of a database error and were not imported. Re-run the import.', 'perflocale' ),
+				'WPML'
+			);
+		}
+
 		if ( $link_failures > 0 ) {
 			$result['errors'][] = sprintf(
 				/* translators: %d: number of failed translation-link writes */
@@ -1823,6 +1846,10 @@ final class WpmlImporter {
 				$skipped_unmapped,
 				$skipped_insert
 			);
+		}
+
+		if ( $this->strings_held > 0 ) {
+			$result['skipped']['held_string'] = $this->strings_held;
 		}
 
 		if ( $this->strings_rejected > 0 ) {
@@ -1908,7 +1935,7 @@ final class WpmlImporter {
 
 		// A lost transaction (Schema::transaction_lost()) must not go on: write_string_batch() stops at
 		// once, then the batch is rolled back and written again without a transaction.
-		$counters = [ $domains, $skipped_insert, $link_failures, $this->strings_sanitized ];
+		$counters = [ $domains, $skipped_insert, $link_failures, $this->strings_sanitized, $this->strings_held ];
 		$errors   = Schema::query_error_count();
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- One transaction per batch.
 		$in_transaction = $this->wpdb->query( 'START TRANSACTION' ) !== false;
@@ -1937,7 +1964,7 @@ final class WpmlImporter {
 		}
 
 		$this->wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-		[ $domains, $skipped_insert, $link_failures, $this->strings_sanitized ] = $counters;
+		[ $domains, $skipped_insert, $link_failures, $this->strings_sanitized, $this->strings_held ] = $counters;
 
 		return (int) $this->write_string_batch( $items, $originals, $str_trans, $domains, $skipped_insert, $link_failures, false, Schema::query_error_count() );
 	}
@@ -1946,7 +1973,7 @@ final class WpmlImporter {
 	 * Write one prepared batch of WPML string translations.
 	 *
 	 * In a transaction it returns null once the transaction is lost, before the next statement;
-	 * outside one, a failed batch write falls back to one write per row.
+	 * outside one, a failed batch write falls back to one write per row, and a string lookup that fails twice fails the batch.
 	 *
 	 * @param array                       $items          Translations to write.
 	 * @param array                       $originals      Strings to create without a translation.
@@ -1967,16 +1994,20 @@ final class WpmlImporter {
 		// Up to the link write every statement is the batch's own (no hook runs
 		// in these reads and writes), so any new failed query is its own.
 		$stopped = static fn(): bool => $in_transaction && Schema::transaction_lost( $errors, Schema::query_error_count() > $errors );
-		$strings = $this->strings_by_hash( array_values( array_unique( array_merge( array_column( $items, 'hash' ), array_map( 'strval', array_keys( $originals ) ) ) ) ) );
+		// Other-form rows of the batch move to their new hash first; after a failed move or read the lookup
+		// could miss a stored row, so the batch fails instead of inserting a second row for its tuple.
+		$members = array_column( array_merge( $items, array_values( $originals ) ), null, 'hash' );
+		$hashes  = array_values( array_unique( array_merge( array_column( $items, 'hash' ), array_map( 'strval', array_keys( $originals ) ) ) ) );
+		$strings = $this->string_lookup( fn(): ?array => \PerfLocale\Strings\StrIdentMigration::adopt( $members ) ? $this->strings_by_hash( $hashes ) : null, $in_transaction );
 		$failed  = [];
 		$created = [];
 
-		if ( $stopped() ) {
-			return null;
+		if ( null === $strings || $stopped() ) {
+			return $this->string_lookup_failed( count( $items ), $skipped_insert, $in_transaction );
 		}
 
 		foreach ( array_merge( $items, array_values( $originals ) ) as $item ) {
-			if ( isset( $strings[ $item['hash'] ] ) || isset( $failed[ $item['hash'] ] ) || isset( $created[ $item['hash'] ] ) ) {
+			if ( array_key_exists( $item['hash'], $strings ) || isset( $failed[ $item['hash'] ] ) || isset( $created[ $item['hash'] ] ) ) {
 				continue;
 			}
 
@@ -2000,12 +2031,14 @@ final class WpmlImporter {
 			}
 		}
 
-		foreach ( $this->strings_by_hash( array_map( 'strval', array_keys( $created ) ) ) as $hash => $string ) {
-			$strings[ $hash ] = $string;
+		$found = $this->string_lookup( fn(): ?array => $this->strings_by_hash( array_map( 'strval', array_keys( $created ) ) ), $in_transaction );
+
+		if ( null === $found || $stopped() ) {
+			return $this->string_lookup_failed( count( $items ), $skipped_insert, $in_transaction );
 		}
 
-		if ( $stopped() ) {
-			return null;
+		foreach ( $found as $hash => $string ) {
+			$strings[ $hash ] = $string;
 		}
 
 		foreach ( $originals as $hash => $entry ) {
@@ -2061,6 +2094,11 @@ final class WpmlImporter {
 			$string = $strings[ $item['hash'] ] ?? null;
 
 			if ( $string === null || (int) $string->group_id <= 0 ) {
+				// A held null entry: another string's row holds the hash; reported, never written.
+				if ( null === $string && array_key_exists( $item['hash'], $strings ) ) {
+					++$this->strings_held;
+				}
+
 				continue;
 			}
 
@@ -2175,6 +2213,42 @@ final class WpmlImporter {
 	}
 
 	/**
+	 * A string lookup; outside a transaction a failed one runs once more. In a transaction a failure
+	 * rolls the batch back, and it is written again without one.
+	 *
+	 * @param callable(): (array<string, object|null>|null) $lookup The lookup: null when a read or adopt() failed.
+	 * @param bool                                          $in_transaction Whether a transaction is open.
+	 * @return array<string, object|null>|null
+	 */
+	private function string_lookup( callable $lookup, bool $in_transaction ): ?array {
+		$found = $lookup();
+
+		return null === $found && ! $in_transaction ? $lookup() : $found;
+	}
+
+	/**
+	 * A failed string lookup: null in a transaction (rolled back, then written again without one); outside one the
+	 * batch's translations count as failed to insert and the run reports the read line.
+	 *
+	 * @param int  $count          Translations of the batch.
+	 * @param int  $skipped_insert Rows whose string could not be created; added to.
+	 * @param bool $in_transaction Whether a transaction is open.
+	 * @return int|null
+	 */
+	private function string_lookup_failed( int $count, int &$skipped_insert, bool $in_transaction ): ?int {
+		self::log_db_error( 'reading PerfLocale strings', $this->wpdb->last_error );
+
+		if ( $in_transaction ) {
+			return null;
+		}
+
+		$this->string_lookup_failed = true;
+		$skipped_insert            += $count;
+
+		return 0;
+	}
+
+	/**
 	 * Count a string translation the sanitizer left empty, keeping a few short originals as examples.
 	 *
 	 * @param string $original The translation's original.
@@ -2210,9 +2284,10 @@ final class WpmlImporter {
 	 * PerfLocale strings by hash, for a batch.
 	 *
 	 * @param string[] $hashes original_hash values.
-	 * @return array<string, object> hash => row with id, group_id and group_type (null when the group is missing).
+	 * @return array<string, object|null>|null hash => row with id, group_id and group_type (null when the group is missing), or
+	 *         null when another tuple's row holds the hash (never written onto, never inserted); null when a read failed.
 	 */
-	private function strings_by_hash( array $hashes ): array {
+	private function strings_by_hash( array $hashes ): ?array {
 		$out = [];
 
 		foreach ( array_chunk( $hashes, 500 ) as $chunk ) {
@@ -2221,14 +2296,20 @@ final class WpmlImporter {
 			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders -- $placeholders is a generated %s list bound to $chunk.
 			$rows = $this->wpdb->get_results(
 				$this->wpdb->prepare(
-					"SELECT s.id, s.group_id, s.original_hash, g.type AS group_type FROM %i s LEFT JOIN %i g ON g.id = s.group_id WHERE s.original_hash IN ({$placeholders})",
+					"SELECT s.id, s.group_id, s.original_hash, s.domain, s.context, s.original, g.type AS group_type FROM %i s LEFT JOIN %i g ON g.id = s.group_id WHERE s.original_hash IN ({$placeholders})",
 					array_merge( [ Schema::table( 'strings' ), Schema::table( 'translation_groups' ) ], $chunk )
 				)
 			);
 			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders
 
+			if ( '' !== $this->read_error() ) {
+				return null;
+			}
+
 			foreach ( (array) $rows as $row ) {
-				$out[ (string) $row->original_hash ] = $row;
+				// Another tuple's row under its own form (a kept twin pair) is never this hash's string.
+				$hash         = (string) $row->original_hash;
+				$out[ $hash ] = StringRepository::foreign( $row, $hash ) ? null : $row;
 			}
 		}
 

@@ -1,6 +1,6 @@
 <?php
 /**
- * Bootstrap's admin, AJAX, REST and WP-CLI wiring.
+ * Bootstrap's admin, AJAX and WP-CLI wiring.
  *
  * @package PerfLocale
  */
@@ -14,12 +14,88 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Service registration for admin and WP-CLI requests, the REST routes, the page-dropdown labels and the AJAX
- * column and term-language handlers of Bootstrap, loaded only on those requests.
+ * Service registration for admin and WP-CLI requests, the page-dropdown labels and the AJAX column and
+ * term-language handlers of Bootstrap, loaded only on those requests.
  *
  * @internal
  */
 final class BootstrapAdmin {
+
+	/**
+	 * Content ReSync's workers on a plain admin page, without loading ResyncSwitch when saved on with its marker
+	 * (ResyncSwitch::OFF_OPTION) in alloptions, or never on; any other case goes through ResyncSwitch::register_workers().
+	 * Decides from the stored row at this moment (ResyncSwitch::decide() minus the filter), not from a memo.
+	 *
+	 * @return void
+	 */
+	public static function bind_resync_workers(): void {
+		if ( has_filter( 'perflocale/resync/enabled' ) ) {
+			Util\ResyncSwitch::register_workers();
+
+			return;
+		}
+
+		$all = wp_load_alloptions();
+		$key = Settings::OPTION_KEY;
+		// The autoloaded row as get_option() returns it; with an option filter or outside alloptions, get_option() itself.
+		$row    = is_string( $all[ $key ] ?? null ) && ! has_filter( "pre_option_$key" ) && ! has_filter( 'pre_option' ) && ! has_filter( "option_$key" ) ? maybe_unserialize( $all[ $key ] ) : get_option( $key, [] );
+		$on     = is_array( $row ) && ! empty( $row['resync_enabled'] );
+		$marked = isset( $all['perflocale_resync_off_at'] );
+
+		if ( ! $on && ! $marked ) {
+			// What ResyncSwitch::register_workers() binds on a never-on blog: a stop for a queued run.
+			add_action( Background\WorkerRegistry::worker_hook( 'content_resync' ), [ Util\ResyncOff::class, 'stop_run' ], 10, 2 );
+
+			return;
+		}
+
+		if ( ! $on || ! $marked ) {
+			Util\ResyncSwitch::register_workers();
+
+			return;
+		}
+
+		add_action( 'perflocale_jobs_gc', [ Automation\Housekeeping::class, 'on_jobs_gc' ] );
+		add_action( 'perflocale_jobs_watchdog', [ Automation\Housekeeping::class, 'on_watchdog' ] );
+
+		Background\WorkerRegistry::register(
+			'content_resync',
+			static fn(): Background\AbstractJob => new Background\Jobs\ContentResyncJob()
+		);
+	}
+
+	/**
+	 * LifecycleHooks::in_use() without loading that class on a blog that does not use URL bases.
+	 *
+	 * @return bool
+	 */
+	private static function url_bases_in_use(): bool {
+		$all = wp_load_alloptions();
+
+		return isset( $all['perflocale_url_bases_map'] ) || isset( $all['perflocale_url_bases_dirty'] );
+	}
+
+	/**
+	 * Where URL bases are not in use: a Shop page set later may start them (LifecycleHooks::on_shop_option(), loaded then).
+	 *
+	 * @return void
+	 */
+	private static function url_bases_shop_watch(): void {
+		add_action( 'add_option_woocommerce_shop_page_id', [ Router\UrlBases\LifecycleHooks::class, 'on_shop_option' ] );
+		add_action( 'update_option_woocommerce_shop_page_id', [ Router\UrlBases\LifecycleHooks::class, 'on_shop_option' ] );
+	}
+
+	/**
+	 * The script name, as RestRead::is_rest() reads it: network-activated, this runs before vars.php sets $pagenow.
+	 *
+	 * @return string
+	 */
+	private static function script_from_php_self(): string {
+		// phpcs:ignore WordPress.Security.ValidatedSanitizedInput -- Matched against a fixed pattern only.
+		$php_self = $_SERVER['PHP_SELF'] ?? '';
+
+		return is_string( $php_self ) && preg_match( '#([^/]+\.php)([?/].*?)?$#i', $php_self, $m ) ? strtolower( $m[1] ) : '';
+	}
 
 	/**
 	 * Register admin-only services.
@@ -28,6 +104,17 @@ final class BootstrapAdmin {
 	 * @return void
 	 */
 	public static function register_admin_services( Plugin $plugin ): void {
+		// URL bases compile triggers where they are in use; elsewhere only the tab's save (the first one turns them on).
+		if ( self::url_bases_in_use() ) {
+			Router\UrlBases\LifecycleHooks::register();
+		} else {
+			self::url_bases_shop_watch();
+
+			if ( 'admin-post.php' === ( $GLOBALS['pagenow'] ?? self::script_from_php_self() ) ) {
+				add_action( 'admin_post_perflocale_save_url_bases', [ Admin\UrlBases\Tab::class, 'handle_save' ] );
+			}
+		}
+
 		$plugin->register(
 			'admin_controller',
 			fn( Plugin $p ) => new Admin\AdminController( $p->get( 'settings' ) ),
@@ -54,6 +141,24 @@ final class BootstrapAdmin {
 			false
 		);
 		add_action( 'wp_dashboard_setup', [ self::class, 'dashboard_widget_setup' ] );
+
+		// A full string scan the identity switch-over asked for is queued by an admin (a job needs a user).
+		add_action(
+			'admin_init',
+			static function (): void {
+				$state = get_option( 'perflocale_str_ident' );
+
+				if ( is_string( $state ) && str_contains( $state, '"scan":1' ) ) {
+					Strings\StrIdentMigration::queue_scan();
+				}
+
+				// The unverified count with Scan now, on PerfLocale's own screens only.
+				// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Screen check only.
+				if ( is_string( $state ) && 1 === preg_match( '/"unverified_n":[1-9]/', $state ) && str_starts_with( ( isset( $_GET['page'] ) && is_string( $_GET['page'] ) ? sanitize_key( wp_unslash( $_GET['page'] ) ) : '' ), 'perflocale' ) ) {
+					add_action( 'admin_notices', [ Admin\StrIdentNotice::class, 'render' ] );
+				}
+			}
+		);
 
 		// Quarantined add-on notice: eager so its admin_notices hooks register in time.
 		$plugin->register(
@@ -105,6 +210,29 @@ final class BootstrapAdmin {
 			false
 		);
 		add_action( 'enqueue_block_editor_assets', [ self::class, 'editor_sidebar_assets' ] );
+
+		// Root posts a language prefix takes: the Permalinks save and the page an activation or a new site lands on.
+		add_action( 'load-options-permalink.php', [ self::class, 'slug_clash_hooks' ] );
+
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Display only; a literal, so the class stays unloaded.
+		if ( isset( $_GET['perflocale_slug_clash'] ) ) {
+			add_action( 'admin_init', [ self::class, 'slug_clash_hooks' ] );
+		}
+	}
+
+	/**
+	 * Hooks of the cold SlugClashNotice for this screen.
+	 *
+	 * @return void
+	 */
+	public static function slug_clash_hooks(): void {
+		require_once __DIR__ . '/Admin/SlugClashNotice.php';
+
+		if ( 'admin_init' === current_action() ) {
+			Admin\SlugClashNotice::landing_hooks();
+		} else {
+			Admin\SlugClashNotice::permalink_hooks();
+		}
 	}
 
 	/**
@@ -136,6 +264,17 @@ final class BootstrapAdmin {
 	 * @return void
 	 */
 	public static function register_cli_services( Plugin $plugin ): void {
+		if ( self::url_bases_in_use() ) {
+			Router\UrlBases\LifecycleHooks::register();
+		} else {
+			self::url_bases_shop_watch();
+		}
+
+		// `wp cron event run` defines DOING_CRON only after boot: the network upgrade pass is registered here as well.
+		if ( is_multisite() ) {
+			add_action( Database\NetworkUpgrade::HOOK, [ Database\NetworkUpgrade::class, 'run' ] );
+		}
+
 		$plugin->register(
 			'cli',
 			fn( Plugin $p ) => new Cli\PerfLocaleCommand( $p ),
@@ -156,48 +295,6 @@ final class BootstrapAdmin {
 			fn() => new Cli\AddonSettingsCommand(),
 			true
 		);
-	}
-
-	/**
-	 * Register REST API routes on rest_api_init.
-	 *
-	 * @return void
-	 */
-	public static function register_rest_routes(): void {
-		// Prevent double registration if rest_api_init fires multiple times.
-		static $registered = false;
-
-		if ( $registered ) {
-			return;
-		}
-
-		$registered = true;
-
-		$controllers = [
-			new Api\LanguagesController(),
-			new Api\TranslationsController(),
-			new Api\StringsController(),
-			new Api\XliffController(),
-			new Api\WebhookController(),
-			new Api\JobsController(),
-		];
-
-		// MT routes register unconditionally: the handlers check mt_enabled() per request and
-		// answer `mt_disabled`, not `rest_no_route`, to an editor that cached the route.
-		$controllers[] = new Api\MachineTranslateController();
-		$controllers[] = new Api\BlockTranslateController();
-
-		// The public edge-config endpoint exists only when edge integration is enabled.
-		if ( Plugin::get_instance()->get( 'settings' )->edge_integration_enabled() ) {
-			$controllers[] = new Api\ConfigController();
-		}
-
-		foreach ( $controllers as $controller ) {
-			$controller->register_routes();
-		}
-
-		// The language of each navigation menu in the Site Editor's edit-context data.
-		( new Api\NavigationLanguageField() )->register();
 	}
 
 	/**

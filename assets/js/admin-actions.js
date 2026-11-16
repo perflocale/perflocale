@@ -28,6 +28,10 @@
  *   <fieldset data-perflocale-col-action>
  *     Screen Options "Language Columns" (Strings and Translations screens):
  *     the second function below.
+ *
+ *   data-perflocale-post="nonce"
+ *     A link to a POST-only action (Content ReSync): a plain click posts its address with the nonce as `_wpnonce`,
+ *     once until the page is shown again; another origin or a modified click is left to the browser.
  */
 ( function () {
 	'use strict';
@@ -172,11 +176,65 @@
 		} );
 	}
 
+	// Set while a posted link's navigation is under way.
+	var posting = false;
+
+	function bindPostLinks() {
+		window.addEventListener( 'pageshow', function () {
+			posting = false;
+		} );
+
+		document.addEventListener( 'click', function ( e ) {
+			var el = e.target.closest( 'a[data-perflocale-post]' );
+			if ( ! el || e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey ) {
+				return;
+			}
+			var url = new URL( el.href, window.location.href );
+			if ( url.origin !== window.location.origin ) {
+				return;
+			}
+			e.preventDefault();
+			if ( posting ) {
+				return;
+			}
+			posting = true;
+
+			var form = document.createElement( 'form' );
+			var field = document.createElement( 'input' );
+			form.method = 'post';
+			form.action = url.href;
+			form.hidden = true;
+			field.type = 'hidden';
+			field.name = '_wpnonce';
+			field.value = el.getAttribute( 'data-perflocale-post' ) || '';
+			form.appendChild( field );
+			document.body.appendChild( form );
+
+			// A navigation an unsaved-changes guard cancels ("Stay") fires no
+			// pageshow: as with submit-busy, the link works again after 3 s
+			// unless the page is leaving.
+			var revive = window.setTimeout( function () {
+				posting = false;
+			}, 3000 );
+
+			window.addEventListener(
+				'pagehide',
+				function () {
+					window.clearTimeout( revive );
+				},
+				{ once: true }
+			);
+
+			form.submit();
+		} );
+	}
+
 	function init() {
 		bindConfirm();
 		bindClipboard();
 		bindSubmitBusy();
 		bindPopovers();
+		bindPostLinks();
 	}
 
 	if ( document.readyState === 'loading' ) {

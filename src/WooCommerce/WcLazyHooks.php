@@ -145,7 +145,7 @@ final class WcLazyHooks {
 	}
 
 	/**
-	 * Register the exchange-rate hooks; in write contexts also ExchangeRateSync::register_write_hooks().
+	 * Register the exchange-rate hooks; in non-REST write contexts also ExchangeRateSync::register_write_hooks().
 	 *
 	 * @param Settings              $settings Plugin settings.
 	 * @param ExchangeRateSync|null $instance The instance to call (ExchangeRateSync::register_hooks()).
@@ -169,7 +169,8 @@ final class WcLazyHooks {
 			add_action( 'admin_notices', [ self::class, 'maybe_render_stale_notice' ] );
 		}
 
-		if ( \PerfLocale\Helper::is_write_context() ) {
+		// Not on REST writes (Store API POSTs): reconcile and the refresh event run on admin, cron and CLI.
+		if ( ( \PerfLocale\Bootstrap::$writes ?? \PerfLocale\Helper::is_write_context() ) && ! \PerfLocale\Bootstrap::$rest ) {
 			self::rates()->register_write_hooks();
 		}
 	}

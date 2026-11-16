@@ -14,6 +14,7 @@ use PerfLocale\Database\Schema;
 use PerfLocale\Enum\ObjectType;
 use PerfLocale\Enum\TranslationStatus;
 use PerfLocale\Settings;
+use PerfLocale\Util\StateHash;
 
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
@@ -22,8 +23,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 /**
  * Monitors source content changes and flags translations as "needs update".
  *
- * Compares a SHA-256 hash of the translatable content on each save: a changed default-language object flags its
- * translations, a changed translation clears its own flag.
+ * Compares a state hash (StateHash) of the translatable content on each save: a changed default-language object flags
+ * its translations, a changed translation clears its own flag. A legacy (unframed) row that matches is rewritten
+ * without a flag.
  */
 final class ContentChangeDetector {
 
@@ -45,6 +47,14 @@ final class ContentChangeDetector {
 	private ?int $default_language_id = null;
 
 	/**
+	 * Posts whose Outdated flag a resync write owns now, by blog then post id: clear_needs_update() skips them.
+	 * The writer releases the id in `finally`.
+	 *
+	 * @var array<int, array<int, true>>
+	 */
+	private static array $held = [];
+
+	/**
 	 * Constructor.
 	 *
 	 * @param Settings     $settings Plugin settings.
@@ -53,6 +63,28 @@ final class ContentChangeDetector {
 	public function __construct( Settings $settings, CacheManager $cache ) {
 		$this->settings = $settings;
 		$this->cache    = $cache;
+	}
+
+	/**
+	 * Hold a post's Outdated flag: the coming save is a resync write, which decides the flag itself.
+	 *
+	 * @param int $post_id Post id.
+	 * @return void
+	 */
+	public static function hold_flag( int $post_id ): void {
+		if ( $post_id > 0 ) {
+			self::$held[ get_current_blog_id() ][ $post_id ] = true;
+		}
+	}
+
+	/**
+	 * Release a held flag.
+	 *
+	 * @param int $post_id Post id.
+	 * @return void
+	 */
+	public static function release_flag( int $post_id ): void {
+		unset( self::$held[ get_current_blog_id() ][ $post_id ] );
 	}
 
 	/**
@@ -110,6 +142,13 @@ final class ContentChangeDetector {
 			return;
 		}
 
+		// A legacy row that names this content: unchanged, and this save stores the new hash.
+		if ( StateHash::is_legacy( $old_hash ) && $old_hash === StateHash::legacy_post( $post->post_title, $post->post_content, $post->post_excerpt ) ) {
+			$this->store_hash( $post_id, 'post', $new_hash );
+
+			return;
+		}
+
 		// Content changed - store the new hash.
 		$this->store_hash( $post_id, 'post', $new_hash );
 
@@ -156,6 +195,13 @@ final class ContentChangeDetector {
 			return;
 		}
 
+		// A legacy row that names this term: unchanged, and this save stores the new hash.
+		if ( StateHash::is_legacy( $old_hash ) && $old_hash === StateHash::legacy_term( $term->name, $term->description ) ) {
+			$this->store_hash( $term_id, 'term', $new_hash );
+
+			return;
+		}
+
 		$this->store_hash( $term_id, 'term', $new_hash );
 
 		if ( ! $this->is_default_language_object( $term_id, 'term' ) ) {
@@ -194,24 +240,31 @@ final class ContentChangeDetector {
 	 * Compute a hash of a post's translatable content.
 	 *
 	 * @param \WP_Post $post Post object.
-	 * @return string SHA-256 hash.
+	 * @return string State hash.
 	 */
 	private function compute_post_hash( \WP_Post $post ): string {
-		$content = $post->post_title . '|' . $post->post_content . '|' . $post->post_excerpt;
-
-		return hash( 'sha256', $content );
+		return self::post_hash( $post );
 	}
 
 	/**
-	 * Compute a hash of a term's translatable content.
+	 * The state hash of a post's translatable content (StateHash::post()), as stored by this detector.
+	 * ReSync's Store::content_hash() must compute the same value.
+	 *
+	 * @param \WP_Post $post Post object.
+	 * @return string State hash.
+	 */
+	public static function post_hash( \WP_Post $post ): string {
+		return StateHash::post( $post->post_title, $post->post_content, $post->post_excerpt );
+	}
+
+	/**
+	 * Compute a hash of a term's translatable content (StateHash::term()).
 	 *
 	 * @param \WP_Term $term Term object.
-	 * @return string SHA-256 hash.
+	 * @return string State hash.
 	 */
 	private function compute_term_hash( \WP_Term $term ): string {
-		$content = $term->name . '|' . $term->description;
-
-		return hash( 'sha256', $content );
+		return StateHash::term( $term->name, $term->description );
 	}
 
 	/**
@@ -393,6 +446,10 @@ final class ContentChangeDetector {
 	 * @return void
 	 */
 	private function clear_needs_update( int $object_id, ObjectType $type ): void {
+		if ( ObjectType::Post === $type && isset( self::$held[ get_current_blog_id() ][ $object_id ] ) ) {
+			return;
+		}
+
 		$object_type = $type === ObjectType::Term ? 'term' : 'post';
 		$language_id = $this->get_object_language_id( $object_id, $object_type );
 

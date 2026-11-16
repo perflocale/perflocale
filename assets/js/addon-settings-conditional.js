@@ -18,9 +18,8 @@
  *           ]}
  *       ]}
  *
- * PHP sets the initial display state at render time; this script keeps it
- * in sync as the user toggles driver fields. No FOUC - the initial render
- * is already correct from the server.
+ * PHP prints a hidden row with the `hidden` attribute; this script toggles
+ * that attribute as driver fields change (no flash: the first pass matches).
  */
 ( function () {
 	'use strict';
@@ -111,7 +110,13 @@
 				return; // Malformed JSON - leave row alone.
 			}
 
-			row.style.display = evaluate( spec, values ) ? '' : 'none';
+			var show = evaluate( spec, values );
+
+			row.hidden = ! show;
+			// A custom render_callback row may still print style="display:none".
+			if ( show && row.style.display === 'none' ) {
+				row.style.display = '';
+			}
 		} );
 	}
 
@@ -163,6 +168,22 @@
 				}
 			} );
 		} );
+
+		if ( ! containers.length ) {
+			return;
+		}
+
+		// Back/forward restores control values after init without a change event: apply once more.
+		var reconcile = function () {
+			setTimeout( function () {
+				containers.forEach( function ( container ) {
+					applyVisibility( container );
+				} );
+			}, 0 );
+		};
+
+		window.addEventListener( 'pageshow', reconcile );
+		window.addEventListener( 'load', reconcile );
 	}
 
 	if ( document.readyState === 'loading' ) {

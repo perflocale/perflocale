@@ -28,6 +28,11 @@ final class PrivacyIntegration {
 	private const SLUG = 'perflocale';
 
 	/**
+	 * Slug of the automation exporter and eraser (Automation\PersonalData::SLUG).
+	 */
+	private const AUTOMATION_SLUG = 'perflocale-automation';
+
+	/**
 	 * Background-job rows per exporter page: bounds one AJAX request, not the export.
 	 */
 	private const EXPORT_JOBS_PER_PAGE = 200;
@@ -60,7 +65,7 @@ final class PrivacyIntegration {
 	}
 
 	/**
-	 * Advertise the exporter to WordPress.
+	 * Advertise the exporter to WordPress, and the automation exporter (Automation\PersonalData), ReSync on or off.
 	 *
 	 * @param array<string, array<string, mixed>> $exporters Existing exporters.
 	 * @return array<string, array<string, mixed>>
@@ -71,11 +76,17 @@ final class PrivacyIntegration {
 			'callback'               => [ $this, 'export_personal_data' ],
 		];
 
+		// PersonalData::SLUG as text: the class loads only when WordPress runs the callback.
+		$exporters[ self::AUTOMATION_SLUG ] = [
+			'exporter_friendly_name' => __( 'PerfLocale Content ReSync updates', 'perflocale' ),
+			'callback'               => [ \PerfLocale\Automation\PersonalData::class, 'export' ],
+		];
+
 		return $exporters;
 	}
 
 	/**
-	 * Advertise the eraser to WordPress.
+	 * Advertise the eraser to WordPress, and the automation eraser, ReSync on or off.
 	 *
 	 * @param array<string, array<string, mixed>> $erasers Existing erasers.
 	 * @return array<string, array<string, mixed>>
@@ -84,6 +95,11 @@ final class PrivacyIntegration {
 		$erasers[ self::SLUG ] = [
 			'eraser_friendly_name' => __( 'PerfLocale', 'perflocale' ),
 			'callback'             => [ $this, 'erase_personal_data' ],
+		];
+
+		$erasers[ self::AUTOMATION_SLUG ] = [
+			'eraser_friendly_name' => __( 'PerfLocale Content ReSync updates', 'perflocale' ),
+			'callback'             => [ \PerfLocale\Automation\PersonalData::class, 'erase' ],
 		];
 
 		return $erasers;
@@ -473,19 +489,52 @@ final class PrivacyIntegration {
 				) . '</p>';
 		}
 
-		if ( (bool) $this->settings->get( 'redirect_geo_enabled', false ) ) {
+		$geo_id     = $this->settings->get( 'geo_provider', '' );
+		$geo_header = is_string( $geo_id ) ? ( [
+			'header_cloudflare' => 'Cloudflare',
+			'header_cloudfront' => 'Amazon CloudFront',
+			'header_server'     => __( 'the web server\'s GeoIP module', 'perflocale' ),
+		][ $geo_id ] ?? '' ) : '';
+
+		if ( (bool) $this->settings->get( 'redirect_geo_enabled', false ) && $geo_header !== '' ) {
+			$sections[] = '<h3>' . esc_html__( 'Geolocation-based language detection', 'perflocale' ) . '</h3>'
+				. '<p>' . sprintf(
+					/* translators: %s: Cloudflare, Amazon CloudFront, or the web server's GeoIP module */
+					esc_html__( 'On a first visit, the country code that %s adds to the request is read to suggest a language version. PerfLocale does not send the visitor IP address anywhere for this and does not store the country code. This feature can be disabled in PerfLocale settings.', 'perflocale' ),
+					'<strong>' . esc_html( $geo_header ) . '</strong>'
+				) . '</p>';
+		} elseif ( (bool) $this->settings->get( 'redirect_geo_enabled', false ) ) {
 			$provider = (string) $this->settings->get( 'geo_provider', '' );
 
 			$provider_label = $provider !== ''
 				? $provider
 				: __( 'the geolocation provider configured by this site', 'perflocale' );
 
+			// Read as GeoRedirect::lookup_country() reads it: 0 or less stores nothing.
+			$cache_hours = $this->settings->get( 'geo_cache_hours', 24 );
+			$cache_hours = is_scalar( $cache_hours ) ? (int) $cache_hours : 0;
+
+			$cache_sentence = $cache_hours > 0
+				? sprintf(
+					/* translators: %d: number of hours the resolved country code is cached (the GeoIP cache duration setting) */
+					_n(
+						'The resolved country code is cached server-side for %d hour under a salted one-way hash of the anonymized network address (host bits removed); neither the IP address nor any value reversible to it is stored.',
+						'The resolved country code is cached server-side for %d hours under a salted one-way hash of the anonymized network address (host bits removed); neither the IP address nor any value reversible to it is stored.',
+						$cache_hours,
+						'perflocale'
+					),
+					$cache_hours
+				)
+				: __( 'The resolved country code is not cached, and neither the IP address nor any value reversible to it is stored.', 'perflocale' );
+
 			$sections[] = '<h3>' . esc_html__( 'Geolocation-based language detection', 'perflocale' ) . '</h3>'
 				. '<p>' . sprintf(
 					/* translators: %s: GeoIP provider name */
-					esc_html__( 'On a first visit, the visitor IP address is sent to %s to resolve a country code and suggest a language version. The resolved country code is cached server-side for 24 hours under a salted one-way hash of the anonymized network address (host bits removed); neither the IP address nor any value reversible to it is stored. This feature can be disabled in PerfLocale settings.', 'perflocale' ),
+					esc_html__( 'On a first visit, the visitor IP address is sent to %s to resolve a country code and suggest a language version.', 'perflocale' ),
 					'<strong>' . esc_html( $provider_label ) . '</strong>'
-				) . '</p>';
+				)
+				. ' ' . esc_html( $cache_sentence )
+				. ' ' . esc_html__( 'This feature can be disabled in PerfLocale settings.', 'perflocale' ) . '</p>';
 		}
 
 		if (
@@ -509,10 +558,31 @@ final class PrivacyIntegration {
 					$this->mt_provider_recipient( $provider )
 				) . '</p>'
 				. '<p>' . esc_html__(
-					'Text you send for machine translation is transmitted to the provider you configured and is not retained by PerfLocale beyond the translated result saved on the post.',
+					'Text you send for machine translation is transmitted to the provider you configured. PerfLocale keeps only the translated result: saved on the post, or held with a Content ReSync update as described below. Content ReSync sends the new or changed parts of a translation only when its "Changed and new parts" setting is set to machine translate them.',
 					'perflocale'
 				) . '</p>';
+
+			// The raw value first: this text is built on every admin page, ContextSettings only when context may be on.
+			if ( 'off' !== $this->settings->get( 'mt_context_mode', 'off' ) && 'off' !== \PerfLocale\MachineTranslation\ContextSettings::mode( $this->settings ) ) {
+				$sections[] = '<p>' . esc_html__(
+					'With each part Content ReSync machine translates, text around it is also sent as context to providers that accept it: the neighbouring parts or its section of the same post, and its earlier translation. An outdated string is sent with its current translation.',
+					'perflocale'
+				) . '</p>';
+			}
 		}
+
+		$sections[] = '<h3>' . esc_html__( 'Content ReSync', 'perflocale' ) . '</h3>'
+			. '<p>' . esc_html__(
+				'When site staff update translations from their source posts with Content ReSync, PerfLocale stores copies of post text in its own database tables: the version of each source post a translation was last updated from, proposed updates waiting for review, and the text an applied update replaced, so that the update can be undone. These copies contain whatever the posts contain, which can include personal data. Each update also records which user started it and which user decided it; these records are exported and erased with Tools &rarr; Export Personal Data and Erase Personal Data.',
+				'perflocale'
+			) . '</p>'
+			. '<p>' . esc_html__(
+				'A proposed update waits until a reviewer applies or rejects it, a newer update replaces it, its source post is permanently deleted, its translation is trashed or deleted, or its language is removed. Stored copies of a source post are removed after the post is permanently deleted. A decided update is removed 90 days after the decision, with the text it replaced, except the latest applied update of each translation, which is kept while the translation exists. A source version that no update uses is removed after 90 days without use. Machine translation results of a run that stopped before saving expire after one day, and WordPress removes expired entries in its daily clean-up. When the plugin is deleted, these copies are removed only if "Delete all plugin data when uninstalling" is turned on under PerfLocale &rarr; Settings &rarr; Advanced; otherwise they stay in the database for a reinstall.',
+				'perflocale'
+			) . ' ' . esc_html__(
+				'On an object cache that cannot clear groups, PerfLocale\'s cached copies expire on their own within a day, or within the GeoIP cache time you set.',
+				'perflocale'
+			) . '</p>';
 
 		$sections[] = '<h3>' . esc_html__( 'Admin user preferences', 'perflocale' ) . '</h3>'
 			. '<p>' . esc_html__(

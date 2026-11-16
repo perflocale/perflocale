@@ -356,7 +356,7 @@ final class StringLinkCheck {
 
 		$marker    = $guard->condition();
 		$string_id = $row['id'];
-		$group_id  = StringGroupAssigner::assign( $wpdb, $string_id, true, $guard );
+		$group_id  = StringGroupAssigner::assign( $wpdb, $string_id, true, $guard, $row['group_id'] );
 		$moved     = $group_id > 0 ? $wpdb->query(
 			( $wpdb->prepare(
 				"UPDATE %i SET group_id = %d, updated_at = updated_at WHERE type = 'string' AND object_id = %d AND group_id <> %d",

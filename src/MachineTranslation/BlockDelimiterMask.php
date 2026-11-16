@@ -24,11 +24,19 @@ if ( ! defined( 'ABSPATH' ) ) {
 final class BlockDelimiterMask {
 
 	/**
-	 * Per-call nonce in every placeholder.
+	 * Nonce in every placeholder: a hash of the content, so the same content gives the same pieces (PieceAnswers); a
+	 * content cannot hold the hash of itself.
 	 *
 	 * @var string
 	 */
 	private string $nonce;
+
+	/**
+	 * The delimiters as BlockStructureGuard::delimiters() read them from the content.
+	 *
+	 * @var array<int, array{kind: string, name: string, attrs: bool, start: int, end: int}>
+	 */
+	private array $tokens = [];
 
 	/**
 	 * Whether placeholders are `<pfl-b>` elements instead of comments.
@@ -74,9 +82,11 @@ final class BlockDelimiterMask {
 
 	/**
 	 * Constructor.
+	 *
+	 * @param string $content Content whose hash is the nonce.
 	 */
-	private function __construct() {
-		$this->nonce = bin2hex( random_bytes( 6 ) );
+	private function __construct( string $content ) {
+		$this->nonce = substr( hash( 'sha256', $content ), 0, 12 );
 	}
 
 	/**
@@ -97,8 +107,9 @@ final class BlockDelimiterMask {
 			return null;
 		}
 
-		$mask           = new self();
+		$mask           = new self( $content );
 		$mask->elements = $elements;
+		$mask->tokens   = $tokens;
 		$offset         = 0;
 
 		foreach ( $tokens as $i => $t ) {
@@ -174,8 +185,7 @@ final class BlockDelimiterMask {
 			$sent[] = $this->placeholder( $i );
 		}
 
-		// Either form and any pfl-b tag or bare nonce token counts, so a marker moved between forms is damage.
-		$damaged = PlaceholderCheck::damaged( $translated, $sent, '/<!--\s*pfl-b-' . $this->nonce . '-\d+\s*-->|<pfl-b\b[^>]*+>(?:\s*+<\/pfl-b>)?|<\/pfl-b>|(?:pfl-b-)?' . $this->nonce . '-\d+/' );
+		$damaged = PlaceholderCheck::damaged( $translated, $sent, $this->any_pattern() );
 
 		if ( $damaged > 0 ) {
 			throw new NotSavedException(
@@ -220,6 +230,40 @@ final class BlockDelimiterMask {
 		}
 
 		return strtr( $translated, $map );
+	}
+
+	/**
+	 * Any token of this mask's placeholders: either form, any pfl-b tag or bare nonce token, so a marker moved between
+	 * forms is damage.
+	 *
+	 * @return string
+	 */
+	public function any_pattern(): string {
+		return '/<!--\s*pfl-b-' . $this->nonce . '-\d+\s*-->|<pfl-b\b[^>]*+>(?:\s*+<\/pfl-b>)?|<\/pfl-b>|(?:pfl-b-)?' . $this->nonce . '-\d+/';
+	}
+
+	/**
+	 * Each delimiter's kind, name and placeholder span in text(), in order.
+	 *
+	 * @return list<array{kind: string, name: string, start: int, end: int}>
+	 */
+	public function layout(): array {
+		$out   = [];
+		$shift = 0;
+
+		foreach ( $this->tokens as $i => $t ) {
+			$length = strlen( $this->placeholder( $i ) );
+			$start  = $t['start'] + $shift;
+			$out[]  = [
+				'kind'  => $t['kind'],
+				'name'  => $t['name'],
+				'start' => $start,
+				'end'   => $start + $length,
+			];
+			$shift += $length - ( $t['end'] - $t['start'] );
+		}
+
+		return $out;
 	}
 
 	/**

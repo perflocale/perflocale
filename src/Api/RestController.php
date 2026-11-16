@@ -139,7 +139,7 @@ abstract class RestController extends \WP_REST_Controller {
 	}
 
 	/**
-	 * Whether the user may read every post; primes 200 at a time, since each read_post check loads its post.
+	 * Whether the user may read every post's text (ObjectPermission::read_text()); primes 200 at a time.
 	 *
 	 * @param int[] $post_ids Post ids; ids below 1 are skipped.
 	 * @return bool
@@ -151,7 +151,9 @@ abstract class RestController extends \WP_REST_Controller {
 			_prime_post_caches( $chunk, false, false );
 
 			foreach ( $chunk as $pid ) {
-				if ( ! current_user_can( 'read_post', $pid ) ) {
+				$post = get_post( $pid );
+
+				if ( ! $post instanceof \WP_Post || ! \PerfLocale\Util\ObjectPermission::read_text( $post ) ) {
 					return false;
 				}
 			}

@@ -13,6 +13,9 @@
  *      bound to the same form (via the HTML5 `form="..."` attribute).
  *   4. Apply button: validate that an action AND at least one row are
  *      selected. Confirm before destructive bulk delete.
+ *   5. Extra inputs of one action (data-perflocale-bulk-extra="<action>",
+ *      e.g. the "Missing translations" choice of Update translations) show
+ *      only while that action is selected.
  *
  * Loaded only on the Translations list view via Assets.php.
  */
@@ -41,7 +44,9 @@
 			set_deadline:        '[data-perflocale-bulk-value-deadline]',
 			mt_translate:        '[data-perflocale-bulk-value-target-lang]',
 			mark_needs_update:   '[data-perflocale-bulk-value-target-lang]',
+			update_translations: '[data-perflocale-bulk-value-target-lang]',
 		};
+		var extraEls = document.querySelectorAll( '[data-perflocale-bulk-extra]' );
 
 		var secondaryEls = {};
 		Object.keys( secondaryMap ).forEach( function ( action ) {
@@ -65,6 +70,10 @@
 				match.hidden = false;
 				match.disabled = false;
 			}
+
+			extraEls.forEach( function ( extra ) {
+				extra.hidden = extra.getAttribute( 'data-perflocale-bulk-extra' ) !== action;
+			} );
 		}
 
 		function syncDropdowns( source ) {

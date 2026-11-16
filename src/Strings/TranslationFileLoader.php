@@ -48,6 +48,13 @@ final class TranslationFileLoader {
 	private bool $gettext_domains = false;
 
 	/**
+	 * Database mode's service once a file was damaged (FileLoadFallback): it answers first, also for memoized references.
+	 *
+	 * @var StringTranslation|null
+	 */
+	private ?StringTranslation $db = null; // @phpstan-ignore property.unusedType (assigned by FileLoadFallback through a bound closure)
+
+	/**
 	 * Constructor.
 	 *
 	 * @param LanguageRouter $router Language router.
@@ -76,19 +83,26 @@ final class TranslationFileLoader {
 		$current = $this->router->get_current_language();
 		$default = $this->router->get_default_language();
 
-		if (
-			$current !== null
-			&& $default !== null
-			&& isset( $current->slug, $default->slug )
-			&& $current->slug === $default->slug
-		) {
+		if ( isset( $current->slug, $default->slug ) && $current->slug === $default->slug ) {
 			return;
 		}
 
 		// Load first: gettext fires on every __() call, so register the filters only when they can serve something.
 		$this->load_translations();
 
-		if ( empty( $this->translations ) || ! $this->gettext_domains ) {
+		if ( empty( $this->translations ) ) {
+			return;
+		}
+
+		// Without AJAX or an attach filter, FileGettextRule's answer is $gettext_domains: a page view does not load it.
+		$attach = $this->gettext_domains;
+
+		if ( wp_doing_ajax() || has_filter( 'perflocale/strings/attach_gettext' ) ) {
+			require_once __DIR__ . '/FileGettextRule.php';
+			$attach = FileGettextRule::should_attach( $attach );
+		}
+
+		if ( ! $attach ) {
 			return;
 		}
 
@@ -211,9 +225,9 @@ final class TranslationFileLoader {
 	 */
 	private function plural_form_index( int $number ): int {
 		$current = $this->router->get_current_language();
-		$locale  = is_object( $current ) && ! empty( $current->locale )
+		$locale  = ! empty( $current->locale )
 			? (string) $current->locale
-			: ( is_object( $current ) && ! empty( $current->slug ) ? (string) $current->slug : 'en' );
+			: ( ! empty( $current->slug ) ? (string) $current->slug : 'en' );
 
 		return PluralRules::form_index( $locale, $number );
 	}
@@ -243,7 +257,7 @@ final class TranslationFileLoader {
 		$pick  = $forms[ $form_index - 1 ] ?? '';
 
 		// A missing or empty form falls back to form 1, as gettext does.
-		$form = ( is_string( $pick ) && $pick !== '' ) ? $pick : $forms[0];
+		$form = $pick !== '' ? $pick : $forms[0];
 
 		return has_filter( 'perflocale/string/translate' ) ? StringLookup::filtered( $form, $original, $domain, $this->router->get_current_slug() ) : $form;
 	}
@@ -261,18 +275,14 @@ final class TranslationFileLoader {
 			$this->load_translations();
 		}
 
-		if ( empty( $this->translations ) ) {
-			return null;
-		}
-
 		$translated = $this->translations[ self::map_key( $domain, $context, $text ) ] ?? null;
 
 		// As the database mode, per form (pick_plural_form() filters a NUL-joined plural's); hot path, so only with listeners.
-		return $translated !== null && has_filter( 'perflocale/string/translate' ) && ! str_contains( $translated, "\0" ) ? StringLookup::filtered( $translated, $text, $domain, $this->router->get_current_slug() ) : $translated;
+		return $this->db?->get_translation( $text, $domain, $context ) ?? ( $translated !== null && has_filter( 'perflocale/string/translate' ) && ! str_contains( $translated, "\0" ) ? StringLookup::filtered( $translated, $text, $domain, $this->router->get_current_slug() ) : $translated );
 	}
 
 	/**
-	 * Build the translations-map key: the raw pre-image of StringRepository::compute_hash(), unhashed.
+	 * Build the translations-map key (files mode only; never compared with a stored hash).
 	 *
 	 * Combined bundles persist these keys: a format change bumps TranslationFileGenerator::COMBINED_VERSION and its
 	 * literal in load_translations().
@@ -283,7 +293,8 @@ final class TranslationFileLoader {
 	 * @return string
 	 */
 	public static function map_key( string $domain, string $context, string $text ): string {
-		return $domain . '|' . $context . '|' . $text;
+		// "\x04" ends the context, as in a .l10n.php key.
+		return $domain . '|' . $context . "\x04" . $text;
 	}
 
 	/**
@@ -331,13 +342,15 @@ final class TranslationFileLoader {
 				// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_is_readable
 				&& is_readable( $combined )
 			) {
-				$data = include $combined; // phpcs:ignore WordPressVIPMinimum.Files.IncludingFile.UsingVariable
+				$data = $this->read( $combined );
+
+				if ( null === $data ) {
+					return;
+				}
 
 				if (
-					is_array( $data )
-					&& 1 === (int) ( $data['v'] ?? 0 )
-					&& isset( $data['map'] )
-					&& is_array( $data['map'] )
+					2 === (int) ( $data['v'] ?? 0 )
+					&& is_array( $data['map'] ?? null )
 					&& $data['map'] !== []
 				) {
 					$this->loaded       = true;
@@ -370,18 +383,18 @@ final class TranslationFileLoader {
 			$files = glob( $dir . '/*' . $suffix );
 		}
 
-		// Safety limit: prevent excessive file I/O from misconfigured directories.
-		if ( is_array( $files ) && count( $files ) > 200 ) {
-			$files = array_slice( $files, 0, 200 );
-		}
-
-		if ( ! is_array( $files ) || empty( $files ) ) {
+		if ( ! $files ) {
 			// While generation runs, stay unloaded so the next request retries.
 			if ( ! get_transient( 'perflocale_strings_regenerating' ) ) {
 				$this->loaded = true;
 			}
 
 			return;
+		}
+
+		// Safety limit: prevent excessive file I/O from misconfigured directories.
+		if ( count( $files ) > 200 ) {
+			$files = array_slice( $files, 0, 200 );
 		}
 
 		$this->loaded = true;
@@ -391,37 +404,33 @@ final class TranslationFileLoader {
 
 		foreach ( $files as $file ) {
 			$basename = basename( $file );
+			$domain   = substr( $basename, 0, -strlen( $suffix ) );
 
 			// The untrusted combined bundle shares the locale suffix but is not a per-domain file.
-			if ( $basename === $combined_name ) {
-				continue;
-			}
-
-			$domain = substr( $basename, 0, -strlen( $suffix ) );
-
-			if ( $domain === '' ) {
+			if ( $basename === $combined_name || $domain === '' ) {
 				continue;
 			}
 
 			$file_real = realpath( $file );
 
-			if ( $file_real === false || $dir_real === false ) {
-				continue; // Broken symlink or missing parent - skip silently.
-			}
-
-			// The trailing separator stops `/foo` matching `/foobar`.
-			if ( strncmp( $file_real, $dir_real . DIRECTORY_SEPARATOR, strlen( $dir_real ) + 1 ) !== 0 ) {
+			// Broken symlink, missing parent, outside the directory (the trailing separator stops `/foo` matching `/foobar`)
+			// or unreadable: skip silently.
+			if (
+				$file_real === false
+				|| $dir_real === false
+				|| strncmp( $file_real, $dir_real . DIRECTORY_SEPARATOR, strlen( $dir_real ) + 1 ) !== 0
+				|| ! is_readable( $file ) // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_is_readable
+			) {
 				continue;
 			}
 
-			// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_is_readable
-			if ( ! is_readable( $file ) ) {
-				continue;
+			$data = $this->read( $file );
+
+			if ( null === $data ) {
+				return;
 			}
 
-			$data = include $file; // phpcs:ignore WordPressVIPMinimum.Files.IncludingFile.UsingVariable
-
-			if ( ! is_array( $data ) || empty( $data['messages'] ) || ! is_array( $data['messages'] ) ) {
+			if ( empty( $data['messages'] ) || ! is_array( $data['messages'] ) ) {
 				continue;
 			}
 
@@ -449,13 +458,29 @@ final class TranslationFileLoader {
 	}
 
 	/**
+	 * Include a generated file; a damaged one (throws or returns no array) goes to FileLoadFallback.
+	 *
+	 * @param string $file Absolute path.
+	 * @return array<mixed>|null Null when damaged.
+	 */
+	private function read( string $file ): ?array {
+		try {
+			$data = include $file; // phpcs:ignore WordPressVIPMinimum.Files.IncludingFile.UsingVariable
+		} catch ( \Throwable $data ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch -- Caught into $data.
+		}
+
+		return is_array( $data ) ? $data : FileLoadFallback::start( $this, $file, $data );
+	}
+
+	/**
 	 * Whether a domain's strings are served through the gettext filters.
 	 *
 	 * @param string $domain Text domain.
 	 * @return bool
 	 */
 	private static function is_gettext_domain( string $domain ): bool {
-		return $domain !== \PerfLocale\Frontend\OptionStrings::DOMAIN;
+		// StringTranslation::LOOKUP_ONLY written out, so a page view loads no other class (StringFrontEndDomainsTest).
+		return ! in_array( $domain, [ 'perflocale-options', 'perflocale-acf-options', 'perflocale-mb-settings', 'perflocale-mb-fields', 'perflocale-labels' ], true );
 	}
 
 	/**

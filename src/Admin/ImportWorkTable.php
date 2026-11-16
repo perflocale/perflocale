@@ -37,6 +37,26 @@ final class ImportWorkTable {
 	public const MOVED_GROUP = 3;
 
 	/**
+	 * Replace: file id of a strings row skipped because a row of the file holds its hash (a held pair's twin) => that row's id.
+	 */
+	public const TWIN = 4;
+
+	/**
+	 * Replace: the TWIN rows whose file hash is their computed hash (the row visitors were served) => the holder's id.
+	 */
+	public const TWIN_SERVED = 5;
+
+	/**
+	 * Replace: TWIN file id => its file group id.
+	 */
+	public const TWIN_GROUP = 6;
+
+	/**
+	 * Replace: file id of a strings row refused for a gettext separator => its file group id.
+	 */
+	public const REFUSED = 7;
+
+	/**
 	 * First kind of the per-parent-table id maps (old id => id here), assigned in first-use order.
 	 */
 	private const FIRST_ID_MAP = 16;

@@ -28,7 +28,7 @@ final class Migrator {
 	private array $addons_current = [];
 
 	/**
-	 * Register hooks on admin_init, rest_api_init and wp_loaded, so every kind of request migrates.
+	 * Register hooks on admin_init, rest_api_init and wp_loaded, for the admin, REST and WP-CLI requests that boot this class.
 	 *
 	 * Every handler returns early once current; the add-on pass also skips a repeat for the same blog and add-on state.
 	 *
@@ -45,7 +45,7 @@ final class Migrator {
 		add_action( 'rest_api_init', [ $this, 'maybe_update' ] );
 		add_action( 'rest_api_init', [ $this, 'maybe_migrate_addons' ] );
 
-		// Front-end, cron and WP-CLI requests; priority 1 runs before code that needs the current schema. A failing step retries with backoff.
+		// wp_loaded too: WP-CLI has neither hook above; priority 1 runs before code that needs the current schema. A failing step retries with backoff.
 		add_action( 'wp_loaded', [ $this, 'maybe_migrate' ], 1 );
 		add_action( 'wp_loaded', [ $this, 'maybe_update' ], 1 );
 		add_action( 'wp_loaded', [ $this, 'maybe_migrate_addons' ], 2 );
@@ -61,7 +61,7 @@ final class Migrator {
 	 */
 	public function maybe_migrate_addons(): void {
 		$plugin = \PerfLocale\Plugin::get_instance();
-		if ( ! $plugin->has( 'addon_registry' ) ) {
+		if ( ! $plugin->has( 'addon_registry' ) || ! self::may_try() ) {
 			return;
 		}
 		$registry = $plugin->get( 'addon_registry' );
@@ -85,6 +85,14 @@ final class Migrator {
 		}
 
 		$clean = true;
+		// Asked right before each write (manifest, schema step, error record), never remembered: a callback may change the
+		// user or their capabilities; on most requests no add-on has a write.
+		$gate = static function () use ( &$clean ): bool {
+			$may   = self::may_run();
+			$clean = $clean && $may;
+
+			return $may;
+		};
 
 		// Keyed by addon id (the registration key), so the id comes from the registry, not an addon-author get_id() call.
 		foreach ( $addons as $addon_id => $addon ) {
@@ -111,14 +119,17 @@ final class Migrator {
 			// Refresh the manifest (checksum-gated, no write when unchanged), then migrate.
 			// A throw from addon-author code is recorded for that addon, never fatal on wp_loaded.
 			try {
-				\PerfLocale\Addon\AddonManifestWriter::refresh( $addon );
+				\PerfLocale\Addon\AddonManifestWriter::refresh( $addon, $gate );
 
-				if ( $addon instanceof \PerfLocale\Addon\HasSchema && ! \PerfLocale\Addon\AddonSchemaManager::migrate( $addon ) ) {
+				if ( $addon instanceof \PerfLocale\Addon\HasSchema && ! \PerfLocale\Addon\AddonSchemaManager::is_current( $addon ) && ( ! $gate() || ! \PerfLocale\Addon\AddonSchemaManager::migrate( $addon ) ) ) {
 					$clean = false;
 				}
 			} catch ( \Throwable $e ) {
 				$clean = false;
-				\PerfLocale\Addon\AddonMigrationErrors::record( (string) $addon_id, 'migrate', 0, UpgradeRunner::describe( $e ) );
+
+				if ( self::may_run() ) {
+					\PerfLocale\Addon\AddonMigrationErrors::record( (string) $addon_id, 'migrate', 0, UpgradeRunner::describe( $e ) );
+				}
 			}
 		}
 
@@ -133,7 +144,7 @@ final class Migrator {
 	 * @return void
 	 */
 	public function maybe_migrate(): void {
-		if ( (int) get_option( 'perflocale_db_version', 0 ) >= PERFLOCALE_DB_VERSION ) {
+		if ( (int) get_option( 'perflocale_db_version', 0 ) >= PERFLOCALE_DB_VERSION || ! self::may_run() ) {
 			return;
 		}
 
@@ -161,5 +172,28 @@ final class Migrator {
 		}
 
 		UpgradeRunner::pending( 'update' );
+	}
+
+	/**
+	 * Whether this request may run schema steps: WP-CLI or a user who can manage options; never a visitor's REST or
+	 * admin-ajax request, where a failing step would scan whole tables again after each backoff. This class never boots on cron.
+	 *
+	 * @return bool
+	 */
+	private static function may_run(): bool {
+		if ( ( defined( 'WP_CLI' ) && WP_CLI ) || wp_doing_cron() ) {
+			return true;
+		}
+
+		return is_user_logged_in() && current_user_can( 'manage_options' );
+	}
+
+	/**
+	 * Whether may_run() can hold: WP-CLI or a signed-in user (no capability check yet); this class never boots on cron.
+	 *
+	 * @return bool
+	 */
+	private static function may_try(): bool {
+		return ( defined( 'WP_CLI' ) && WP_CLI ) || wp_doing_cron() || is_user_logged_in();
 	}
 }

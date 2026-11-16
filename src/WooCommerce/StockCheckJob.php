@@ -138,6 +138,9 @@ final class StockCheckJob extends AbstractJob {
 
 			if ( null === $page['next'] ) {
 				$result['done'] = true;
+
+				$result['refreshed'] = self::refresh_flagged( 0 === $result['drifting'], $result['started'] );
+
 				return $result;
 			}
 		} while ( ! $sliced || microtime( true ) - $began < self::SLICE_SECONDS );
@@ -148,10 +151,35 @@ final class StockCheckJob extends AbstractJob {
 	}
 
 	/**
+	 * Refresh the stock status and lookup row of the copies StockRelativeWrite flagged (both are derived from the copy's
+	 * own stock, so a refresh is always right), and drop the flag's stock ids when no group drifts.
+	 *
+	 * @param bool $no_drift Whether the check found no drifting group.
+	 * @param int  $started  When the check started (a flag noted later keeps its stock ids).
+	 * @return list<int> The refreshed ids.
+	 */
+	private static function refresh_flagged( bool $no_drift, int $started ): array {
+		require_once __DIR__ . '/StockDriftFlag.php';
+		require_once __DIR__ . '/StockRelativeWrite.php';
+
+		$ids = StockDriftFlag::read()['refresh'];
+
+		// Cleared first: a refresh that fails again flags its id anew.
+		StockDriftFlag::clear( $no_drift ? null : [], $ids, $started );
+
+		foreach ( $ids as $id ) {
+			StockRelativeWrite::status( $id );
+			StockRelativeWrite::lookup( $id );
+		}
+
+		return $ids;
+	}
+
+	/**
 	 * The result so far: the stored result of the previous slice, or a new one.
 	 *
 	 * @param array<string, mixed> $args Worker args.
-	 * @return array{done: bool, cursor: int, read: int, total: int, drifting: int, copies: int, skipped: int, groups: list<array<mixed>>}
+	 * @return array{done: bool, cursor: int, read: int, total: int, drifting: int, copies: int, skipped: int, groups: list<array<mixed>>, started: int, refreshed?: list<int>}
 	 */
 	private static function resume( array $args ): array {
 		$fresh  = [
@@ -163,6 +191,7 @@ final class StockCheckJob extends AbstractJob {
 			'copies'   => 0,
 			'skipped'  => 0,
 			'groups'   => [],
+			'started'  => time(),
 		];
 		$slice  = $args['__perflocale_slice'] ?? null;
 		$stored = is_array( $slice ) ? ( $slice['resume'] ?? null ) : null;
@@ -174,6 +203,8 @@ final class StockCheckJob extends AbstractJob {
 		foreach ( [ 'cursor', 'read', 'total', 'drifting', 'copies', 'skipped' ] as $key ) {
 			$fresh[ $key ] = is_numeric( $stored[ $key ] ?? null ) ? max( 0, (int) $stored[ $key ] ) : 0;
 		}
+
+		$fresh['started'] = is_numeric( $stored['started'] ?? null ) ? (int) $stored['started'] : 0;
 
 		$fresh['groups'] = array_values( array_filter( array_slice( $stored['groups'], 0, self::LISTED ), 'is_array' ) );
 

@@ -26,6 +26,25 @@ if ( ! defined( 'ABSPATH' ) ) {
 final class TranslationGroupWrites extends TranslationGroupRepository {
 
 	/**
+	 * Per-blog counter every link write raises; a cold map build compares it around publication. Not autoloaded: only
+	 * cold builds read it, past every cache.
+	 */
+	private const LINK_GENERATION_OPTION = 'perflocale_cgen__links';
+
+	/**
+	 * Object types that can hold an eager link map.
+	 */
+	private const EAGER_MAP_TYPES = [ 'post', 'term', 'option', 'string', 'post_type', 'taxonomy' ];
+
+	/**
+	 * Blogs whose generation bump failed in this process (blog id => true): no build publishes here, and the shutdown
+	 * flush bumps again and deletes the maps. Not in reset_static_caches(): it must outlive a blog switch.
+	 *
+	 * @var array<int, true>
+	 */
+	private static array $generation_unproven = [];
+
+	/**
 	 * Seconds after this process deleted (or deferred deleting) a blog's cached all-language status selections during
 	 * which another status change does not delete them again (forget_status_selectors()).
 	 */
@@ -53,6 +72,18 @@ final class TranslationGroupWrites extends TranslationGroupRepository {
 	 * @var int
 	 */
 	private int $new_group_id = 0;
+
+	/**
+	 * Whether a transaction registered with set_in_transaction() (or this repository's own) is open: a batch then nests
+	 * inside it, as a second START TRANSACTION would commit the outer one.
+	 *
+	 * @since 1.0.8
+	 *
+	 * @return bool
+	 */
+	public static function in_transaction(): bool {
+		return self::$in_transaction;
+	}
 
 	/**
 	 * Give one string a new string-type group and point the string at it ({@see StringGroupAssigner::assign()}).
@@ -109,23 +140,31 @@ final class TranslationGroupWrites extends TranslationGroupRepository {
 	 * none, so the Translations screen filters in SQL and pagination counts the filtered set.
 	 * Docs: docs-ai/11-code-rationale.md, "TranslationGroupRepository: status selections".
 	 *
-	 * @param ObjectType $type Object type (e.g. Post).
-	 * @param int        $language_id Target language ID.
-	 * @param string     $status Optional status filter ('' = any, 'empty'
-	 *     = missing the language entirely).
-	 * @param int        $source_language_id Default language ID (0 = none): binds
-	 *     the returned row to the group's default-language member.
+	 * @param ObjectType           $type Object type (e.g. Post).
+	 * @param int                  $language_id Target language ID.
+	 * @param string               $status Optional status filter ('' = any, 'empty'
+	 *               = missing the language entirely).
+	 * @param int                  $source_language_id Default language ID (0 = none): binds
+	 *               the returned row to the group's default-language member.
+	 * @param array<string, mixed> $visible The user's view rules (visible_sql()): a member it may not view counts as
+	 *     missing ([] = all viewable).
 	 * @return array<int, int> Source object IDs.
 	 */
 	public function find_source_object_ids_by_language_status(
 		ObjectType $type,
 		int $language_id,
 		string $status = '',
-		int $source_language_id = 0
+		int $source_language_id = 0,
+		array $visible = []
 	): array {
 		if ( $language_id <= 0 ) {
 			return [];
 		}
+
+		[ $vis_sql, $vis_args ] = ObjectType::Post === $type ? self::visible_sql( $visible ) : [ '', [] ];
+
+		$sib_join = '' !== $vis_sql ? ' INNER JOIN %i pfl_sib ON pfl_sib.ID = t.object_id' : '';
+		$sib_args = '' !== $vis_sql ? [ $this->wpdb->posts ] : [];
 
 		// The outer scan to the one row per group that can survive the caller's filter.
 		$src_sql  = $source_language_id > 0 ? ' AND l.language_id = %d' : '';
@@ -142,13 +181,16 @@ final class TranslationGroupWrites extends TranslationGroupRepository {
 					WHERE g.type = %s
 					AND l.language_id != %d' . $src_sql . '
 					AND l.group_id NOT IN (
-						SELECT group_id FROM %i
-						WHERE language_id = %d
+						SELECT t.group_id FROM %i t' . $sib_join . '
+						WHERE t.language_id = %d' . $vis_sql . '
 					)',
 					array_merge(
 						[ $this->links_table(), $this->groups_table(), $type->value, $language_id ],
 						$src_args,
-						[ $this->links_table(), $language_id ]
+						[ $this->links_table() ],
+						$sib_args,
+						[ $language_id ],
+						$vis_args
 					)
 				)
 			);
@@ -167,15 +209,17 @@ final class TranslationGroupWrites extends TranslationGroupRepository {
 					FROM %i l
 					INNER JOIN %i g ON l.group_id = g.id
 					INNER JOIN %i t ON t.group_id = l.group_id AND t.language_id = %d'
-					. $post_join . '
+					. $post_join . $sib_join . '
 					WHERE g.type = %s' . $src_sql . '
-					AND ' . $status_match,
+					AND ' . $status_match . $vis_sql,
 					array_merge(
 						[ $this->links_table(), $this->groups_table(), $this->links_table(), $language_id ],
 						$post_args,
+						$sib_args,
 						[ $type->value ],
 						$src_args,
-						[ $status ]
+						[ $status ],
+						$vis_args
 					)
 				)
 			);
@@ -187,13 +231,16 @@ final class TranslationGroupWrites extends TranslationGroupRepository {
 					INNER JOIN %i g ON l.group_id = g.id
 					WHERE g.type = %s' . $src_sql . '
 					AND l.group_id IN (
-						SELECT group_id FROM %i
-						WHERE language_id = %d
+						SELECT t.group_id FROM %i t' . $sib_join . '
+						WHERE t.language_id = %d' . $vis_sql . '
 					)',
 					array_merge(
 						[ $this->links_table(), $this->groups_table(), $type->value ],
 						$src_args,
-						[ $this->links_table(), $language_id ]
+						[ $this->links_table() ],
+						$sib_args,
+						[ $language_id ],
+						$vis_args
 					)
 				)
 			);
@@ -206,15 +253,17 @@ final class TranslationGroupWrites extends TranslationGroupRepository {
 	 * Source object ids whose group has any translation at the effective status, in any language; with a default
 	 * language only the other members count (the row's own status is the source's).
 	 *
-	 * @param ObjectType $type Object type.
-	 * @param string     $status Status value (non-empty, non-'empty').
-	 * @param int        $source_language_id Default language ID (0 = none).
+	 * @param ObjectType           $type Object type.
+	 * @param string               $status Status value (non-empty, non-'empty').
+	 * @param int                  $source_language_id Default language ID (0 = none).
+	 * @param array<string, mixed> $visible As find_source_object_ids_by_language_status(); set, the selection is not cached.
 	 * @return array<int, int>
 	 */
 	public function find_source_object_ids_by_status_any_language(
 		ObjectType $type,
 		string $status,
-		int $source_language_id = 0
+		int $source_language_id = 0,
+		array $visible = []
 	): array {
 		// The outer scan to the one row per group that can survive the source-only filter.
 		$src_sql  = $source_language_id > 0 ? ' AND l.language_id = %d' : '';
@@ -230,11 +279,12 @@ final class TranslationGroupWrites extends TranslationGroupRepository {
 		// This process holds a selection again: a later status change must delete it.
 		unset( self::$status_selectors_forgotten_at[ get_current_blog_id() ] );
 
-		return (array) $this->cache->get(
-			$cache_key,
-			function () use ( $type, $status, $source_language_id, $src_sql, $src_args ): array {
+		[ $vis_sql, $vis_args ] = ObjectType::Post === $type ? self::visible_sql( $visible ) : [ '', [] ];
+
+		$select = function () use ( $type, $status, $source_language_id, $src_sql, $src_args, $vis_sql, $vis_args ): array {
 				// t walks the other members (the source excluded), p each member's post.
 				$exclude_sql = $source_language_id > 0 ? ' AND t.language_id <> l.language_id' : '';
+				$sib_join    = '' !== $vis_sql ? ' INNER JOIN %i pfl_sib ON pfl_sib.ID = t.object_id' : '';
 
 				[ $post_join, $post_args, $status_match ] = $this->status_match_parts( $type, $status );
 
@@ -245,26 +295,90 @@ final class TranslationGroupWrites extends TranslationGroupRepository {
 						FROM %i l
 						INNER JOIN %i g ON l.group_id = g.id
 						INNER JOIN %i t ON t.group_id = l.group_id' . $exclude_sql
-						. $post_join . '
+						. $post_join . $sib_join . '
 						WHERE g.type = %s' . $src_sql . '
-						AND ' . $status_match,
+						AND ' . $status_match . $vis_sql,
 						array_merge(
 							[ $this->links_table(), $this->groups_table(), $this->links_table() ],
 							$post_args,
+							'' !== $vis_sql ? [ $this->wpdb->posts ] : [],
 							[ $type->value ],
 							$src_args,
-							[ $status ]
+							[ $status ],
+							$vis_args
 						)
 					)
 				);
 				// phpcs:enable
 
 				return array_map( 'intval', (array) $rows );
-			},
-			MINUTE_IN_SECONDS,
-			'perflocale_trans'
-		);
+		};
+
+		// A user's own view is not shared through the cache, which status changes clear for the plain selection only.
+		$picked = '' !== $vis_sql ? $select() : $this->cache->get( $cache_key, $select, MINUTE_IN_SECONDS, 'perflocale_trans' );
+
+		return array_values( array_filter( (array) $picked, 'is_int' ) );
 	}
+	/**
+	 * A user's view rules as conditions on `pfl_sib` (a member's post) that hold when the user may view it, and their
+	 * values: other users' posts of a hidden status (rules `hide`: type => statuses, `user`) and the view sets of types
+	 * without map_meta_cap (`sets`: type => [ viewable list?, highest id checked, ids ]).
+	 *
+	 * @param array<string, mixed> $rules TranslationsPage::sibling_rules().
+	 * @return array{0: literal-string, 1: list<int|string>} ['', []] when every member is viewable.
+	 */
+	private static function visible_sql( array $rules ): array {
+		$sql  = '';
+		$args = [];
+		$user = is_int( $rules['user'] ?? null ) ? $rules['user'] : 0;
+		$or   = [];
+
+		foreach ( is_array( $rules['hide'] ?? null ) ? $rules['hide'] : [] as $post_type => $statuses ) {
+			$statuses = array_values( array_filter( is_array( $statuses ) ? $statuses : [], 'is_string' ) );
+
+			if ( [] === $statuses ) {
+				continue;
+			}
+
+			$clause = '( pfl_sib.post_type = %s AND pfl_sib.post_status IN (' . implode( ',', array_fill( 0, count( $statuses ), '%s' ) ) . ')';
+			$args[] = (string) $post_type;
+			$args   = array_merge( $args, $statuses );
+
+			if ( $user > 0 ) {
+				$clause .= ' AND pfl_sib.post_author <> %d';
+				$args[]  = $user;
+			}
+
+			$or[] = $clause . ' )';
+		}
+
+		if ( [] !== $or ) {
+			$sql .= ' AND NOT ( ' . implode( ' OR ', $or ) . ' )';
+		}
+
+		foreach ( is_array( $rules['sets'] ?? null ) ? $rules['sets'] : [] as $post_type => $set ) {
+			$set      = is_array( $set ) ? array_values( $set ) : [];
+			$viewable = true === ( $set[0] ?? null );
+			$max      = is_int( $set[1] ?? null ) ? $set[1] : 0;
+			$ids      = array_values( array_filter( is_array( $set[2] ?? null ) ? $set[2] : [], 'is_int' ) );
+			$ph       = implode( ',', array_fill( 0, max( 1, count( $ids ) ), '%d' ) );
+			$args[]   = (string) $post_type;
+
+			if ( $viewable && [] === $ids ) {
+				$sql .= ' AND pfl_sib.post_type <> %s';
+			} elseif ( $viewable ) {
+				$sql .= ' AND ( pfl_sib.post_type <> %s OR pfl_sib.ID IN (' . $ph . ') )';
+				$args = array_merge( $args, $ids );
+			} else {
+				$sql   .= " AND ( pfl_sib.post_type <> %s OR ( pfl_sib.post_status NOT IN ('trash', 'auto-draft') AND pfl_sib.ID <= %d" . ( [] !== $ids ? ' AND pfl_sib.ID NOT IN (' . $ph . ')' : '' ) . ' ) )';
+				$args[] = $max;
+				$args   = array_merge( $args, $ids );
+			}
+		}
+
+		return [ $sql, $args ];
+	}
+
 	/**
 	 * The cache key of one all-language status selection.
 	 *
@@ -419,14 +533,17 @@ final class TranslationGroupWrites extends TranslationGroupRepository {
 	/**
 	 * Source object ids whose group lacks a link in at least one of the languages ("empty" with all languages).
 	 *
-	 * @param ObjectType     $type Object type.
-	 * @param array<int,int> $language_ids Active language IDs.
+	 * @param ObjectType           $type Object type.
+	 * @param array<int,int>       $language_ids Active language IDs.
+	 * @param int                  $source_language_id Default language ID (0 = none).
+	 * @param array<string, mixed> $visible As find_source_object_ids_by_language_status(); set, the selection is not cached.
 	 * @return array<int, int>
 	 */
 	public function find_source_object_ids_missing_any_language(
 		ObjectType $type,
 		array $language_ids,
-		int $source_language_id = 0
+		int $source_language_id = 0,
+		array $visible = []
 	): array {
 		$language_ids = array_values( array_unique( array_map( 'intval', $language_ids ) ) );
 		$language_ids = array_filter( $language_ids, static fn( $i ) => $i > 0 );
@@ -440,14 +557,17 @@ final class TranslationGroupWrites extends TranslationGroupRepository {
 		// The default language changes the result: part of the key.
 		$cache_key = sprintf( 'missing_any_lang_%s_%s_%d', $type->value, md5( implode( ',', $language_ids ) ), $source_language_id );
 
-		return (array) $this->cache->get(
-			$cache_key,
-			function () use ( $type, $language_ids, $source_language_id ): array {
+		[ $vis_sql, $vis_args ] = ObjectType::Post === $type ? self::visible_sql( $visible ) : [ '', [] ];
+
+		$select = function () use ( $type, $language_ids, $source_language_id, $vis_sql, $vis_args ): array {
 				// The outer scan to the row that survives the source-only filter.
 				$src_sql  = $source_language_id > 0 ? ' AND l.language_id = %d' : '';
 				$src_args = $source_language_id > 0 ? [ $source_language_id ] : [];
 				$lang_count   = count( $language_ids );
 				$placeholders = implode( ',', array_fill( 0, $lang_count, '%d' ) );
+				// A member the user may not view is not counted, as if missing.
+				$sib_join = '' !== $vis_sql ? ' LEFT JOIN %i pfl_sib ON pfl_sib.ID = l2.object_id' : '';
+				$counted  = '' !== $vis_sql ? 'CASE WHEN pfl_sib.ID IS NOT NULL' . $vis_sql . ' THEN l2.language_id END' : 'l2.language_id';
 
 				// Each group LEFT JOINed to its links in the target languages; fewer distinct matches than languages means one is
 				// missing (LEFT JOIN, so groups with none count 0).
@@ -462,27 +582,32 @@ final class TranslationGroupWrites extends TranslationGroupRepository {
 							SELECT g2.id
 							FROM %i g2
 							LEFT JOIN %i l2
-								ON l2.group_id = g2.id AND l2.language_id IN ($placeholders)
+								ON l2.group_id = g2.id AND l2.language_id IN ($placeholders)" . $sib_join . '
 							WHERE g2.type = %s
 							GROUP BY g2.id
-							HAVING COUNT(DISTINCT l2.language_id) < %d
-						)",
+							HAVING COUNT(DISTINCT ' . $counted . ') < %d
+						)',
 						array_merge(
 							[ $this->links_table(), $this->groups_table(), $type->value ],
 							$src_args,
 							[ $this->groups_table(), $this->links_table() ],
 							$language_ids,
-							[ $type->value, $lang_count ]
+							'' !== $vis_sql ? [ $this->wpdb->posts ] : [],
+							[ $type->value ],
+							$vis_args,
+							[ $lang_count ]
 						)
 					)
 				);
 				// phpcs:enable
 
 				return array_map( 'intval', (array) $rows );
-			},
-			MINUTE_IN_SECONDS,
-			'perflocale_trans'
-		);
+		};
+
+		// A user's own view is not shared through the cache, which link writes clear for the plain selection only.
+		$picked = '' !== $vis_sql ? $select() : $this->cache->get( $cache_key, $select, MINUTE_IN_SECONDS, 'perflocale_trans' );
+
+		return array_values( array_filter( (array) $picked, 'is_int' ) );
 	}
 	/**
 	 * The link in a language of an object's group, from the database: for decisions that must see other processes'
@@ -572,12 +697,12 @@ final class TranslationGroupWrites extends TranslationGroupRepository {
 	 * after a crash or restore reuses the group (importers call get_group_id() first). Source keys and the transaction
 	 * rules: docs-ai/11-code-rationale.md, "TranslationGroupRepository: create_group() and link_object()".
 	 *
-	 * @param ObjectType                                $type Object type.
-	 * @param int                                       $object_id Object ID.
-	 * @param int                                       $language_id Language ID.
-	 * @param string                                    $status Translation status.
-	 * @param \PerfLocale\Enum\SourceType               $source Translation source provenance.
-	 * @param array{type: string, key: string}|null     $migration_source Optional source-map link.
+	 * @param ObjectType                            $type Object type.
+	 * @param int                                   $object_id Object ID.
+	 * @param int                                   $language_id Language ID.
+	 * @param string                                $status Translation status.
+	 * @param \PerfLocale\Enum\SourceType           $source Translation source provenance.
+	 * @param array{type: string, key: string}|null $migration_source Optional source-map link.
 	 * @return int|false Group ID or false.
 	 * @throws \InvalidArgumentException When $object_id is <= 0 and WP_DEBUG is on (guards a site-wide DELETE).
 	 */
@@ -713,6 +838,8 @@ final class TranslationGroupWrites extends TranslationGroupRepository {
 	 * @param int                         $language_id Language ID.
 	 * @param string                      $status Translation status.
 	 * @param \PerfLocale\Enum\SourceType $source Translation source provenance.
+	 * @param bool                        $replace False: never take the language's slot from another object (a creation
+	 *                                             mark's link); the group_lang key refuses a concurrent winner.
 	 * @return int|false Link ID or false on rejection/failure.
 	 * @throws \InvalidArgumentException When $object_id <= 0 or the group is a string-type group, and WP_DEBUG is on.
 	 */
@@ -721,7 +848,8 @@ final class TranslationGroupWrites extends TranslationGroupRepository {
 		int $object_id,
 		int $language_id,
 		string $status = 'empty',
-		\PerfLocale\Enum\SourceType $source = \PerfLocale\Enum\SourceType::Manual
+		\PerfLocale\Enum\SourceType $source = \PerfLocale\Enum\SourceType::Manual,
+		bool $replace = true
 	): int|false {
 		// Guard 1: object_id 0 would make the DELETE wipe every zero row; no destructive SQL either way.
 		if ( $object_id <= 0 ) {
@@ -871,11 +999,20 @@ final class TranslationGroupWrites extends TranslationGroupRepository {
 			}
 
 			$displaced_id = (int) $displaced;
+
+			// Insert-only: the slot is another object's.
+			if ( ! $replace && $displaced_id > 0 && $displaced_id !== $object_id ) {
+				if ( $needs_own_transaction ) {
+					$this->wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+					self::$in_transaction = false;
+				}
+				return false;
+			}
 		}
 
-		// Remove the group's link for this language (the group_lang key).
+		// Remove the group's link for this language (the group_lang key); insert-only keeps it, so the key refuses a winner.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-		if ( false === $this->wpdb->delete(
+		if ( $replace && false === $this->wpdb->delete(
 			$this->links_table(),
 			[
 				'group_id'    => $group_id,
@@ -1231,14 +1368,21 @@ final class TranslationGroupWrites extends TranslationGroupRepository {
 			return false;
 		}
 
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-		$deleted = $this->wpdb->delete(
-			$this->links_table(),
-			[
-				'group_id'    => $group_id,
-				'language_id' => $language_id,
-			],
-			[ '%d', '%d' ]
+		$deleted = false;
+
+		$this->delete_group_links(
+			$group_id,
+			function () use ( $group_id, $language_id, &$deleted ): void {
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				$deleted = $this->wpdb->delete(
+					$this->links_table(),
+					[
+						'group_id'    => $group_id,
+						'language_id' => $language_id,
+					],
+					[ '%d', '%d' ]
+				);
+			}
 		);
 
 		return (int) $deleted > 0;
@@ -1260,8 +1404,8 @@ final class TranslationGroupWrites extends TranslationGroupRepository {
 	 * @param string|null $expect_updated_at Write ONLY while the row's `updated_at` still
 	 *                                   reads this value as well: no other write reached
 	 *                                   the row since that time was read. Null for none.
-	 * @return bool True when the row was written. With a precondition set, false also
-	 *              means the precondition did not hold and nothing changed.
+	 * @return bool True when the row is proven written. With a precondition set, false also
+	 *              means the precondition did not hold or a rerun left the outcome unknown.
 	 */
 	public function update_link_status( int $object_id, int $language_id, string $status, string $source = '', ObjectType $type = ObjectType::Post, ?string $expect_status = null, ?string $expect_updated_at = null ): bool {
 		$data   = [
@@ -1303,43 +1447,537 @@ final class TranslationGroupWrites extends TranslationGroupRepository {
 			$where_format
 		);
 
-		// Under a precondition 0 rows means it did not hold (updated_at = NOW(), so a match always counts): return
-		// before flushing caches or firing status_changed for a write that did not happen.
+		// Under a precondition 0 rows means it did not hold, or a rerun matched what a lost first run wrote: never
+		// reported as a write, invalidated only when it landed.
 		if ( ( $expect_status !== null || $expect_updated_at !== null ) && ( $result === false || (int) $result === 0 ) ) {
+			$this->after_unconfirmed_status_write( $object_id, $language_id, $type, $data['status'], $data['updated_at'] );
+
 			return false;
 		}
 
 		if ( $result !== false ) {
-			// Only the type written: another type would fire a spurious flush_object purge.
-			$this->cache->flush_object( $object_id, $type->value );
-
-			// The status is in the eager map, which get_translations() reads first: without this a publish would stay missing
-			// from hreflang, the switcher and resolution until another link write.
-			$this->invalidate_eager_link_map( $type );
-
-			// Every member caches the group's links with their statuses: drop the siblings' caches too.
-			// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Prepared through $this->wpdb, identifier bound with %i.
-			$group_id = (int) $this->wpdb->get_var(
-				$this->wpdb->prepare(
-					'SELECT group_id FROM %i WHERE object_id = %d AND language_id = %d AND type = %s LIMIT 1',
-					$this->links_table(),
-					$object_id,
-					$language_id,
-					$type->value
-				)
-			);
-			// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter
-
-			if ( $group_id > 0 ) {
-				$this->invalidate_group_cache( $group_id );
-			}
-
-			/** @hook perflocale/translation/status_changed Fires after a translation status changes. */
-			do_action( 'perflocale/translation/status_changed', $object_id, $status, $language_id );
+			$this->after_link_status_write( $object_id, $language_id, $status, $type );
 		}
 
 		return $result !== false;
 	}
+	/**
+	 * After a link status write: drop the object's cache, the eager map and the group's siblings' caches, then fire
+	 * perflocale/translation/status_changed.
+	 *
+	 * @param int        $object_id   Object ID.
+	 * @param int        $language_id Language ID.
+	 * @param string     $status      Status written.
+	 * @param ObjectType $type        Object type written.
+	 * @return void
+	 */
+	private function after_link_status_write( int $object_id, int $language_id, string $status, ObjectType $type ): void {
+		// Only the type written: another type would fire a spurious flush_object purge.
+		$this->cache->flush_object( $object_id, $type->value );
+
+		// The status is in the eager map, which get_translations() reads first: without this a publish would stay missing
+		// from hreflang, the switcher and resolution until another link write.
+		$this->invalidate_eager_link_map( $type );
+
+		// Every member caches the group's links with their statuses: drop the siblings' caches too.
+		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Prepared through $this->wpdb, identifier bound with %i.
+		$group_id = (int) $this->wpdb->get_var(
+			$this->wpdb->prepare(
+				'SELECT group_id FROM %i WHERE object_id = %d AND language_id = %d AND type = %s LIMIT 1',
+				$this->links_table(),
+				$object_id,
+				$language_id,
+				$type->value
+			)
+		);
+		// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+		if ( $group_id > 0 ) {
+			$this->invalidate_group_cache( $group_id );
+		}
+
+		/** @hook perflocale/translation/status_changed Fires after a translation status changes. */
+		do_action( 'perflocale/translation/status_changed', $object_id, $status, $language_id );
+	}
+
+	/**
+	 * After a conditional status UPDATE that reported no row: invalidate only when the row holds this write's status and
+	 * literal time (a rerun after a lost reply sends the same text); an unreadable row counts as landed. A later writer
+	 * invalidated for itself; an older identical write in the same second costs one needless invalidation.
+	 *
+	 * @param int        $object_id   Object ID.
+	 * @param int        $language_id Language ID.
+	 * @param ObjectType $type        Object type written.
+	 * @param string     $status      Status the UPDATE set.
+	 * @param string     $written_at  Literal updated_at the UPDATE set.
+	 * @return void
+	 */
+	private function after_unconfirmed_status_write( int $object_id, int $language_id, ObjectType $type, string $status, string $written_at ): void {
+		// Callers read last_error to tell a refused write from a missed precondition (SyncRecorder::after_undo()).
+		$write_error = $this->wpdb->last_error;
+
+		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Prepared through $this->wpdb, table bound with %i.
+		$rows = $this->select_rows(
+			$this->wpdb->prepare(
+				'SELECT status, updated_at FROM %i WHERE object_id = %d AND language_id = %d AND type = %s LIMIT 1',
+				$this->links_table(),
+				$object_id,
+				$language_id,
+				$type->value
+			)
+		);
+		// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+		$row = $rows[0] ?? null;
+
+		if ( null === $rows || ( null !== $row && $status === $row->status && $written_at === $row->updated_at ) ) {
+			$this->invalidate_unconfirmed_status_write( $object_id, $language_id, $type );
+		}
+
+		$this->wpdb->last_error = $write_error;
+	}
+
+	/**
+	 * Invalidate as for a status write, without reporting one. Honours a deferral scope: the map delete waits for its end.
+	 *
+	 * @param int        $object_id   Object ID.
+	 * @param int        $language_id Language ID.
+	 * @param ObjectType $type        Object type written.
+	 * @return void
+	 */
+	private function invalidate_unconfirmed_status_write( int $object_id, int $language_id, ObjectType $type ): void {
+		$this->invalidate_eager_link_map( $type );
+
+		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Prepared through $this->wpdb, identifiers bound with %i.
+		$members = $this->select_rows(
+			$this->wpdb->prepare(
+				'SELECT m.object_id, m.type FROM %i l INNER JOIN %i m ON m.group_id = l.group_id
+				WHERE l.object_id = %d AND l.language_id = %d AND l.type = %s',
+				$this->links_table(),
+				$this->links_table(),
+				$object_id,
+				$language_id,
+				$type->value
+			)
+		);
+		// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+		// Unread: the siblings are unknown, so every cached link goes.
+		if ( null === $members ) {
+			$this->cache->flush_translations();
+			self::$find_cache = [];
+
+			return;
+		}
+
+		$this->flush_members(
+			[] === $members
+				? [
+					(object) [
+						'object_id' => $object_id,
+						'type'      => $type->value,
+					],
+				]
+				: $members
+		);
+	}
+
+	/**
+	 * Drop the listed members' cached links and find_for_object() entries.
+	 *
+	 * @param array<\stdClass> $members Rows with object_id and type.
+	 * @return array<string, true> The members' types.
+	 */
+	private function flush_members( array $members ): array {
+		$types = [];
+
+		foreach ( $members as $member ) {
+			$id   = \PerfLocale\Util\Scalar::int( $member->object_id );
+			$type = \PerfLocale\Util\Scalar::str( $member->type );
+
+			$this->cache->flush_object( $id, $type );
+			unset( self::$find_cache[ self::find_cache_key( $type, $id ) ] );
+			$types[ $type ] = true;
+		}
+
+		return $types;
+	}
+
+	/**
+	 * Run a deletion of a group's links, then invalidate every member: read first, as the rows cannot be read afterwards.
+	 * Refuses without that read; invalidates whatever the deletion reports, as a rerun reports 0. No transaction: a START
+	 * TRANSACTION commits a caller's own. A registered transaction's owner invalidates after its commit, as the importers do.
+	 *
+	 * @param int      $group_id Group ID.
+	 * @param callable $delete   Runs the deletion.
+	 * @return void
+	 */
+	private function delete_group_links( int $group_id, callable $delete ): void {
+		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Prepared through $this->wpdb, table bound with %i.
+		$members = $this->select_rows(
+			$this->wpdb->prepare(
+				'SELECT object_id, type FROM %i WHERE group_id = %d',
+				$this->links_table(),
+				$group_id
+			)
+		);
+		// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+		if ( null === $members ) {
+			return;
+		}
+
+		$delete();
+
+		// The caller of a false return may read the deletion's error.
+		$write_error = $this->wpdb->last_error;
+		$types       = $this->flush_members( $members );
+
+		// No member read names no type: all of them.
+		$this->invalidate_eager_link_map( 1 === count( $types ) ? ObjectType::tryFrom( (string) array_key_first( $types ) ) : null );
+
+		$this->wpdb->last_error = $write_error;
+	}
+
+	/**
+	 * Clear a translation's `needs_update` only while its source still holds the content hash the change was computed
+	 * from (either form of that one state): one statement, so a source saved meanwhile is never cleared.
+	 *
+	 * @since 1.0.8
+	 *
+	 * @param int    $object_id   The translation's post id.
+	 * @param int    $language_id Its language.
+	 * @param string $new_status  The status to write (published, or empty).
+	 * @param int    $source_id   The source's post id.
+	 * @param string $source_hash The source's content hash the change was computed from.
+	 * @param string $legacy_hash The legacy hash of that state, '' when not known.
+	 * @return bool True when the row was written.
+	 */
+	public function clear_needs_update_if_source( int $object_id, int $language_id, string $new_status, int $source_id, string $source_hash, string $legacy_hash ): bool {
+		$new_status = sanitize_key( $new_status );
+		$written_at = current_time( 'mysql' );
+
+		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Prepared through $this->wpdb, identifiers bound with %i.
+		$sql = $this->wpdb->prepare(
+			'UPDATE %i SET status = %s, updated_at = %s
+			WHERE object_id = %d AND language_id = %d AND type = %s AND status = %s
+			AND EXISTS (SELECT 1 FROM %i WHERE object_type = %s AND object_id = %d AND content_hash IN (%s, %s))',
+			$this->links_table(),
+			$new_status,
+			$written_at,
+			$object_id,
+			$language_id,
+			ObjectType::Post->value,
+			\PerfLocale\Enum\TranslationStatus::NeedsUpdate->value,
+			Schema::table( 'content_hashes' ),
+			ObjectType::Post->value,
+			$source_id,
+			$source_hash,
+			'' === $legacy_hash ? $source_hash : $legacy_hash
+		);
+
+		$result = is_string( $sql ) ? $this->wpdb->query( $sql ) : false;
+		// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+		if ( ! is_int( $result ) || 0 === $result ) {
+			$this->after_unconfirmed_status_write( $object_id, $language_id, ObjectType::Post, $new_status, $written_at );
+
+			return false;
+		}
+
+		$this->after_link_status_write( $object_id, $language_id, $new_status, ObjectType::Post );
+
+		return true;
+	}
+
+	/**
+	 * Deferred eager-map invalidation of a long run (ContentResyncJob): depth, recorded types by blog, shutdown hook.
+	 *
+	 * @return array{depth: int, types: array<int, array<string, true>>, shutdown: bool}
+	 */
+	private static function &deferral(): array {
+		/**
+		 * The state.
+		 *
+		 * @var array{depth: int, types: array<int, array<string, true>>, shutdown: bool} $state
+		 */
+		static $state = [
+			'depth'    => 0,
+			'types'    => [],
+			'shutdown' => false,
+		];
+
+		return $state;
+	}
+
+	/**
+	 * Begin a scope whose eager-map invalidations wait for its end (nests); a shutdown hook ends a scope left open.
+	 *
+	 * @since 1.0.8
+	 *
+	 * @return void
+	 */
+	public static function begin_deferred_link_invalidation(): void {
+		$deferral = &self::deferral();
+
+		++$deferral['depth'];
+
+		if ( ! $deferral['shutdown'] ) {
+			$deferral['shutdown'] = true;
+			register_shutdown_function( [ self::class, 'end_all_deferred_link_invalidation' ] );
+		}
+	}
+
+	/**
+	 * End one deferral scope; the outermost runs the recorded invalidations, per blog.
+	 *
+	 * @since 1.0.8
+	 *
+	 * @return void
+	 */
+	public static function end_deferred_link_invalidation(): void {
+		$deferral = &self::deferral();
+
+		if ( $deferral['depth'] <= 0 ) {
+			return;
+		}
+
+		--$deferral['depth'];
+
+		if ( $deferral['depth'] > 0 || [] === $deferral['types'] ) {
+			return;
+		}
+
+		$recorded          = $deferral['types'];
+		$deferral['types'] = [];
+		$plugin            = \PerfLocale\Plugin::get_instance();
+
+		if ( ! $plugin->has( 'group_repo' ) ) {
+			return;
+		}
+
+		$repo = $plugin->get( 'group_repo' );
+
+		if ( ! $repo instanceof TranslationGroupRepository ) {
+			return;
+		}
+
+		$current = get_current_blog_id();
+
+		foreach ( $recorded as $blog_id => $types ) {
+			$switched = is_multisite() && $blog_id !== $current;
+
+			if ( $switched ) {
+				switch_to_blog( $blog_id );
+			}
+
+			try {
+				if ( isset( $types['*'] ) ) {
+					$repo->invalidate_eager_link_map();
+				} else {
+					foreach ( array_keys( $types ) as $type ) {
+						$object_type = ObjectType::tryFrom( $type );
+
+						if ( null !== $object_type ) {
+							$repo->invalidate_eager_link_map( $object_type );
+						}
+					}
+				}
+			} finally {
+				if ( $switched ) {
+					restore_current_blog();
+				}
+			}
+		}
+	}
+
+	/**
+	 * Shutdown: end every open deferral scope.
+	 *
+	 * @since 1.0.8
+	 *
+	 * @return void
+	 */
+	public static function end_all_deferred_link_invalidation(): void {
+		self::retry_failed_bumps();
+
+		$deferral = &self::deferral();
+
+		if ( $deferral['depth'] <= 0 ) {
+			return;
+		}
+
+		$deferral['depth'] = 1;
+		self::end_deferred_link_invalidation();
+	}
+
+	/**
+	 * This blog's committed link generation; null when the read failed (an aggregate, so absent is a row: '0').
+	 *
+	 * @return string|null
+	 */
+	public function link_generation(): ?string {
+		$wpdb = $this->wpdb;
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Must see other processes' bumps.
+		$read = $wpdb->get_var( $wpdb->prepare( "SELECT COALESCE(MAX(option_value), '0') FROM %i WHERE option_name = %s", $wpdb->options, self::LINK_GENERATION_OPTION ) );
+
+		return null === $read || '' !== $wpdb->last_error ? null : (string) $read;
+	}
+
+	/**
+	 * Raise this blog's link generation. Every link write calls it after its commit and before deleting the map: a
+	 * builder then either sees the bump, or published before the delete that removes its map. A failed bump proves
+	 * nothing: it is retried at shutdown (retry_failed_bumps()).
+	 *
+	 * @return void
+	 */
+	public static function bump_link_generation(): void {
+		global $wpdb;
+
+		if ( ! $wpdb instanceof \wpdb ) {
+			return;
+		}
+
+		$autoload = function_exists( 'wp_determine_option_autoload_value' ) ? 'off' : 'no';
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Atomic counter, read only by link_generation().
+		$bumped = $wpdb->query( $wpdb->prepare( "INSERT INTO %i (option_name, option_value, autoload) VALUES (%s, '1', %s) ON DUPLICATE KEY UPDATE option_value = option_value + 1", $wpdb->options, self::LINK_GENERATION_OPTION, $autoload ) ?? '' );
+
+		if ( false !== $bumped ) {
+			return;
+		}
+
+		self::$generation_unproven[ get_current_blog_id() ] = true;
+
+		$deferral = &self::deferral();
+
+		if ( ! $deferral['shutdown'] ) {
+			$deferral['shutdown'] = true;
+			register_shutdown_function( [ self::class, 'end_all_deferred_link_invalidation' ] );
+		}
+	}
+
+	/**
+	 * Shutdown, after a failed bump: bump each blog again, then delete its maps, so a map a build published meanwhile goes.
+	 *
+	 * @return void
+	 */
+	private static function retry_failed_bumps(): void {
+		foreach ( array_keys( self::$generation_unproven ) as $blog_id ) {
+			$switched = is_multisite() && $blog_id !== get_current_blog_id();
+
+			if ( $switched ) {
+				switch_to_blog( $blog_id );
+			}
+
+			try {
+				unset( self::$generation_unproven[ $blog_id ] );
+				self::drop_eager_maps();
+			} finally {
+				if ( $switched ) {
+					restore_current_blog();
+				}
+			}
+		}
+	}
+
+	/**
+	 * Delete every type's eager map and the request statics, for CacheManager::flush_all(): static, as deactivation must
+	 * not build a repository, and importers flush so their idempotency checks see fresh rows.
+	 *
+	 * @return void
+	 */
+	public static function drop_eager_maps(): void {
+		self::bump_link_generation();
+		CacheManager::delete_autoloaded_options( array_map( static fn( string $t ): string => 'perflocale_eager_links_' . $t, self::EAGER_MAP_TYPES ) );
+		self::reset_static_caches();
+	}
+
+	/**
+	 * Publish a cold-built map unless a link write raced the build: the generation is checked before persisting and
+	 * again after, as a write landing between the check and the persist deleted nothing yet.
+	 *
+	 * @param string                          $memo_key   Memo key.
+	 * @param string                          $option_key Autoloaded option name.
+	 * @param array<int, list<object>>|string $value      The map or a sentinel.
+	 * @param string                          $generation The generation read before the build's first SELECT.
+	 * @return bool False when discarded (the request uses the JOIN path).
+	 */
+	public function publish_eager_map( string $memo_key, string $option_key, array|string $value, string $generation ): bool {
+		if ( ! isset( self::$generation_unproven[ get_current_blog_id() ] ) && $this->link_generation() === $generation ) {
+			self::persist_eager_map( $option_key, $value );
+
+			if ( $this->link_generation() === $generation ) {
+				self::$eager_link_map_memo[ $memo_key ] = $value;
+
+				return true;
+			}
+
+			CacheManager::delete_autoloaded_options( [ $option_key ] );
+		}
+
+		self::$eager_link_map_memo[ $memo_key ] = self::EAGER_MAP_RACED;
+
+		return false;
+	}
+
+	/**
+	 * Invalidate the eager link map; every write to groups or links calls it.
+	 *
+	 * @param ObjectType|null $type Restrict to one type, or null for all.
+	 * @return void
+	 */
+	public function invalidate_eager_link_map( ?ObjectType $type = null ): void {
+		++self::$link_changes;
+
+		// Before the deferral: a deferred scope postpones only the delete, a build must see every commit at once.
+		self::bump_link_generation();
+
+		if ( self::defers( $type ) ) {
+			return;
+		}
+
+		$types = $type ? [ $type->value ] : self::EAGER_MAP_TYPES;
+		$names = [];
+
+		foreach ( $types as $t ) {
+			unset( self::$eager_link_map_memo[ self::eager_memo_key( $t ) ] );
+			$names[] = 'perflocale_eager_links_' . $t;
+		}
+
+		// Also from the cached alloptions list, or a map without its row (rollback, concurrent store) is served until the
+		// object cache is flushed (CacheManager::delete_autoloaded_options()).
+		CacheManager::delete_autoloaded_options( $names );
+
+		// A post link change moves posts between language buckets: bump the generation of PostQueryFilter's cached archive
+		// counts. Every post link write passes here.
+		if ( $type === null || $type === ObjectType::Post ) {
+			CacheManager::bump_group_generation( 'perflocale_found_rows' );
+		}
+	}
+
+	/**
+	 * Inside a deferral scope: drop this process's memo of the types and record them for the scope's end.
+	 *
+	 * @param ObjectType|null $type The type written; null for all.
+	 * @return bool True when deferred (the caller invalidates nothing more now).
+	 */
+	public static function defers( ?ObjectType $type ): bool {
+		$deferral = &self::deferral();
+
+		if ( $deferral['depth'] <= 0 ) {
+			return false;
+		}
+
+		foreach ( $type ? [ $type->value ] : self::EAGER_MAP_TYPES as $t ) {
+			unset( self::$eager_link_map_memo[ self::eager_memo_key( $t ) ] );
+		}
+
+		$deferral['types'][ get_current_blog_id() ][ $type ? $type->value : '*' ] = true;
+
+		return true;
+	}
+
 	/**
 	 * One object's link as stored at this moment (status, last write time), uncached: for decisions that must see other processes'
 	 * writes. Null without a link in that language or without an answer.
@@ -1496,14 +2134,27 @@ final class TranslationGroupWrites extends TranslationGroupRepository {
 	 * {@inheritDoc}
 	 */
 	public function delete( int $id ): bool {
-		// Links first.
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-		$this->wpdb->delete( $this->links_table(), [ 'group_id' => $id ], [ '%d' ] );
+		$result = false;
 
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-		$result = $this->wpdb->delete( $this->groups_table(), [ 'id' => $id ], [ '%d' ] );
+		$this->delete_group_links(
+			$id,
+			function () use ( $id, &$result ): void {
+				// Links first.
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				$this->wpdb->delete( $this->links_table(), [ 'group_id' => $id ], [ '%d' ] );
 
-		$this->delete_source_map_for_group( $id );
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				$result      = $this->wpdb->delete( $this->groups_table(), [ 'id' => $id ], [ '%d' ] );
+				$group_error = $this->wpdb->last_error;
+
+				$this->delete_source_map_for_group( $id );
+
+				// The false return is the group row's: the cleanup's own query must not clear its error.
+				if ( '' !== $group_error ) {
+					$this->wpdb->last_error = $group_error;
+				}
+			}
+		);
 
 		return $result !== false;
 	}
@@ -1637,6 +2288,8 @@ final class TranslationGroupWrites extends TranslationGroupRepository {
 				unset( self::$eager_link_map_memo[ self::eager_memo_key( $type_value ) ] );
 				$names[] = 'perflocale_eager_links_' . $type_value;
 			}
+
+			self::bump_link_generation();
 
 			// As invalidate_eager_link_map(): a cached map without its row goes too.
 			CacheManager::delete_autoloaded_options( $names );
@@ -1838,12 +2491,13 @@ final class TranslationGroupWrites extends TranslationGroupRepository {
 		}
 
 		$dirty_types = [];
+		$unread      = false;
 
 		foreach ( array_chunk( $group_ids, 500 ) as $chunk ) {
 			$placeholders = implode( ',', array_fill( 0, count( $chunk ), '%d' ) );
 
 			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $placeholders is a generated %d list bound to $chunk.
-			$rows = $this->wpdb->get_results(
+			$rows = $this->select_rows(
 				$this->wpdb->prepare(
 					"SELECT l.object_id, g.type FROM %i l
 					INNER JOIN %i g ON l.group_id = g.id
@@ -1853,11 +2507,24 @@ final class TranslationGroupWrites extends TranslationGroupRepository {
 			);
 			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter
 
-			foreach ( (array) $rows as $link ) {
+			if ( null === $rows ) {
+				$unread = true;
+
+				continue;
+			}
+
+			foreach ( $rows as $link ) {
 				$this->cache->flush_object( (int) $link->object_id, (string) $link->type );
 				unset( self::$find_cache[ self::find_cache_key( (string) $link->type, (int) $link->object_id ) ] );
 				$dirty_types[ (string) $link->type ] = true;
 			}
+		}
+
+		// A failed read or no links left: the types are unknown, so all of them (as invalidate_group_cache()).
+		if ( $unread || $dirty_types === [] ) {
+			$this->invalidate_eager_link_map();
+
+			return;
 		}
 
 		$names = [];
@@ -1867,6 +2534,7 @@ final class TranslationGroupWrites extends TranslationGroupRepository {
 			$names[] = 'perflocale_eager_links_' . $type_value;
 		}
 
+		self::bump_link_generation();
 		CacheManager::delete_autoloaded_options( $names );
 	}
 	/**
@@ -1878,5 +2546,14 @@ final class TranslationGroupWrites extends TranslationGroupRepository {
 	 */
 	private function statement_failed(): bool {
 		return '' !== $this->wpdb->last_error;
+	}
+
+	/**
+	 * Whether a caller registered its own open transaction (set_in_transaction()): nested writes must not BEGIN.
+	 *
+	 * @return bool
+	 */
+	public static function outer_transaction(): bool {
+		return self::$in_transaction;
 	}
 }

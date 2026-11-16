@@ -196,6 +196,8 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 		// Register product meta keys as translatable.
 		add_filter( 'perflocale/translatable_meta_keys', [ $this, 'add_meta_keys' ], 10, 2 );
 
+		// URL bases provider: Registry::build() adds it while this add-on is booted (no hook here).
+
 		// ---- URL slug translation ----
 
 		// Translate cart item permalink to the current language.
@@ -285,8 +287,9 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 			$stock_ajax = self::stock_ajax_action();
 
 			if ( '' !== $stock_ajax || wp_doing_cron() || ( defined( 'WP_CLI' ) && WP_CLI ) ) {
-				// StockCheckJob::TYPE as a string: the job class loads only when a worker runs. Aligning is off (Api::align_off()).
+				// StockCheckJob::TYPE and StockAlignJob::TYPE as strings: the job classes load only when a worker runs.
 				\PerfLocale\Background\WorkerRegistry::register( 'wc_stock_check', static fn(): \PerfLocale\Background\AbstractJob => new \PerfLocale\WooCommerce\StockCheckJob() );
+				\PerfLocale\Background\WorkerRegistry::register( 'wc_stock_align', static fn(): \PerfLocale\Background\AbstractJob => new \PerfLocale\WooCommerce\StockAlignJob() );
 
 				if ( 'stock' === $stock_ajax ) {
 					\PerfLocale\WooCommerce\StockAlignScreen::register();
@@ -1312,7 +1315,7 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 		$running = true;
 
 		try {
-			$wc_page_ids = $this->get_wc_page_ids();
+			$wc_page_ids = self::funnel_page_ids();
 
 			if ( ! isset( $wc_page_ids[ $page_id ] ) ) {
 				return $link;
@@ -1338,45 +1341,58 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 	}
 
 	/**
+	 * Funnel-page sets by blog id (funnel_page_ids()).
+	 *
+	 * @var array<int, array<int, bool>>
+	 */
+	private static array $funnel = [];
+
+	/**
 	 * WooCommerce funnel-page IDs for the current language, as an id => true set.
 	 *
 	 * `shop` is excluded: it is indexable and linked while other pages are queried, so the rendered-page
 	 * guard cannot protect its canonical; boot() hooks wc_get_page_permalink( 'shop' ) instead.
-	 * Read via get_option(), whose filter maps each page to its translation. Memoized per blog.
+	 * Read via get_option(), whose filter maps each page to its translation. Memoized per blog until one of the
+	 * four changes; public so UrlLanguageServe reuses the set instead of reading the four options again.
 	 *
 	 * @return array<int, bool> Page ID set (empty when WooCommerce has no pages configured).
 	 */
-	private function get_wc_page_ids(): array {
-		static $ids_by_blog = [];
+	public static function funnel_page_ids(): array {
+		$blog_id = get_current_blog_id();
 
-		$blog_id = is_multisite() ? get_current_blog_id() : 0;
+		if ( ! isset( self::$funnel[ $blog_id ] ) ) {
+			$option_names = [ 'woocommerce_cart_page_id', 'woocommerce_checkout_page_id', 'woocommerce_myaccount_page_id', 'woocommerce_terms_page_id' ];
 
-		if ( isset( $ids_by_blog[ $blog_id ] ) ) {
-			return $ids_by_blog[ $blog_id ];
-		}
+			// None of the four autoloads: one multi-get covers the set.
+			wp_prime_option_caches( $option_names );
+			self::$funnel[ $blog_id ] = [];
 
-		$ids          = [];
-		$option_names = [
-			'woocommerce_cart_page_id',
-			'woocommerce_checkout_page_id',
-			'woocommerce_myaccount_page_id',
-			'woocommerce_terms_page_id',
-		];
+			foreach ( $option_names as $option_name ) {
+				$id = (int) get_option( $option_name );
 
-		// None of the four autoloads: one multi-get covers the set.
-		wp_prime_option_caches( $option_names );
+				if ( $id > 0 ) {
+					self::$funnel[ $blog_id ][ $id ] = true;
+				}
 
-		foreach ( $option_names as $option_name ) {
-			$id = (int) get_option( $option_name );
-
-			if ( $id > 0 ) {
-				$ids[ $id ] = true;
+				// A page setting changed later in this request drops the sets (one callback per hook, however often added).
+				foreach ( [ 'add_option_', 'update_option_', 'delete_option_' ] as $hook ) {
+					add_action( $hook . $option_name, [ self::class, 'forget_funnel_pages' ] );
+				}
 			}
 		}
 
-		$ids_by_blog[ $blog_id ] = $ids;
+		return self::$funnel[ $blog_id ];
+	}
 
-		return $ids;
+	/**
+	 * Drop the funnel-page sets of every blog.
+	 *
+	 * @internal Hooked by funnel_page_ids().
+	 *
+	 * @return void
+	 */
+	public static function forget_funnel_pages(): void {
+		self::$funnel = [];
 	}
 
 	/**
@@ -2356,82 +2372,9 @@ final class PerfLocaleWooCommerce implements \PerfLocale\Addon\AddonInterface {
 	 * @return string Translated HTML.
 	 */
 	public function translate_order_item_meta( string $html, $item, array $args ): string {
-		if ( ! method_exists( $item, 'get_meta_data' ) || $html === '' ) {
-			return $html;
-		}
+		require_once __DIR__ . '/PerfLocaleWooCommerceOrderMeta.php';
 
-		$plugin = \PerfLocale\Plugin::get_instance();
-
-		if ( ! $plugin->has( 'router' ) ) {
-			return $html;
-		}
-
-		$router       = $plugin->get( 'router' );
-		$current_slug = $router->get_current_slug();
-
-		if ( $current_slug === '' ) {
-			return $html;
-		}
-
-		// Skip on default language - meta values are already correct.
-		$default = $router->get_default_language();
-
-		if ( $default && $current_slug === $default->slug ) {
-			return $html;
-		}
-
-		$term_manager = $this->get_term_manager();
-
-		$meta_data = $item->get_meta_data();
-
-		foreach ( $meta_data as $meta ) {
-			$data     = $meta->get_data();
-			$meta_key = $data['key'] ?? '';
-			$value    = $data['value'] ?? '';
-
-			if ( $value === '' ) {
-				continue;
-			}
-
-			// Attribute meta keys start with "pa_" for taxonomy-based attributes.
-			$taxonomy = $meta_key;
-
-			if ( ! taxonomy_exists( $taxonomy ) ) {
-				continue;
-			}
-
-			$term = get_term_by( 'slug', $value, $taxonomy );
-
-			if ( ! $term instanceof \WP_Term ) {
-				// Value might be the term name, not slug.
-				$term = get_term_by( 'name', $value, $taxonomy );
-			}
-
-			if ( ! $term instanceof \WP_Term ) {
-				continue;
-			}
-
-			$translated_id = $term_manager->get_translation_id( $term->term_id, $current_slug );
-
-			if ( $translated_id !== null && $translated_id !== $term->term_id ) {
-				$translated_term = get_term( $translated_id );
-
-				if ( $translated_term instanceof \WP_Term && $translated_term->name !== $term->name ) {
-					// Replace the escaped original term name with the translated one.
-					$escaped_original   = esc_html( $term->name );
-					$escaped_translated = esc_html( $translated_term->name );
-
-					// Replace only the first occurrence to avoid unintended matches.
-					$pos = strpos( $html, $escaped_original );
-
-					if ( $pos !== false ) {
-						$html = substr_replace( $html, $escaped_translated, $pos, strlen( $escaped_original ) );
-					}
-				}
-			}
-		}
-
-		return $html;
+		return \PerfLocaleWooCommerceOrderMeta::translate_order_item_meta( $html, $item, fn(): \PerfLocale\Translation\TermTranslationManager => $this->get_term_manager() );
 	}
 
 	/**

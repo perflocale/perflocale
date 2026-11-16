@@ -405,20 +405,22 @@ final class DashboardPage {
 		?>
 		<div class="perflocale-dash-panel">
 			<h3 class="perflocale-dash-panel__title"><?php echo esc_html__( 'Cache', 'perflocale' ); ?></h3>
-			<a href="<?php echo esc_url( wp_nonce_url( admin_url( 'admin.php?page=perflocale&perflocale_action=clear_cache' ), 'perflocale_dashboard_action' ) ); ?>"
-				class="button button-secondary">
-				<?php echo esc_html__( 'Clear Cache', 'perflocale' ); ?>
-			</a>
+			<form method="post" action="<?php echo esc_url( admin_url( 'admin.php?page=perflocale' ) ); ?>">
+				<?php wp_nonce_field( 'perflocale_dashboard_action' ); ?>
+				<input type="hidden" name="perflocale_dashboard_action" value="clear_cache">
+				<button type="submit" class="button button-secondary"><?php echo esc_html__( 'Clear Cache', 'perflocale' ); ?></button>
+			</form>
 			<p class="description">
 				<?php echo esc_html__( 'Empties all PerfLocale caches. They are rebuilt automatically on the next page view.', 'perflocale' ); ?>
 			</p>
 		</div>
 		<div class="perflocale-dash-panel">
 			<h3 class="perflocale-dash-panel__title"><?php echo esc_html__( 'Permalinks', 'perflocale' ); ?></h3>
-			<a href="<?php echo esc_url( wp_nonce_url( admin_url( 'admin.php?page=perflocale&perflocale_action=flush_permalinks' ), 'perflocale_dashboard_action' ) ); ?>"
-				class="button button-secondary">
-				<?php echo esc_html__( 'Refresh Permalinks', 'perflocale' ); ?>
-			</a>
+			<form method="post" action="<?php echo esc_url( admin_url( 'admin.php?page=perflocale' ) ); ?>">
+				<?php wp_nonce_field( 'perflocale_dashboard_action' ); ?>
+				<input type="hidden" name="perflocale_dashboard_action" value="flush_permalinks">
+				<button type="submit" class="button button-secondary"><?php echo esc_html__( 'Refresh Permalinks', 'perflocale' ); ?></button>
+			</form>
 			<p class="description">
 				<?php echo esc_html__( 'Rebuilds the rewrite rules. Use this if language URLs stop resolving after changing the URL mode.', 'perflocale' ); ?>
 			</p>

@@ -35,6 +35,21 @@ final class PostTranslationWrites extends PostTranslationManager {
 	/**
 	 * Key segments marking a credential meta key: never copied, seeded or sent to machine translation.
 	 */
+	/**
+	 * sensitive_meta_patterns() by blog while a window is open (open_patterns_window()), with the filter's callback
+	 * set it was asked with; null when none is.
+	 *
+	 * @var array<int, array{0: array<array-key, list<string>>, 1: list<string>}>|null
+	 */
+	private static ?array $patterns_window = null;
+
+	/**
+	 * Whether this request's last create_translation() refused because a read of the existing translation failed.
+	 *
+	 * @var bool
+	 */
+	private static bool $unread = false;
+
 	private const SENSITIVE_META_PATTERNS = [
 		'_password',
 		'_secret',
@@ -76,6 +91,8 @@ final class PostTranslationWrites extends PostTranslationManager {
 	 *     false on failure or when another process's creation lock gave no answer.
 	 */
 	public function create_translation( int $source_id, string $target_slug, bool $copy_content = false, SourceType $source = SourceType::Manual, ?bool &$created = null ): int|false {
+		self::$unread = false;
+
 		$created     = false;
 		$source_post = get_post( $source_id );
 
@@ -216,6 +233,34 @@ final class PostTranslationWrites extends PostTranslationManager {
 	}
 
 	/**
+	 * Whether the last create_translation() refused on a failed read of the existing translation (retryable).
+	 *
+	 * @return bool
+	 */
+	public static function create_was_unread(): bool {
+		return self::$unread;
+	}
+
+	/**
+	 * Whether the post row is confirmed absent; null when the read failed.
+	 *
+	 * @param int $post_id Post.
+	 * @return bool|null
+	 */
+	private static function post_row_gone( int $post_id ): ?bool {
+		global $wpdb;
+
+		if ( ! $wpdb instanceof \wpdb ) {
+			return null;
+		}
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- A cache cannot prove a row absent; COUNT always answers, so "no row" means a failed read.
+		$found = $wpdb->get_var( $wpdb->prepare( 'SELECT COUNT(*) FROM %i WHERE ID = %d', $wpdb->posts, $post_id ) );
+
+		return is_numeric( $found ) ? 0 === (int) $found : null;
+	}
+
+	/**
 	 * The create_translation() body, run under its creation lock.
 	 *
 	 * @param int        $source_id    Source post ID.
@@ -225,7 +270,7 @@ final class PostTranslationWrites extends PostTranslationManager {
 	 * @param SourceType $source       Provenance tag.
 	 * @param bool       $inserted     Set to true once a new post is inserted and linked.
 	 * @return int|false New post ID, a live post already linked in the target language, or false on failure
-	 *                   (including no answer from the existence query).
+	 *                   (including no answer from the existence query, or a linked post that could not be read).
 	 */
 	private function do_create_translation( int $source_id, string $target_slug, object $target_lang, bool $copy_content, SourceType $source, bool &$inserted ): int|false {
 		// A template translation always starts from the source's blocks: a template is structure, and an
@@ -243,6 +288,7 @@ final class PostTranslationWrites extends PostTranslationManager {
 		$linked = $this->groups->find_translation_link_uncached( $source_id, ObjectType::Post, (int) $target_lang->id );
 
 		if ( $linked === false ) {
+			self::$unread = true;
 			return false;
 		}
 
@@ -259,7 +305,12 @@ final class PostTranslationWrites extends PostTranslationManager {
 				return $existing;
 			}
 
-			// Stale link - clean it up so we can create a fresh translation.
+			// A failed read is not a deleted post: unlink only a row confirmed absent, else refuse.
+			if ( true !== self::post_row_gone( $existing ) ) {
+				self::$unread = true;
+				return false;
+			}
+
 			$this->groups->unlink_by_object_id( $existing, 'post' );
 		}
 
@@ -345,9 +396,15 @@ final class PostTranslationWrites extends PostTranslationManager {
 		// Language hint for the wp_unique_post_slug filter: the new post has no link row yet.
 		self::$creating_translation_lang_slug = $target_slug;
 
+		// An untitled source copied without content is "empty" to core, which refuses it; the translation still needs its
+		// row (machine translation fills it next). Early priority: core's verdict only, other filters still decide.
+		$not_empty = static fn(): bool => false;
+
 		// wp_slash(): get_post() values are unslashed and wp_insert_post() unslashes. The hint and
 		// auto-assign are restored in finally; CopiedContentSave keeps copied markup past the user's content filters.
 		$copied = $copy_content ? CopiedContentSave::for_insert( $new_post_data, (int) $content_source->ID, $source_id ) : null;
+
+		add_filter( 'wp_insert_post_empty_content', $not_empty, 1, 0 );
 
 		try {
 			$copied?->arm();
@@ -355,6 +412,7 @@ final class PostTranslationWrites extends PostTranslationManager {
 			$new_post_id = wp_insert_post( wp_slash( $new_post_data ), true );
 		} finally {
 			$copied?->disarm();
+			remove_filter( 'wp_insert_post_empty_content', $not_empty, 1 );
 
 			self::$creating_translation_lang_slug = null;
 
@@ -365,18 +423,38 @@ final class PostTranslationWrites extends PostTranslationManager {
 			return false;
 		}
 
+		// A marked creation (CreationMark) claims its pair here, then links insert-only: it never takes the slot from a
+		// translation another creator linked. Refused either way, its draft is kept and reported, never deleted.
+		$marked = class_exists( CreationMark::class, false ) && CreationMark::gated();
+
+		if ( $marked && ! CreationMark::may_link( $new_post_id ) ) {
+			return false;
+		}
+
 		// A failed link deletes the new post, so no language-less draft is left; a successful one
 		// has already invalidated the group's caches.
-		$link_ok = $this->link_posts( $source_id, $new_post_id, $target_slug, $source );
+		$link_ok = $this->link_posts( $source_id, $new_post_id, $target_slug, $source, ! $marked );
 
 		if ( ! $link_ok ) {
-			wp_delete_post( $new_post_id, true );
+			if ( ! $marked ) {
+				wp_delete_post( $new_post_id, true );
+			}
 			return false;
 		}
 
 		$inserted = true;
 
 		$this->finish_new_translation( $content_source, $new_post_id, $target_slug, $source_id );
+
+		// An empty translation records its given title, so a machine fill tells it from a typed one; an MT create writes
+		// its output right after.
+		if ( SourceType::MachineTranslation !== $source ) {
+			$new_post = get_post( $new_post_id );
+
+			if ( $new_post instanceof \WP_Post ) {
+				StubTitle::record( $new_post );
+			}
+		}
 
 		return $new_post_id;
 	}
@@ -429,7 +507,7 @@ final class PostTranslationWrites extends PostTranslationManager {
 		self::$creation_locks_held[ $held_key ] = true;
 
 		try {
-			$this->finish_new_translation( $content_source, $new_post_id, $target_slug, $source_id );
+			$this->finish_new_translation( $content_source, $new_post_id, $target_slug, $source_id, true );
 		} finally {
 			unset( self::$creation_locks_held[ $held_key ] );
 		}
@@ -446,18 +524,20 @@ final class PostTranslationWrites extends PostTranslationManager {
 	 * @param int      $new_post_id    New translation post ID.
 	 * @param string   $target_slug    Target language slug.
 	 * @param int      $source_id      Post the translation was created from.
+	 * @param bool     $replace        A re-run: its result replaces an earlier run's warning (none left: deleted).
 	 * @return void
 	 */
-	private function finish_new_translation( \WP_Post $content_source, int $new_post_id, string $target_slug, int $source_id ): void {
+	private function finish_new_translation( \WP_Post $content_source, int $new_post_id, string $target_slug, int $source_id, bool $replace = false ): void {
 		$copy_errors = [];
+		$stopped     = [];
 
 		try {
-			$this->copy_post_meta( $content_source->ID, $new_post_id );
+			$this->copy_post_meta( $content_source->ID, $new_post_id, $stopped );
 		} catch ( \Throwable $e ) {
 			$copy_errors[] = [
 				'step'    => 'post_meta',
 				'message' => $e->getMessage(),
-			];
+			] + ( [] !== $stopped ? [ 'rows' => $stopped ] : [] );
 		}
 
 		try {
@@ -476,6 +556,10 @@ final class PostTranslationWrites extends PostTranslationManager {
 				'step'    => 'taxonomy_terms',
 				'message' => $e->getMessage(),
 			];
+		}
+
+		if ( $replace && empty( $copy_errors ) ) {
+			delete_post_meta( $new_post_id, '_perflocale_meta_copy_errors' );
 		}
 
 		if ( ! empty( $copy_errors ) ) {
@@ -592,19 +676,71 @@ final class PostTranslationWrites extends PostTranslationManager {
 	/**
 	 * The sensitive meta-key patterns in force for the current site.
 	 *
-	 * Not memoised: the answer can differ per blog, and callers ask once per operation.
+	 * Asked once per operation: inside a save's sync window (open_patterns_window()) one answer per blog and callback
+	 * set, so a callback added or removed during the save is asked at once.
 	 *
 	 * @return array<int, string>
 	 */
 	public static function sensitive_meta_patterns(): array {
-		/** @hook perflocale/translation/dangerous_meta_patterns Filter patterns for meta keys that should never be copied, nor sent to machine translation. The second argument names the list: 'copy', or 'machine_translation' (that list adds token, secret, api_key, apikey, password, license and licence). */
-		$patterns = apply_filters( 'perflocale/translation/dangerous_meta_patterns', self::SENSITIVE_META_PATTERNS, 'copy' );
+		$blog = get_current_blog_id();
+		$set  = null === self::$patterns_window ? [] : self::patterns_callbacks();
 
-		if ( ! is_array( $patterns ) ) {
-			return [];
+		if ( isset( self::$patterns_window[ $blog ] ) && $set === self::$patterns_window[ $blog ][0] ) {
+			return self::$patterns_window[ $blog ][1];
 		}
 
-		return array_values( array_filter( $patterns, 'is_string' ) );
+		/** @hook perflocale/translation/dangerous_meta_patterns Filter patterns for meta keys that should never be copied, nor sent to machine translation. The second argument names the list: 'copy', or 'machine_translation' (that list adds token, secret, api_key, apikey, password, license and licence). */
+		$patterns = apply_filters( 'perflocale/translation/dangerous_meta_patterns', self::SENSITIVE_META_PATTERNS, 'copy' );
+		$patterns = is_array( $patterns ) ? array_values( array_filter( $patterns, 'is_string' ) ) : [];
+
+		if ( null !== self::$patterns_window ) {
+			self::$patterns_window[ $blog ] = [ $set, $patterns ];
+		}
+
+		return $patterns;
+	}
+
+	/**
+	 * The patterns filter's callback ids by priority, as core's WP_Hook holds them.
+	 *
+	 * @return array<array-key, list<string>>
+	 */
+	private static function patterns_callbacks(): array {
+		global $wp_filter;
+
+		$hook = is_array( $wp_filter ) ? ( $wp_filter['perflocale/translation/dangerous_meta_patterns'] ?? null ) : null;
+		$out  = [];
+
+		foreach ( $hook instanceof \WP_Hook ? $hook->callbacks : [] as $priority => $at ) {
+			$out[ $priority ] = is_array( $at ) ? array_map( 'strval', array_keys( $at ) ) : [];
+		}
+
+		return $out;
+	}
+
+	/**
+	 * Open the window in which sensitive_meta_patterns() answers once per blog: a save's sync and the field-map
+	 * producers it runs ask for the same list.
+	 *
+	 * @return bool Whether this call opened it; only that caller closes it (close_patterns_window()).
+	 */
+	public static function open_patterns_window(): bool {
+		if ( null !== self::$patterns_window ) {
+			return false;
+		}
+
+		self::$patterns_window = [];
+
+		return true;
+	}
+
+	/**
+	 * Close the window open_patterns_window() opened.
+	 *
+	 * @return void
+	 */
+	public static function close_patterns_window(): void {
+		self::$patterns_window = null;
 	}
 
 	/**
@@ -643,12 +779,14 @@ final class PostTranslationWrites extends PostTranslationManager {
 	/**
 	 * Copy post meta from source to target, excluding internal WP keys.
 	 *
-	 * @param int $source_id Source post ID.
-	 * @param int $target_id Target post ID.
+	 * @param int                $source_id Source post ID.
+	 * @param int                $target_id Target post ID.
+	 * @param array<string, int> $stopped   Set to each key a failed insert stopped => the rows it should hold.
 	 * @return void
 	 * @throws \RuntimeException After the other keys, naming the keys a failed insert stopped.
 	 */
-	private function copy_post_meta( int $source_id, int $target_id ): void {
+	private function copy_post_meta( int $source_id, int $target_id, array &$stopped = [] ): void {
+		$stopped  = [];
 		$all_meta = get_post_meta( $source_id );
 
 		if ( ! is_array( $all_meta ) ) {
@@ -686,50 +824,125 @@ final class PostTranslationWrites extends PostTranslationManager {
 		$excluded_prefixes = DataRegistry::copy_excluded_post_meta_prefixes();
 
 		$dangerous_patterns = self::sensitive_meta_patterns();
-		$stopped            = [];
+		$pending            = 0;
 
-		foreach ( $all_meta as $key => $values ) {
-			if ( in_array( $key, $excluded, true ) || str_starts_with( $key, '_wp_trash' ) ) {
-				continue;
+		// This call's own insert: core fires add_post_meta right before it and added_post_meta after it. A nested add_post_meta
+		// (another plugin's filter or listener) is another post, key or blog, or balances itself.
+		$blog    = get_current_blog_id();
+		$current = '';
+		$mine    = static function ( mixed $object_id, mixed $meta_key ) use ( &$current, $target_id, $blog ): bool {
+			return is_numeric( $object_id ) && (int) $object_id === $target_id && is_scalar( $meta_key ) && (string) $meta_key === $current && get_current_blog_id() === $blog;
+		};
+		$tried   = static function ( mixed $object_id = 0, mixed $meta_key = '' ) use ( $mine, &$pending ): void {
+			if ( $mine( $object_id, $meta_key ) ) {
+				++$pending;
 			}
+		};
+		$landed  = static function ( mixed $meta_id = 0, mixed $object_id = 0, mixed $meta_key = '' ) use ( $mine, &$pending ): void {
+			if ( $mine( $object_id, $meta_key ) ) {
+				--$pending;
+			}
+		};
+		// A closure by reference, not an arrow function (that copies the count when it is made).
+		$started = static function () use ( &$pending ): bool {
+			return $pending > 0;
+		};
 
-			foreach ( $excluded_prefixes as $prefix ) {
-				if ( str_starts_with( (string) $key, $prefix ) ) {
-					continue 2;
+		// Switched to another blog, a field plugin's key cannot be told from a password there: only known keys travel.
+		$own_only = \PerfLocale\Translation\Fields\FieldMap::definitions_unavailable();
+		// Least trust: rows of a post an author or last editor without unfiltered_html wrote are copied as such a user
+		// may store them (core never filters meta); the same rows every run, so a resumed copy matches.
+		require_once __DIR__ . '/SourceTrust.php';
+		$least = ! SourceTrust::trusted( $source_id );
+
+		add_action( 'add_post_meta', $tried, PHP_INT_MAX, 2 );
+		add_action( 'added_post_meta', $landed, PHP_INT_MIN, 3 );
+
+		try {
+			foreach ( $all_meta as $key => $values ) {
+				if ( in_array( $key, $excluded, true ) || str_starts_with( $key, '_wp_trash' ) ) {
+					continue;
+				}
+
+				if ( $own_only && ! \PerfLocale\Translation\Fields\FieldMap::travels_switched( (string) $key ) ) {
+					continue;
+				}
+
+				foreach ( $excluded_prefixes as $prefix ) {
+					if ( str_starts_with( (string) $key, $prefix ) ) {
+						continue 2;
+					}
+				}
+
+				// Skip keys matching dangerous patterns (credentials, tokens, secrets).
+				if ( self::is_sensitive_meta_key( (string) $key, $dangerous_patterns ) ) {
+					continue;
+				}
+
+				$rows = [];
+
+				foreach ( $values as $value ) {
+					// Meta is user data: no class with unserialize side effects is instantiated.
+					if ( is_string( $value ) && is_serialized( $value ) ) {
+						// Only stdClass (no gadget): Beaver Builder stores stdClass nodes, which an incomplete class breaks.
+						// phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_unserialize, WordPress.PHP.NoSilencedErrors.Discouraged -- allowed_classes restricted to gadget-free stdClass.
+						$decoded = @unserialize( $value, [ 'allowed_classes' => [ 'stdClass' ] ] );
+					} else {
+						$decoded = $value;
+					}
+
+					if ( $least && null !== $decoded ) {
+						$decoded = SourceTrust::least_row( $decoded );
+
+						if ( null === $decoded ) {
+							continue;
+						}
+					}
+
+					$rows[] = $decoded;
+				}
+
+				// Core unslashes the key before its actions, and the row is stored under that name.
+				$current = stripslashes( (string) $key );
+
+				foreach ( $rows as $decoded ) {
+					$pending = 0;
+
+					// add_post_meta() unslashes: deep_slash() (arrays and objects) keeps builder JSON intact.
+					$added = add_post_meta( $target_id, $key, \PerfLocale\Helper::deep_slash( $decoded ) );
+
+					// False after this insert started and did not land is a failed insert, not a filter's refusal or a resume's
+					// skip: it stops the key, so a stopped copy holds a prefix of the rows, as the resume rules need. The count
+					// of rows it should hold lets a save tell a partly copied key from a copied one.
+					if ( $started() && false === $added ) {
+						$stopped[ $current ] = count( $rows );
+						break;
+					}
 				}
 			}
-
-			// Skip keys matching dangerous patterns (credentials, tokens, secrets).
-			if ( self::is_sensitive_meta_key( (string) $key, $dangerous_patterns ) ) {
-				continue;
-			}
-
-			foreach ( $values as $value ) {
-				// Meta is user data: no class with unserialize side effects is instantiated.
-				if ( is_string( $value ) && is_serialized( $value ) ) {
-					// Only stdClass (no gadget): Beaver Builder stores stdClass nodes, which an incomplete class breaks.
-					// phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_unserialize, WordPress.PHP.NoSilencedErrors.Discouraged -- allowed_classes restricted to gadget-free stdClass.
-					$decoded = @unserialize( $value, [ 'allowed_classes' => [ 'stdClass' ] ] );
-				} else {
-					$decoded = $value;
-				}
-				$tried = did_action( 'add_post_meta' );
-
-				// add_post_meta() unslashes: deep_slash() (arrays and objects) keeps builder JSON intact.
-				$added = add_post_meta( $target_id, $key, \PerfLocale\Helper::deep_slash( $decoded ) );
-
-				// False after core's add_post_meta action is a failed insert, not a filter's refusal or a resume's skip:
-				// it stops the key, so a stopped copy holds a prefix of the rows, as the resume rules need.
-				if ( false === $added && did_action( 'add_post_meta' ) > $tried ) {
-					$stopped[] = (string) $key;
-					break;
-				}
-			}
+		} finally {
+			remove_action( 'add_post_meta', $tried, PHP_INT_MAX );
+			remove_action( 'added_post_meta', $landed, PHP_INT_MIN );
 		}
 
 		if ( [] !== $stopped ) {
-			throw new \RuntimeException( esc_html( 'Meta rows not saved, key stopped: ' . implode( ', ', $stopped ) ) );
+			throw new \RuntimeException( esc_html( 'Meta rows not saved, key stopped: ' . implode( ', ', array_keys( $stopped ) ) ) );
 		}
+	}
+
+	/**
+	 * Add one entry to a new translation's copy notice (`_perflocale_meta_copy_errors`), for a step an add-on left out.
+	 *
+	 * @param int                  $post_id The new translation.
+	 * @param array<string, mixed> $entry   step, message, and the step's own fields.
+	 * @return void
+	 */
+	public static function note_copy_step( int $post_id, array $entry ): void {
+		$errors   = get_post_meta( $post_id, '_perflocale_meta_copy_errors', true );
+		$errors   = is_array( $errors ) ? $errors : [];
+		$errors[] = $entry;
+
+		update_post_meta( $post_id, '_perflocale_meta_copy_errors', wp_slash( $errors ) );
 	}
 
 	/**
@@ -840,14 +1053,58 @@ final class PostTranslationWrites extends PostTranslationManager {
 
 	/**
 	 * Link two posts as translations of each other, in the source's group or a new one.
+	 * A published target that leaves another language, or had none, is re-checked as set_post_language() does.
 	 *
 	 * @param int        $source_id Source post ID.
 	 * @param int        $target_id Target post ID.
 	 * @param string     $target_slug Target language slug.
 	 * @param SourceType $source Provenance tag persisted on the new link row.
+	 * @param bool       $replace False: never take the language's slot from another post (a creation mark's link).
 	 * @return bool
 	 */
-	public function link_posts( int $source_id, int $target_id, string $target_slug, SourceType $source = SourceType::Manual ): bool {
+	public function link_posts( int $source_id, int $target_id, string $target_slug, SourceType $source = SourceType::Manual, bool $replace = true ): bool {
+		$published = in_array( get_post_status( $target_id ), [ 'publish', 'future', 'private' ], true );
+		$left      = $published ? $this->detect_post_language( $target_id ) : null;
+
+		if ( ! $this->link_into_group( $source_id, $target_id, $target_slug, $source, $replace ) ) {
+			return false;
+		}
+
+		$lang = $this->languages->find_by_slug( $target_slug );
+		// No language before: its slug was checked as the default language's.
+		$was = $left ?? ( $published ? $this->languages->get_default() : null );
+
+		if ( $was && $lang && ( get_object_vars( $was )['id'] ?? 0 ) !== ( get_object_vars( $lang )['id'] ?? 0 ) ) {
+			$this->recheck_slug( $target_id, $lang );
+		}
+
+		return true;
+	}
+
+	/**
+	 * Re-check a moved post's slug in its new language (PostSlugCheck, required here: it stays out of the classmap).
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param object $lang    Its new language.
+	 * @return void
+	 */
+	private function recheck_slug( int $post_id, object $lang ): void {
+		require_once __DIR__ . '/PostSlugCheck.php';
+
+		PostSlugCheck::recheck( $post_id, $lang );
+	}
+
+	/**
+	 * Write the link row of link_posts().
+	 *
+	 * @param int        $source_id Source post ID.
+	 * @param int        $target_id Target post ID.
+	 * @param string     $target_slug Target language slug.
+	 * @param SourceType $source Provenance tag persisted on the new link row.
+	 * @param bool       $replace False: never take the language's slot from another post.
+	 * @return bool
+	 */
+	private function link_into_group( int $source_id, int $target_id, string $target_slug, SourceType $source, bool $replace ): bool {
 		$target_lang = $this->languages->find_by_slug( $target_slug );
 
 		if ( ! $target_lang ) {
@@ -864,7 +1121,8 @@ final class PostTranslationWrites extends PostTranslationManager {
 				$target_id,
 				(int) $target_lang->id,
 				TranslationStatus::Empty->value,
-				$source
+				$source,
+				$replace
 			);
 
 			if ( $result !== false ) {
@@ -881,7 +1139,7 @@ final class PostTranslationWrites extends PostTranslationManager {
 		$lock_result = \PerfLocale\Concurrency\Lock::with(
 			$lock_name,
 			30,
-			function () use ( $source_id, $target_id, $target_slug, $target_lang, $source ): bool {
+			function () use ( $source_id, $target_id, $target_slug, $target_lang, $source, $replace ): bool {
 				// Re-read inside the lock, after dropping the memoised null, or a second group is created.
 				$this->groups->invalidate_find_cache( $source_id, ObjectType::Post );
 				$double_check = $this->groups->find_for_object( $source_id, ObjectType::Post );
@@ -891,7 +1149,8 @@ final class PostTranslationWrites extends PostTranslationManager {
 						$target_id,
 						(int) $target_lang->id,
 						TranslationStatus::Empty->value,
-						$source
+						$source,
+						$replace
 					);
 					if ( $result !== false ) {
 						unset( self::$lang_cache[ self::lang_cache_key( $target_id ) ] );
@@ -931,7 +1190,8 @@ final class PostTranslationWrites extends PostTranslationManager {
 					$target_id,
 					(int) $target_lang->id,
 					TranslationStatus::Empty->value,
-					$source
+					$source,
+					$replace
 				);
 
 				if ( $result !== false ) {
@@ -962,7 +1222,8 @@ final class PostTranslationWrites extends PostTranslationManager {
 			$target_id,
 			(int) $target_lang->id,
 			TranslationStatus::Empty->value,
-			$source
+			$source,
+			$replace
 		);
 		if ( $result !== false ) {
 			unset( self::$lang_cache[ self::lang_cache_key( $target_id ) ] );
@@ -1128,10 +1389,18 @@ final class PostTranslationWrites extends PostTranslationManager {
 				// Else the language already had this value: success.
 			}
 
+			$left_id = is_object( $left_language ) && isset( $left_language->id ) && is_numeric( $left_language->id ) ? (int) $left_language->id : 0;
+
 			$member_ids = $this->groups->invalidate_group_cache( (int) $group->id );
 
 			// invalidate_group_cache() leaves this memo holding the prior language.
 			unset( self::$lang_cache[ self::lang_cache_key( $post_id ) ] );
+
+			// A move between languages: re-check the slug once the memos hold the new language (its update hooks build
+			// links), before the cache clears below, so they also cover a rename.
+			if ( $left_id > 0 && $left_id !== $new_lang ) {
+				$this->recheck_slug( $post_id, $lang );
+			}
 
 			// No transition_post_status fires here.
 			$this->maybe_flush_found_rows( $post_id );
@@ -1147,16 +1416,17 @@ final class PostTranslationWrites extends PostTranslationManager {
 				$this->clear_group_hreflang( $post_id, $member_ids );
 
 				// Template menu and pattern references follow the new language at the end of the request.
-				TemplateBlockRefs::note_language_change( $post_id, is_object( $left_language ) && isset( $left_language->id ) && is_numeric( $left_language->id ) ? (int) $left_language->id : 0 );
+				TemplateBlockRefs::note_language_change( $post_id, $left_id );
 			}
 
 			return true;
 		}
 
+		$lang_id  = (int) $lang->id;
 		$group_id = $this->groups->create_group(
 			ObjectType::Post,
 			$post_id,
-			(int) $lang->id,
+			$lang_id,
 			TranslationStatus::Published->value
 		);
 
@@ -1164,6 +1434,14 @@ final class PostTranslationWrites extends PostTranslationManager {
 			// Both memos may hold null from before the post had a language.
 			$this->groups->invalidate_find_cache( $post_id, ObjectType::Post );
 			unset( self::$lang_cache[ self::lang_cache_key( $post_id ) ] );
+
+			// A slug checked without a language counted as the default one: re-check under any other first language.
+			$default = $this->languages->get_default();
+			$default = is_object( $default ) && isset( $default->id ) && is_numeric( $default->id ) ? (int) $default->id : 0;
+
+			if ( $default > 0 && $default !== $lang_id ) {
+				$this->recheck_slug( $post_id, $lang );
+			}
 
 			// No transition_post_status fires here.
 			$this->maybe_flush_found_rows( $post_id );

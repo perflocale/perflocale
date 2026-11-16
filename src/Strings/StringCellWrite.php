@@ -12,6 +12,7 @@ namespace PerfLocale\Strings;
 use PerfLocale\Admin\Typed;
 use PerfLocale\Concurrency\Lock;
 use PerfLocale\Database\ConnectionGuard;
+use PerfLocale\Database\Repository\StringRepository;
 use PerfLocale\Database\Repository\TranslationGroupRepository;
 use PerfLocale\Database\Schema;
 use PerfLocale\Enum\SourceType;
@@ -20,14 +21,15 @@ defined( 'ABSPATH' ) || exit;
 
 /**
  * A person's cell save: never replaces a value another person stored after the read; replaces a machine translation.
- * Loaded by the Strings save only.
+ * Loaded by the Strings save and by StringTarget's compare-and-set writes (Apply, Undo).
  *
  * @since 1.0.7.5
+ * @phpstan-type UnitHow array{over_mt: bool, label: SourceType, strict: bool, check: callable|null, then: callable|null, link: string|null, same: bool}
  */
 final class StringCellWrite {
 
 	/**
-	 * Save a cell while the row is as read, or over a machine translation, then label the link manual. MySQL/MariaDB hold
+	 * Save a cell while the row is as read, or over a machine translation, then label the link $label. MySQL/MariaDB hold
 	 * the link row, SQLite a cell lock, for the whole unit, so another person's save never lands between value and label.
 	 *
 	 * @param TranslationGroupRepository $repo        Group/link repository.
@@ -39,9 +41,16 @@ final class StringCellWrite {
 	 * @param string                     $text        Form 1 to write, not ''.
 	 * @param string|false|null          $forms       extra_forms to write; false leaves them, and they are not compared.
 	 * @param bool                       $over_mt     Only over a machine translation (the page showed an older value).
-	 * @return string 'saved', 'unlinked' (written; the caller links it), 'same', 'stale', 'mismatch' or 'failed'.
+	 * @param SourceType                 $label       Label the unit sets on the link.
+	 * @param bool                       $strict      Only while the row is as read, never over a machine translation that moved.
+	 * @param callable|null              $check       fn(): bool, run inside the unit before the value statement; false refuses it.
+	 * @param callable|null              $then        fn( string $guarded ): bool, run inside the unit after its statements with the
+	 *                                                unit's connection condition (' AND ...' or ''); false rolls it back.
+	 * @param string|null                $link        Link status set in the unit; a cell with no link is linked in it (null: the
+	 *                                                caller links an 'unlinked' cell, status 'translated').
+	 * @return string 'saved', 'unlinked' (written; the caller links it), 'same', 'stale', 'mismatch', 'refused' or 'failed'.
 	 */
-	public static function save( TranslationGroupRepository $repo, int $group_id, int $string_id, int $language_id, ?string $read_text, ?string $read_forms, string $text, string|false|null $forms, bool $over_mt ): string {
+	public static function save( TranslationGroupRepository $repo, int $group_id, int $string_id, int $language_id, ?string $read_text, ?string $read_forms, string $text, string|false|null $forms, bool $over_mt, SourceType $label = SourceType::Manual, bool $strict = false, ?callable $check = null, ?callable $then = null, ?string $link = null ): string {
 		$outcome = 'failed';
 		$first   = null;
 
@@ -52,20 +61,104 @@ final class StringCellWrite {
 				$group_id,
 				$string_id,
 				$language_id,
-				$over_mt,
 				/** @param array{0: literal-string, 1: array<int, mixed>, 2: string} $fence */
 				static fn( array $fence ): int|false => self::write( $string_id, $language_id, $read_text, $read_forms, $text, $forms, $fence ),
 				/** @param array{0: literal-string, 1: array<int, mixed>, 2: string} $fence */
 				static fn( array $fence ): int|false => self::write_over( $string_id, $language_id, $text, $forms, $fence ),
 				$text,
-				$forms
+				$forms,
+				[
+					'over_mt' => $over_mt,
+					'label'   => $label,
+					'strict'  => $strict,
+					'check'   => $check,
+					'then'    => $then,
+					'link'    => $link,
+					'same'    => ! $over_mt && $read_text === $text && ( false === $forms || $read_forms === $forms ),
+				]
 			);
 			$first ??= $outcome;
 		}
 
-		$outcome = self::retried( $repo, (string) $first, $outcome, $group_id, $string_id, $language_id, $text, $forms );
+		$outcome = self::retried( $repo, (string) $first, $outcome, $group_id, $string_id, $language_id, $text, $forms, $label );
 
 		return self::why_not( $outcome, $string_id, $language_id, $read_text, $read_forms, $text, $forms );
+	}
+
+	/**
+	 * The Strings screen's save(), only while the string row exists (checked in the unit); a row deleted since the read
+	 * (the identity switch-over folds an empty twin) is saved once to the one other row of its tuple, else 'gone' (nothing written).
+	 *
+	 * @param TranslationGroupRepository             $repo        Group/link repository.
+	 * @param int                                    $group_id    The string's group (a string group).
+	 * @param int                                    $string_id   String.
+	 * @param int                                    $language_id Language.
+	 * @param string|null                            $read_text   Form 1 as read; null when there was no row.
+	 * @param string|null                            $read_forms  extra_forms as read.
+	 * @param string                                 $text        Form 1 to write, not ''.
+	 * @param string|false|null                      $forms       extra_forms to write; false leaves them.
+	 * @param bool                                   $over_mt     Only over a machine translation.
+	 * @param array{0: string, 1: string, 2: string} $tuple       The row's domain, context and original as read.
+	 * @return array{0: string, 1: int, 2: int} save()'s outcome or 'gone', and the string and group written.
+	 */
+	public static function save_live( TranslationGroupRepository $repo, int $group_id, int $string_id, int $language_id, ?string $read_text, ?string $read_forms, string $text, string|false|null $forms, bool $over_mt, array $tuple ): array {
+		$read    = 'ok';
+		$outcome = self::save( $repo, $group_id, $string_id, $language_id, $read_text, $read_forms, $text, $forms, $over_mt, SourceType::Manual, false, self::alive( $string_id, $read ) );
+
+		if ( 'refused' !== $outcome ) {
+			return [ $outcome, $string_id, $group_id ];
+		}
+
+		$to = 'ok' === $read ? self::survivor( $string_id, $tuple ) : false;
+
+		if ( null === $to || false === $to || ! $repo->is_string_group( $to[1] ) ) {
+			return [ false === $to ? 'failed' : 'gone', $string_id, $group_id ];
+		}
+
+		// The same as-read condition: the person saw the twin's cell, so a value the survivor holds is reported, not replaced.
+		$outcome = self::save( $repo, $to[1], $to[0], $language_id, $read_text, $read_forms, $text, $forms, $over_mt, SourceType::Manual, false, self::alive( $to[0], $read ) );
+
+		return [ 'refused' !== $outcome ? $outcome : ( 'ok' === $read ? 'gone' : 'failed' ), $to[0], $to[1] ];
+	}
+
+	/**
+	 * A unit check: the string row still exists, by a locking read on MySQL/MariaDB (it waits for a fold's batch).
+	 *
+	 * @param int    $string_id String.
+	 * @param string $read      Set to 'error' on a failed read.
+	 * @return callable(): bool
+	 */
+	private static function alive( int $string_id, string &$read ): callable {
+		return static function () use ( $string_id, &$read ): bool {
+			$wpdb = Typed::wpdb();
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Inside the unit, by primary key; the suffix is a literal.
+			$id   = $wpdb->get_var( $wpdb->prepare( 'SELECT id FROM %i WHERE id = %d' . ConnectionGuard::lock_suffix(), Schema::table( 'strings' ), $string_id ) );
+			$read = '' === $wpdb->last_error ? 'ok' : 'error';
+
+			return 'ok' === $read && null !== $id;
+		};
+	}
+
+	/**
+	 * The one row other than $gone stored for the tuple under either hash rule, matched byte for byte.
+	 *
+	 * @param int                                    $gone  The deleted string id.
+	 * @param array{0: string, 1: string, 2: string} $tuple Domain, context, original.
+	 * @return array{0: int, 1: int}|false|null [ id, group_id ]; null: none or more than one; false: the read failed.
+	 */
+	private static function survivor( int $gone, array $tuple ): array|false|null {
+		$wpdb          = Typed::wpdb();
+		[ $new, $old ] = StringRepository::identity_hashes( ...$tuple );
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Must see the fold's commit.
+		$rows = $wpdb->get_results( $wpdb->prepare( 'SELECT id, group_id, domain, context, original FROM %i WHERE original_hash IN (%s, %s) AND id <> %d', Schema::table( 'strings' ), $new, $old, $gone ), ARRAY_A );
+
+		if ( ! is_array( $rows ) || '' !== $wpdb->last_error ) {
+			return false;
+		}
+
+		$rows = array_values( array_filter( Typed::rows( $rows ), static fn( array $r ): bool => [ $r['domain'] ?? null, $r['context'] ?? null, $r['original'] ?? null ] === $tuple ) );
+
+		return 1 === count( $rows ) ? [ Typed::int( $rows[0]['id'] ?? 0 ), Typed::int( $rows[0]['group_id'] ?? 0 ) ] : null;
 	}
 
 	/**
@@ -78,9 +171,12 @@ final class StringCellWrite {
 	 * @param string|null                $read_text   Form 1 as read; null when there was no row.
 	 * @param string|false|null          $read_forms  extra_forms as read; false: not compared.
 	 * @param bool                       $over_mt     Only over a machine translation.
-	 * @return string 'saved' (deleted), 'none' (no row was read), 'same', 'stale', 'mismatch' or 'failed'.
+	 * @param bool                       $strict      Only while the row is as read, never over a machine translation that moved.
+	 * @param callable|null              $check       fn(): bool, run inside the unit before the value statement; false refuses it.
+	 * @param callable|null              $then        fn( string $guarded ): bool, as save()'s.
+	 * @return string 'saved' (deleted), 'none' (no row was read), 'same', 'stale', 'mismatch', 'refused' or 'failed'.
 	 */
-	public static function remove( TranslationGroupRepository $repo, int $group_id, int $string_id, int $language_id, ?string $read_text, string|false|null $read_forms, bool $over_mt ): string {
+	public static function remove( TranslationGroupRepository $repo, int $group_id, int $string_id, int $language_id, ?string $read_text, string|false|null $read_forms, bool $over_mt, bool $strict = false, ?callable $check = null, ?callable $then = null ): string {
 		$outcome = 'failed';
 		$first   = null;
 
@@ -90,18 +186,26 @@ final class StringCellWrite {
 				$group_id,
 				$string_id,
 				$language_id,
-				$over_mt,
 				/** @param array{0: literal-string, 1: array<int, mixed>, 2: string} $fence */
 				static fn( array $fence ): int|false => null === $read_text ? 2 : self::clear( $string_id, $language_id, $read_text, $read_forms, $fence ),
 				/** @param array{0: literal-string, 1: array<int, mixed>, 2: string} $fence */
 				static fn( array $fence ): int|false => self::delete_over( $string_id, $language_id, $fence ),
 				null,
-				false
+				false,
+				[
+					'over_mt' => $over_mt,
+					'label'   => SourceType::Manual,
+					'strict'  => $strict,
+					'check'   => $check,
+					'then'    => $then,
+					'link'    => null,
+					'same'    => false,
+				]
 			);
 			$first ??= $outcome;
 		}
 
-		$outcome = self::retried( $repo, (string) $first, $outcome, $group_id, $string_id, $language_id, null, false );
+		$outcome = self::retried( $repo, (string) $first, $outcome, $group_id, $string_id, $language_id, null, false, SourceType::Manual );
 
 		if ( 'saved' === $outcome && null === $read_text ) {
 			return 'none';
@@ -177,6 +281,53 @@ final class StringCellWrite {
 	}
 
 	/**
+	 * Link a cell that has none, in the caller's unit: never over another writer's link (INSERT IGNORE on group_lang).
+	 *
+	 * @param int        $group_id    String group.
+	 * @param int        $string_id   String.
+	 * @param int        $language_id Language.
+	 * @param string     $status      Link status.
+	 * @param SourceType $label       Link source.
+	 * @param string     $guarded     The unit's connection condition (' AND ...'), '' on SQLite.
+	 * @return int|false 1 linked, 2 another writer's link stands, 0 no link (another group's object_lang row: the caller's
+	 *                   upsert_link() reaps it), false on a database error.
+	 */
+	public static function link_if_none( int $group_id, int $string_id, int $language_id, string $status, SourceType $label, string $guarded ): int|false {
+		$wpdb  = Typed::wpdb();
+		$links = Schema::table( 'translation_links' );
+
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Prepared here; the marker is a checked literal (ConnectionGuard::condition()).
+		$sql  = $wpdb->prepare(
+			'INSERT IGNORE INTO %i (group_id, object_id, language_id, type, status, source) ' . ( '' === $guarded ? 'VALUES (%d, %d, %d, %s, %s, %s)' : 'SELECT %d, %d, %d, %s, %s, %s FROM DUAL WHERE 1 = 1' ),
+			$links,
+			$group_id,
+			$string_id,
+			$language_id,
+			'string',
+			sanitize_key( $status ),
+			$label->value
+		);
+		$done = is_string( $sql ) ? $wpdb->query( $sql . $guarded ) : false;
+
+		if ( ! is_int( $done ) ) {
+			return false;
+		}
+
+		if ( $done > 0 ) {
+			return 1;
+		}
+
+		$id = $wpdb->get_var( $wpdb->prepare( 'SELECT id FROM %i WHERE group_id = %d AND language_id = %d' . ConnectionGuard::lock_suffix(), $links, $group_id, $language_id ) );
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber, PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+		if ( '' !== $wpdb->last_error ) {
+			return false;
+		}
+
+		return null === $id ? 0 : 2;
+	}
+
+	/**
 	 * One unit. SQLite has no row locks: a per-cell lock serializes the Strings saves of one cell, and one transaction
 	 * holds the unit, so a save that took the lock over after its TTL cannot write until this one ends.
 	 *
@@ -184,17 +335,19 @@ final class StringCellWrite {
 	 * @param int                        $group_id    String group.
 	 * @param int                        $string_id   String.
 	 * @param int                        $language_id Language.
-	 * @param bool                       $over_mt     Only over a machine translation.
 	 * @param callable                   $as_read     Value statement while the row is as read: fn( fence ): int|false.
 	 * @param callable                   $over        Value statement over a machine translation: fn( fence ): int|false.
 	 * @param string|null                $text        Form 1 written; null clears the cell.
 	 * @param string|false|null          $forms       extra_forms written; false: not compared.
-	 * @return string 'saved', 'unlinked', 'zero' (as read matched nothing), 'stale', 'failed', or on
-	 *                MySQL/MariaDB 'unsure' / 'unsure_label' (COMMIT sent, not acknowledged; the latter relabelled a link).
+	 * @param array<string, mixed>       $how         over_mt, label, strict, check, then (save()'s parameters).
+	 * @phpstan-param UnitHow $how
+	 * @return string 'saved', 'unlinked', 'zero' (as read matched nothing, or value and link were already as wanted),
+	 *                'stale', 'refused', 'failed', or on MySQL/MariaDB 'unsure' / 'unsure_label' (COMMIT sent, not
+	 *                acknowledged; the latter relabelled a link).
 	 */
-	private static function unit( TranslationGroupRepository $repo, int $group_id, int $string_id, int $language_id, bool $over_mt, callable $as_read, callable $over, ?string $text, string|false|null $forms ): string {
+	private static function unit( TranslationGroupRepository $repo, int $group_id, int $string_id, int $language_id, callable $as_read, callable $over, ?string $text, string|false|null $forms, array $how ): string {
 		if ( ConnectionGuard::applies() ) {
-			return self::locked_unit( $repo, $group_id, $string_id, $language_id, $over_mt, $as_read, $over, $text, $forms );
+			return self::locked_unit( $repo, $group_id, $string_id, $language_id, $as_read, $over, $text, $forms, $how );
 		}
 
 		$name = StringLinkLabel::cell_lock( $group_id, $language_id );
@@ -204,7 +357,7 @@ final class StringCellWrite {
 		}
 
 		try {
-			$outcome = self::transaction_unit( $repo, $group_id, $string_id, $language_id, $over_mt, $as_read, $over, $text, $forms );
+			$outcome = self::transaction_unit( $repo, $group_id, $string_id, $language_id, $as_read, $over, $text, $forms, $how );
 		} finally {
 			Lock::release( $name );
 		}
@@ -233,14 +386,15 @@ final class StringCellWrite {
 	 * @param int                        $group_id    String group.
 	 * @param int                        $string_id   String.
 	 * @param int                        $language_id Language.
-	 * @param bool                       $over_mt     Only over a machine translation.
 	 * @param callable                   $as_read     Value statement while the row is as read: fn( fence ): int|false.
 	 * @param callable                   $over        Value statement over a machine translation: fn( fence ): int|false.
 	 * @param string|null                $text        Form 1 written; null clears the cell.
 	 * @param string|false|null          $forms       extra_forms written; false: not compared.
+	 * @param array<string, mixed>       $how         over_mt, label, strict, check, then (save()'s parameters).
+	 * @phpstan-param UnitHow $how
 	 * @return string As locked_unit(), but 'unlabelled' is rolled back as 'failed'.
 	 */
-	private static function transaction_unit( TranslationGroupRepository $repo, int $group_id, int $string_id, int $language_id, bool $over_mt, callable $as_read, callable $over, ?string $text, string|false|null $forms ): string {
+	private static function transaction_unit( TranslationGroupRepository $repo, int $group_id, int $string_id, int $language_id, callable $as_read, callable $over, ?string $text, string|false|null $forms, array $how ): string {
 		$wpdb    = Typed::wpdb();
 		$errors  = Schema::query_error_count();
 		$outcome = 'failed';
@@ -253,14 +407,19 @@ final class StringCellWrite {
 		try {
 			$sql     = $wpdb->prepare( 'UPDATE %i SET option_value = option_value WHERE 1 = 0', $wpdb->options );
 			$hold    = is_string( $sql ) ? $wpdb->query( $sql ) : false; // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- prepare() output.
-			$outcome = false === $hold ? 'failed' : self::locked_unit( $repo, $group_id, $string_id, $language_id, $over_mt, $as_read, $over, $text, $forms );
+			$outcome = false === $hold ? 'failed' : self::locked_unit( $repo, $group_id, $string_id, $language_id, $as_read, $over, $text, $forms, $how );
 		} finally {
 			$commit = in_array( $outcome, [ 'claimed', 'dropped', 'saved', 'unlinked' ], true ) && ! Schema::transaction_lost( $errors );
 
-			// 'stale' and 'zero' wrote nothing; anything else leaves no half unit behind.
+			if ( $commit && null !== $how['then'] && true !== ( $how['then'] )( '' ) ) {
+				$commit  = false;
+				$outcome = 'refused';
+			}
+
+			// 'stale', 'zero' and 'refused' wrote nothing; anything else leaves no half unit behind.
 			if ( ! $commit || false === $wpdb->query( 'COMMIT' ) ) {
 				$wpdb->query( 'ROLLBACK' );
-				$outcome = 'stale' === $outcome || 'zero' === $outcome ? $outcome : 'failed';
+				$outcome = in_array( $outcome, [ 'stale', 'zero', 'refused' ], true ) ? $outcome : 'failed';
 			}
 		}
 		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
@@ -275,15 +434,16 @@ final class StringCellWrite {
 	 * @param int                        $group_id    String group.
 	 * @param int                        $string_id   String.
 	 * @param int                        $language_id Language.
-	 * @param bool                       $over_mt     Only over a machine translation.
 	 * @param callable                   $as_read     Value statement while the row is as read: fn( fence ): int|false.
 	 * @param callable                   $over        Value statement over a machine translation: fn( fence ): int|false.
 	 * @param string|null                $text        Form 1 written; null clears the cell.
 	 * @param string|false|null          $forms       extra_forms written; false: not compared.
+	 * @param array<string, mixed>       $how         over_mt, label, strict, check, then (save()'s parameters).
+	 * @phpstan-param UnitHow $how
 	 * @return string As unit(), or on SQLite 'claimed' (saved and relabelled) or 'dropped' (link deleted): unit() drops
 	 *                the caches after the COMMIT and the cell lock.
 	 */
-	private static function locked_unit( TranslationGroupRepository $repo, int $group_id, int $string_id, int $language_id, bool $over_mt, callable $as_read, callable $over, ?string $text, string|false|null $forms ): string {
+	private static function locked_unit( TranslationGroupRepository $repo, int $group_id, int $string_id, int $language_id, callable $as_read, callable $over, ?string $text, string|false|null $forms, array $how ): string {
 		$wpdb  = Typed::wpdb();
 		$links = Schema::table( 'translation_links' );
 		$guard = ConnectionGuard::applies() ? new ConnectionGuard( 'string_cell' ) : null;
@@ -307,16 +467,26 @@ final class StringCellWrite {
 		// SQLite reads the source unlocked, so the write over a machine translation checks it again in its own statement.
 		$mt_fence = null === $guard ? [ ' AND EXISTS ( SELECT 1 FROM %i WHERE group_id = %d AND language_id = %d AND source = %s )', [ $links, $group_id, $language_id, SourceType::MachineTranslation->value ], '' ] : $marker;
 
+		$over_mt = $how['over_mt'];
+
 		if ( $over_mt && ! $is_mt ) {
 			self::end( $wpdb, $guard, false );
 
 			return 'stale';
 		}
 
+		$label = $how['label'];
+
+		if ( null !== $how['check'] && true !== ( $how['check'] )() ) {
+			self::end( $wpdb, $guard, false );
+
+			return 'refused';
+		}
+
 		$done = $over_mt ? 0 : $as_read( $marker );
 		$zero = 0 === $done ? 'zero' : 'stale';
 
-		if ( 0 === $done && $is_mt ) {
+		if ( 0 === $done && $is_mt && ! $how['strict'] ) {
 			$done = $over( $mt_fence );
 			$zero = 'stale';
 
@@ -327,6 +497,20 @@ final class StringCellWrite {
 			}
 		}
 
+		// No row on a new connection: the marker went with the lost one, so the cell did not move.
+		if ( 0 === $done && null !== $guard && ! $guard->holds() ) {
+			self::end( $wpdb, $guard, false );
+
+			return 'failed';
+		}
+
+		// The value as read is the value wanted: MySQL counts no changed row, SQLite one matched row. Either way the label
+		// step runs unless the link is already as wanted, so 'same' means value and link.
+		if ( $how['same'] && ( 0 === $done || 1 === $done ) ) {
+			$done = self::same_cell( $string_id, $language_id, $group_id, $text, $forms, $how['link'], $label );
+			$zero = 'zero';
+		}
+
 		if ( 1 !== $done && 2 !== $done ) {
 			self::end( $wpdb, $guard, false );
 
@@ -334,7 +518,30 @@ final class StringCellWrite {
 		}
 
 		if ( null === $source && null !== $text ) {
-			return self::end( $wpdb, $guard, true ) ? 'unlinked' : ( null === $guard ? 'failed' : 'unsure' );
+			// Linked inside the unit: a save that links the cell after the COMMIT keeps its own status and label.
+			$made = null === $how['link'] ? 0 : self::link_if_none( $group_id, $string_id, $language_id, $how['link'], $label, $guarded );
+
+			if ( false === $made || ( null !== $guard && null !== $how['then'] && true !== ( $how['then'] )( $guarded ) ) ) {
+				self::end( $wpdb, $guard, false );
+
+				return false === $made ? 'failed' : 'refused';
+			}
+
+			if ( ! self::end( $wpdb, $guard, true ) ) {
+				return null === $guard ? 'failed' : 'unsure';
+			}
+
+			if ( 1 !== $made ) {
+				return 0 === $made ? 'unlinked' : 'saved';
+			}
+
+			if ( null === $guard ) {
+				return 'claimed';
+			}
+
+			StringLinkLabel::announce( $repo, $group_id, $string_id, $language_id );
+
+			return 'saved';
 		}
 
 		$sql = null;
@@ -351,11 +558,11 @@ final class StringCellWrite {
 				$language_id
 			);
 		} elseif ( null !== $guard ) {
-			$label = [ $string_id, 'translated', SourceType::Manual->value ];
+			$set   = [ $string_id, $how['link'] ?? 'translated', $label->value ];
 			$touch = Schema::touch_write_time( [ [ 'object_id', '%d', 'int' ], [ 'status', '%s', 'text' ], [ 'source', '%s', 'text' ] ] );
 			$sql   = $wpdb->prepare(
 				'UPDATE %i SET object_id = %d, status = %s, source = %s' . $touch . ' WHERE group_id = %d AND language_id = %d',
-				array_merge( [ $links ], $label, '' === $touch ? [] : $label, [ $group_id, $language_id ] )
+				array_merge( [ $links ], $set, '' === $touch ? [] : $set, [ $group_id, $language_id ] )
 			);
 		}
 
@@ -363,19 +570,25 @@ final class StringCellWrite {
 		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber, PluginCheck.Security.DirectDB.UnescapedDBParameter
 
 		if ( null !== $guard ) {
+			if ( is_int( $linked ) && null !== $how['then'] && true !== ( $how['then'] )( $guarded ) ) {
+				self::end( $wpdb, $guard, false );
+
+				return 'refused';
+			}
+
 			// MySQL/MariaDB: a failed label is rolled back with the value; a COMMIT not acknowledged may have committed both.
 			if ( ! self::end( $wpdb, $guard, is_int( $linked ) ) ) {
 				if ( ! is_int( $linked ) ) {
 					return 'failed';
 				}
 
-				return null !== $text && null !== $source && SourceType::Manual->value !== $source ? 'unsure_label' : 'unsure';
+				return null !== $text && null !== $source && $label->value !== $source ? 'unsure_label' : 'unsure';
 			}
 		} elseif ( ! is_int( $linked ) ) {
 			return 'unlabelled';
 		} elseif ( null !== $text ) {
 			// SQLite: the label in one statement, only while form 1 is the person's text; a failure fails the whole unit.
-			$claimed = StringLinkLabel::claim( $repo, $group_id, $string_id, $language_id, SourceType::Manual, $text, null, false );
+			$claimed = StringLinkLabel::claim( $repo, $group_id, $string_id, $language_id, $label, $text, null, false );
 
 			if ( null === $claimed ) {
 				return 'unlabelled';
@@ -408,6 +621,43 @@ final class StringCellWrite {
 		}
 
 		return 'saved';
+	}
+
+	/**
+	 * Inside a unit whose value write keeps the value as read: 1 when the cell holds it and the link is not yet as the unit
+	 * labels it (the label step runs), 0 when nothing is left to write or the cell moved, false on a failed read.
+	 *
+	 * @param int               $string_id   String.
+	 * @param int               $language_id Language.
+	 * @param int               $group_id    String group.
+	 * @param string|null       $text        Form 1 wanted.
+	 * @param string|false|null $forms       extra_forms wanted; false: not compared.
+	 * @param string|null       $status      Link status the unit sets; null: never taken as set.
+	 * @param SourceType        $label       Link source the unit sets.
+	 * @return int|false
+	 */
+	private static function same_cell( int $string_id, int $language_id, int $group_id, ?string $text, string|false|null $forms, ?string $status, SourceType $label ): int|false {
+		$now = self::now( $string_id, $language_id, true );
+
+		if ( false === $now ) {
+			return false;
+		}
+
+		if ( ! self::as_wanted( $now, $text, $forms ) ) {
+			return 0;
+		}
+
+		$wpdb = Typed::wpdb();
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Inside the unit; the lock suffix is a literal.
+		$link = $wpdb->get_row( $wpdb->prepare( 'SELECT object_id, status, source FROM %i WHERE group_id = %d AND language_id = %d' . ConnectionGuard::lock_suffix(), Schema::table( 'translation_links' ), $group_id, $language_id ), ARRAY_A );
+
+		if ( '' !== $wpdb->last_error ) {
+			return false;
+		}
+
+		$set = null !== $status && is_array( $link ) && [ $string_id, $status, $label->value ] === [ Typed::int( $link['object_id'] ?? 0 ), Typed::str( $link['status'] ?? '' ), Typed::str( $link['source'] ?? '' ) ];
+
+		return $set ? 0 : 1;
 	}
 
 	/**
@@ -460,9 +710,10 @@ final class StringCellWrite {
 	 * @param int                        $language_id Language.
 	 * @param string|null                $text        Form 1 wanted; null: no row.
 	 * @param string|false|null          $forms       extra_forms wanted; false: not compared.
+	 * @param SourceType                 $label       Label the unit sets on the link.
 	 * @return string
 	 */
-	private static function retried( TranslationGroupRepository $repo, string $first, string $outcome, int $group_id, int $string_id, int $language_id, ?string $text, string|false|null $forms ): string {
+	private static function retried( TranslationGroupRepository $repo, string $first, string $outcome, int $group_id, int $string_id, int $language_id, ?string $text, string|false|null $forms, SourceType $label ): string {
 		$last    = $outcome;
 		$outcome = self::unsure( $last ) ? 'failed' : $last;
 
@@ -478,7 +729,7 @@ final class StringCellWrite {
 			return $outcome;
 		}
 
-		StringLinkLabel::reconciled( $repo, $group_id, $string_id, $language_id, 'unsure_label' === $first || 'unsure_label' === $last ? SourceType::Manual : null );
+		StringLinkLabel::reconciled( $repo, $group_id, $string_id, $language_id, 'unsure_label' === $first || 'unsure_label' === $last ? $label : null );
 
 		return null === $text || self::has_link( $group_id, $language_id ) ? 'saved' : 'unlinked';
 	}

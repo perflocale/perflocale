@@ -14,10 +14,11 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * The `migrate_to_N()` steps UpgradeRunner runs before dbDelta when the stored DB version is below N.
+ * The `migrate_to_N()` steps UpgradeRunner runs before dbDelta when the stored DB version is below N; a step returns ''
+ * or why it stopped (then no dbDelta, no stamp).
  *
- * None on the v1 schema. Each step must be safe to run twice (MySQL DDL cannot roll back): UpgradeIdempotencyTest
- * runs every step twice and compares the schema.
+ * None so far: v2 adds tables only (dbDelta). Each step must be safe to run twice (MySQL DDL cannot roll back):
+ * UpgradeIdempotencyTest runs every step twice and compares the schema.
  *
  * @since 1.0.7.5
  */

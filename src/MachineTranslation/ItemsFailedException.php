@@ -68,7 +68,7 @@ final class ItemsFailedException extends \RuntimeException {
 		$chars = 0;
 
 		for ( $i = $first; $i <= $last; $i++ ) {
-			$chars += mb_strlen( $sent[ $i ] ?? '' );
+			$chars += \PerfLocale\Util\Utf8::length( $sent[ $i ] ?? '' );
 		}
 
 		/* translators: %s: number of characters */

@@ -18,7 +18,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Redirects first-time visitors to their country's language, using a GeoIP provider a site registers by filter.
+ * Redirects first-time visitors to their country's language, from a CDN or server header (GeoHeaderSource) or a registered provider.
  */
 final class GeoRedirect {
 
@@ -92,7 +92,7 @@ final class GeoRedirect {
 	];
 
 	/**
-	 * Built-in GeoIP provider definitions: none ship, sites add theirs through perflocale/geo/providers.
+	 * Built-in IP provider definitions: none ship (header sources are GeoHeaderSource); sites add theirs by filter.
 	 *
 	 * @var array<string, array{name: string, needs_key: bool, key_setting: string}>
 	 */
@@ -198,12 +198,12 @@ final class GeoRedirect {
 		}
 
 		// No 302 for feeds and the like (a cookieless poller would flip a feed's language).
-		// URL-derived checks stay above nocache_headers(), so these responses stay cacheable.
+		// URL-derived checks stay above the no-store point, so these responses stay cacheable.
 		if ( is_feed() || is_trackback() || is_robots() || is_favicon() ) {
 			return;
 		}
 
-		// Without a language cookie the redirect would repeat on every page. Config-derived: above nocache_headers().
+		// Without a language cookie the redirect would repeat on every page. Config-derived: above the no-store point.
 		if ( $this->router->language_cookie_never_written() ) {
 			return;
 		}
@@ -213,14 +213,10 @@ final class GeoRedirect {
 			return;
 		}
 
-		// From here the 302-or-200 answer depends on the visitor, so a cached 200 would end the redirect for everyone:
-		// no-cache before every visitor-specific decline below. The edge worker (assets/js/edge-helper.js) keeps both.
-		if ( $this->router->is_default_language() && ! headers_sent() ) {
-			nocache_headers();
-		}
+		// First-time, non-bot visitor on a default-language page, no earlier verdict; that answer is made no-store.
+		require_once __DIR__ . '/Redirect/FirstVisit.php';
 
-		// Only first-time visitors (no cookie yet).
-		if ( isset( $_COOKIE['perflocale_lang'] ) ) {
+		if ( ! Redirect\FirstVisit::steerable( $this->router ) ) {
 			return;
 		}
 
@@ -237,18 +233,6 @@ final class GeoRedirect {
 		// Redirect fuse: skip if we already redirected this navigation step.
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
 		if ( ! empty( $_GET['perflocale_redirected'] ) ) {
-			return;
-		}
-
-		// Only when URL resolved to the default language.
-		if ( ! $this->router->is_default_language() ) {
-			return;
-		}
-
-		// Skip bots: LanguageRouter::is_bot_ua() is the one detection pattern.
-		$ua = sanitize_text_field( wp_unslash( $_SERVER['HTTP_USER_AGENT'] ?? '' ) );
-
-		if ( \PerfLocale\Router\LanguageRouter::is_bot_ua( $ua ) ) {
 			return;
 		}
 
@@ -270,8 +254,8 @@ final class GeoRedirect {
 		/** @hook perflocale/geo/visitor_ip Override the visitor IP (useful for testing on localhost). */
 		$ip = (string) apply_filters( 'perflocale/geo/visitor_ip', $ip );
 
-		// Skip local/private IPs unless the IP was overridden via filter.
-		if ( $ip === '' || ( $ip === $real_ip && $this->is_local_ip( $ip ) ) ) {
+		// Skip local/private IPs unless overridden; a header source sends no IP and may sit behind a private peer.
+		if ( $ip === '' || ( $ip === $real_ip && ! $this->header_source() && $this->is_local_ip( $ip ) ) ) {
 			return;
 		}
 
@@ -299,16 +283,17 @@ final class GeoRedirect {
 			return;
 		}
 
-		// Check that the language is active and not the default.
-		$default = $this->router->get_default_language();
-
-		if ( $default && $language_slug === $default->slug ) {
-			return;
-		}
-
+		// Check that the language is active and not the default; an active language is this request's verdict.
+		$default  = $this->router->get_default_language();
 		$slug_map = $this->get_slug_map();
 
 		if ( ! isset( $slug_map[ $language_slug ] ) ) {
+			return;
+		}
+
+		Redirect\FirstVisit::decide();
+
+		if ( $default && $language_slug === $default->slug ) {
 			return;
 		}
 
@@ -324,7 +309,7 @@ final class GeoRedirect {
 
 		// The shared builder: REQUEST_URI holds the home path, so home_url() around it doubles a subfolder prefix.
 		$current_url  = \PerfLocale\Router\LanguageRouter::current_request_url();
-		$redirect_url = $converter->convert( $current_url, $language_slug );
+		$redirect_url = $converter->convert( Redirect\FirstVisit::unpaged( $current_url ), $language_slug );
 
 		if ( $redirect_url === '' || $redirect_url === $current_url ) {
 			return;
@@ -336,62 +321,56 @@ final class GeoRedirect {
 			return;
 		}
 
-		// Set cookie before redirect.
-		$this->router->set_language_cookie_public( $language_slug );
-
-		/** @hook perflocale/geo/redirected Fires after a GeoIP redirect. */
-		do_action( 'perflocale/geo/redirected', $language_slug, $country_code, $ip );
-
-		// Append a sentinel so even cookie-blocked browsers don't redirect twice.
+		// Sentinel so even cookie-blocked browsers don't redirect twice. The cookie and perflocale/geo/redirected
+		// follow a successful send.
 		$redirect_url = add_query_arg( 'perflocale_redirected', '1', $redirect_url );
 
-		// Domain mode: allow the target host, or wp_safe_redirect() falls back to /wp-admin/.
-		$this->allow_redirect_host( $redirect_url );
-
-		// A cache that stores 3xx (Varnish, nginx) would otherwise pin one visitor's 302 on everyone.
-		nocache_headers();
-		wp_safe_redirect( $redirect_url, 302 );
-		exit;
-	}
-
-	/**
-	 * Whitelist a redirect target's host for one wp_safe_redirect() call.
-	 *
-	 * @param string $url Redirect target URL.
-	 * @return void
-	 */
-	private function allow_redirect_host( string $url ): void {
-		$host = wp_parse_url( $url, PHP_URL_HOST );
-
-		if ( ! is_string( $host ) || $host === '' ) {
-			return;
-		}
-
-		add_filter(
-			'allowed_redirect_hosts',
-			static function ( array $hosts ) use ( $host ): array {
-				$hosts[] = $host;
-
-				return $hosts;
-			}
+		Redirect\Sender::to(
+			$redirect_url,
+			302,
+			'geo',
+			[
+				'cookie' => $language_slug,
+				'after'  => [ 'perflocale/geo/redirected', [ $language_slug, $country_code, $ip ] ],
+			]
 		);
 	}
 
 	/**
 	 * Look up the country code for an IP address.
 	 *
-	 * The cache first, then perflocale/geo/lookup_country, then the configured provider.
+	 * A header source: the filter, then the header. Otherwise the cache, then the filter, then the provider.
 	 *
 	 * @param string $ip Visitor IP address.
 	 * @return string Two-letter country code (uppercase) or empty string.
 	 */
 	private function lookup_country( string $ip ): string {
+		if ( $this->header_source() ) {
+			// Read per request: no cache (keyed by REMOTE_ADDR, a CDN edge here) and no breaker. The filter still wins.
+			$filtered = apply_filters( 'perflocale/geo/lookup_country', '', $ip );
+			$id       = $this->provider_id();
+
+			if ( is_string( $filtered ) && $filtered !== '' ) {
+				$country = $filtered;
+			} elseif ( $this->header_peer_trusted( $id ) ) {
+				require_once __DIR__ . '/GeoHeaderSource.php';
+				$country = GeoHeaderSource::country( $id );
+			} else {
+				$country = '';
+			}
+
+			return strtoupper( sanitize_key( $country ) );
+		}
+
 		// Privacy: key on a salted HMAC of the anonymized /24 (or v6 prefix), never the IP; a hashed IP is reversible.
 		$anon      = function_exists( 'wp_privacy_anonymize_ip' ) ? wp_privacy_anonymize_ip( $ip ) : $ip;
 		$cache_key = 'ip_' . hash_hmac( 'sha256', (string) $anon, wp_salt( 'auth' ) );
 		$cache     = $this->cache();
 
-		if ( $cache instanceof CacheManager ) {
+		// 0 hours: no read and no write, so a country stored under an earlier cache time is not used.
+		$cache_hours = (int) $this->settings->get( 'geo_cache_hours', 24 );
+
+		if ( $cache_hours > 0 && $cache instanceof CacheManager ) {
 			// get_cached(), not get(): a miss writes nothing, so unseen IPs add no rows.
 			$cached = $cache->get_cached( $cache_key, 'perflocale_geo_lookup' );
 
@@ -414,9 +393,6 @@ final class GeoRedirect {
 		}
 
 		$country_code = strtoupper( sanitize_key( $country_code ) );
-
-		// 0 hours: no cache, every request asks the provider.
-		$cache_hours = (int) $this->settings->get( 'geo_cache_hours', 24 );
 
 		if ( $cache_hours > 0 && $country_code !== '' && $cache instanceof CacheManager ) {
 			// Positive results only: negative rows per client network would fill wp_options; the breaker keeps retries cheap.
@@ -530,6 +506,59 @@ final class GeoRedirect {
 		}
 
 		return '';
+	}
+
+	/**
+	 * Whether geo_provider is a built-in header source; the ids of GeoHeaderSource, written out: no class load.
+	 * A provider the site registers under the same id wins, as it did before the header sources.
+	 *
+	 * @return bool
+	 */
+	private function header_source(): bool {
+		$id = $this->provider_id();
+
+		return in_array( $id, [ 'header_cloudflare', 'header_cloudfront', 'header_server' ], true ) && ! isset( self::get_providers()[ $id ] );
+	}
+
+	/**
+	 * Whether this request's peer may set the selected source's header.
+	 * A CDN header counts only from that CDN (Cloudflare's published ranges) or a geo_trusted_proxies peer: a client
+	 * reaching the origin directly can send any value. Server variables have no HTTP_ form, so no client sets them.
+	 *
+	 * @param string $id Selected header source id.
+	 * @return bool
+	 */
+	private function header_peer_trusted( string $id ): bool {
+		if ( $id === 'header_server' ) {
+			return true;
+		}
+
+		$peer = $_SERVER['REMOTE_ADDR'] ?? ''; // phpcs:ignore WordPress.Security.ValidatedSanitizedInput -- server-set; only inet_pton() reads it.
+		$peer = is_string( $peer ) ? $peer : '';
+
+		return ( $id === 'header_cloudflare' && $this->is_cloudflare_ip( $peer ) ) || $this->is_request_from_trusted_proxy( $peer );
+	}
+
+	/**
+	 * Whether Cloudflare's headers reach this request from a peer the Cloudflare source never trusts (Site Health hint).
+	 *
+	 * @return bool
+	 */
+	public function cloudflare_header_untrusted(): bool {
+		return $this->provider_id() === 'header_cloudflare' && $this->header_source()
+			&& ( isset( $_SERVER['HTTP_CF_IPCOUNTRY'] ) || isset( $_SERVER['HTTP_CF_RAY'] ) )
+			&& ! $this->header_peer_trusted( 'header_cloudflare' );
+	}
+
+	/**
+	 * The stored geo_provider id.
+	 *
+	 * @return string
+	 */
+	private function provider_id(): string {
+		$id = $this->settings->get( 'geo_provider', '' );
+
+		return is_string( $id ) ? $id : '';
 	}
 
 	/**
@@ -718,12 +747,22 @@ final class GeoRedirect {
 			[ $subnet, $bits ] = array_pad( explode( '/', $cidr, 2 ), 2, null );
 
 			$subnet_packed = @inet_pton( (string) $subnet ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- same false-on-invalid contract.
-			if ( $subnet_packed === false || strlen( $subnet_packed ) !== strlen( $remote_packed ) ) {
+			$total_bits    = $subnet_packed === false ? 0 : strlen( $subnet_packed ) * 8;
+
+			// A malformed prefix is refused, never read as /0 ((int) 'abc' is 0: every peer trusted).
+			if ( $subnet_packed === false || ( $bits !== null && ( preg_match( '/\A\d{1,3}\z/', $bits ) !== 1 || (int) $bits > $total_bits ) ) ) {
+				if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+					error_log( sprintf( 'PerfLocale GeoIP: geo_trusted_proxies entry "%s" ignored: not an IP address or IP/prefix.', $cidr ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+				}
+
 				continue;
 			}
 
-			$total_bits = strlen( $subnet_packed ) * 8;
-			$bits       = $bits === null ? $total_bits : max( 0, min( $total_bits, (int) $bits ) );
+			if ( strlen( $subnet_packed ) !== strlen( $remote_packed ) ) {
+				continue;
+			}
+
+			$bits = $bits === null ? $total_bits : (int) $bits;
 
 			if ( $this->packed_ip_in_subnet( $remote_packed, $subnet_packed, $bits ) ) {
 				return true;
@@ -812,7 +851,7 @@ final class GeoRedirect {
 	/**
 	 * Get the available provider definitions.
 	 *
-	 * No providers ship: the same perflocale/geo/providers filter as the lookup path, so the Settings picker agrees.
+	 * Filter-registered IP providers only (header sources: GeoHeaderSource::labels()), as the lookup path reads them.
 	 *
 	 * @return array<string, array<string, mixed>>
 	 */

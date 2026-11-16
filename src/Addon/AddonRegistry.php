@@ -350,7 +350,7 @@ final class AddonRegistry {
 				}
 			} catch ( \Throwable $e ) {
 				if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
-					error_log( sprintf( 'PerfLocale addon manifest compat check for "%s" threw: %s', $id, $e->getMessage() ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+					error_log( sprintf( 'PerfLocale addon manifest compat check for "%s" threw: %s', $id, \PerfLocale\Database\UpgradeRunner::describe( $e ) ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
 				}
 				continue;
 			}
@@ -713,15 +713,12 @@ final class AddonRegistry {
 				$failure_changed = true;
 
 				// Persisted so the Addons page can show the cause on the card.
-				AddonMigrationErrors::record(
-					$id,
-					'boot',
-					(int) $failures[ $id ],
-					\PerfLocale\Util\PathRedactor::redact( $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine() )
-				);
+				// The class and place, never the add-on's message (it can carry data or credentials).
+				$cause = \PerfLocale\Database\UpgradeRunner::describe( $e );
+				AddonMigrationErrors::record( $id, 'boot', (int) $failures[ $id ], $cause );
 
 				if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
-					error_log( sprintf( 'PerfLocale addon %s failed to boot (%d/%d): %s in %s:%d', $id, $failures[ $id ], self::failure_threshold(), $e->getMessage(), $e->getFile(), $e->getLine() ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+					error_log( sprintf( 'PerfLocale addon %s failed to boot (%d/%d): %s', $id, $failures[ $id ], self::failure_threshold(), $cause ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
 				}
 			}
 		}
@@ -1045,7 +1042,7 @@ final class AddonRegistry {
 					sprintf(
 						'PerfLocale: get_settings_fields() threw for addon "%s" during default-seeding: %s',
 						$id,
-						$e->getMessage()
+						\PerfLocale\Database\UpgradeRunner::describe( $e )
 					)
 				);
 			}

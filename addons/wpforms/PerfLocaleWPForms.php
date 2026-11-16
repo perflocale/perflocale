@@ -163,10 +163,10 @@ final class PerfLocaleWPForms implements \PerfLocale\Addon\AddonInterface {
 	 *
 	 * Reuses the metabox handle, so Helper's `perflocale*` pass adds the RTL twin.
 	 *
-	 * @param string $hook_suffix Current admin page's hook suffix.
+	 * @param mixed $hook_suffix Current admin page's hook suffix (mixed: iframe_header() passes null outside admin.php).
 	 * @return void
 	 */
-	public function enqueue_panel_styles( string $hook_suffix ): void {
+	public function enqueue_panel_styles( mixed $hook_suffix ): void {
 		// The builder's hook suffix, as WPForms itself pins it.
 		if ( $hook_suffix !== 'wpforms_page_wpforms-builder' ) {
 			return;

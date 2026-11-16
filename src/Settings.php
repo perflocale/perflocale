@@ -21,7 +21,7 @@ final class Settings {
 	/**
 	 * Option key in wp_options.
 	 */
-	private const OPTION_KEY = 'perflocale_settings';
+	public const OPTION_KEY = 'perflocale_settings';
 
 	/**
 	 * Default values for all settings.
@@ -42,7 +42,7 @@ final class Settings {
 		// Redirect to the edge worker's language hint; needs `edge_integration_enabled` too.
 		'redirect_edge_hint_enabled'     => false,
 		// First entry wins: it registers earlier on `template_redirect`.
-		'redirect_priority_order'        => [ 'geo', 'browser', 'edge_hint' ],
+		'redirect_priority_order'        => [ 'browser', 'geo', 'edge_hint' ],
 		'geo_provider'                   => '',
 		'geo_country_map'                => [],
 		'geo_cache_hours'                => 24,
@@ -63,6 +63,14 @@ final class Settings {
 		'sync_fields'                    => [ 'featured_image', 'menu_order' ],
 		'sync_term_hierarchy'            => true,
 		'translate_slugs'                => true,
+		// Content ReSync (ResyncSettings): on/off (Util\ResyncSwitch), types left out (empty = all), who fills changed
+		// parts, near-match threshold, keep a translation's own blocks, hold a change to a person's block always or once.
+		'resync_enabled'                 => false,
+		'resync_excluded'                => [],
+		'resync_changed_parts'           => 'source',
+		'resync_match_threshold'         => 100,
+		'resync_keep_exceptions'         => true,
+		'resync_person_blocks'           => 'always',
 
 		// Machine Translation.
 		'mt_enabled'                     => false,
@@ -77,6 +85,7 @@ final class Settings {
 		'mt_agency_url'                  => '',
 		'mt_agency_api_key'              => '',
 		'mt_agency_batch'                => false,
+		'mt_agency_max_chars'            => 0,
 		'mt_auto_translate_on_publish'   => false,
 		// Both auto-translate flows; empty = every active language, including later ones.
 		'mt_auto_translate_languages'    => [],
@@ -88,7 +97,14 @@ final class Settings {
 		'mt_enforce_cap_on_bulk'         => true,
 		// MT of SEO meta is cheap (on); custom fields scale with the site (opt-in).
 		'mt_meta_seo'                    => true,
+		// SEO focus keywords (Rank Math, Yoast): opt-in, and only with mt_meta_seo on.
+		'mt_meta_seo_keywords'           => false,
 		'mt_meta_custom_fields'          => false,
+		// Context sent with each piece (MachineTranslation\ContextSettings): off, neighbours or section; its size bounds.
+		'mt_context_mode'                => 'off',
+		'mt_context_neighbours'          => 2,
+		'mt_context_previous'            => true,
+		'mt_context_max_chars'           => 1500,
 
 		// SEO.
 		'seo_hreflang_enabled'           => true,
@@ -487,70 +503,12 @@ final class Settings {
 	 */
 	private static array $last_update_refused = [];
 
-	/**
-	 * Writes update() tries; each lost compare-and-set re-reads the row.
-	 */
-	private const WRITE_ATTEMPTS = 5;
-
 	public function update( array $values ): bool {
 		self::$last_update_refused  = [];
 		self::$last_update_was_noop = false;
 		\PerfLocale\Util\OutboundUrl::forget_refusal();
 
-		$sanitized = $this->sanitize( $values );
-
-		// Locked read-modify-write: concurrent saves would overwrite each other's keys.
-		$result = \PerfLocale\Concurrency\Lock::with(
-			'settings_update',
-			10,
-			function () use ( $sanitized ): array {
-				// Fresh read plus compare-and-set: see docs-ai/11-code-rationale.md, "Settings: update read and write".
-				$expected = false;
-
-				for ( $attempt = 0; ; $attempt++ ) {
-					$this->reset_cache();
-					wp_cache_delete( self::OPTION_KEY, 'options' );
-					wp_cache_delete( 'alloptions', 'options' );
-
-					$current               = $this->load();
-					[ $applied, $refused ] = \PerfLocale\Util\OutboundUrl::provider_address_rules( $this, $current, $sanitized );
-					$merged                = array_merge( $current, $applied );
-
-					self::$last_update_refused = $refused;
-
-					// Later attempts compare against the row itself: a filtered value costs one attempt only.
-					$written = $this->write_row( $merged, $expected );
-
-					if ( null !== $written || $attempt + 1 >= self::WRITE_ATTEMPTS ) {
-						break;
-					}
-
-					$expected = self::stored_row();
-				}
-
-				$saved = true === $written;
-
-				// Memo only what is stored: a failed write must not leave get() ahead of the database.
-				if ( (bool) $saved ) {
-					$this->settings = $merged;
-				} elseif ( $merged === $current ) {
-					// A no-op save: the merged value is already stored.
-					$this->settings = $merged;
-				}
-
-				// Flush rewrite rules only when a URL-affecting setting changed.
-				if ( (bool) $saved && $this->url_affecting_change( $current, $merged ) ) {
-					update_option( 'perflocale_flush_rules', 1, false );
-				}
-
-				return [
-					'ok'      => (bool) $saved,
-					'noop'    => $merged === $current,
-					'merged'  => $merged,
-					'current' => $current,
-				];
-			}
-		);
+		$result = $this->writer()->update( $this->sanitize( $values ) );
 
 		self::$last_update_was_busy = null === $result;
 
@@ -559,51 +517,29 @@ final class Settings {
 			return false;
 		}
 
-		self::$last_update_was_noop = (bool) ( $result['noop'] ?? false );
+		self::$last_update_refused  = $result['refused'];
+		self::$last_update_was_noop = $result['noop'];
 
 		/** @hook perflocale/settings/updated Fires after settings are saved. */
 		do_action( 'perflocale/settings/updated', $result['merged'], $result['current'] );
 
-		return (bool) $result['ok'];
+		return $result['ok'];
 	}
 
 	/**
-	 * The settings row's bytes read from the database, past any cache; null when there is no row.
+	 * The writer behind update() and sanitize(), loaded on first use.
 	 *
-	 * @return string|null
+	 * @return Util\SettingsWriter
 	 */
-	private static function stored_row(): ?string {
-		global $wpdb;
-
-		if ( ! $wpdb instanceof \wpdb ) {
-			return null;
-		}
-
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The row itself, past any cached copy.
-		$row = $wpdb->get_var( $wpdb->prepare( 'SELECT option_value FROM %i WHERE option_name = %s LIMIT 1', $wpdb->options, self::OPTION_KEY ) );
-
-		return is_string( $row ) ? $row : null;
+	private function writer(): Util\SettingsWriter {
+		return new Util\SettingsWriter(
+			$this,
+			fn(): array => $this->load(),
+			function ( array $merged ): void {
+				$this->settings = $merged;
+			}
+		);
 	}
-
-	/**
-	 * Write the merged settings as update_option() would, but only while the row still holds $expected.
-	 *
-	 * @param array<string, mixed> $merged   Settings to store.
-	 * @param string|false|null    $expected The row's bytes the merge was built from; false: the
-	 *                                       value get_option() serves, serialized; null: no row.
-	 * @return bool|null True when written; false when there was nothing to write; null when the
-	 *                   row did not hold $expected (or the write failed).
-	 */
-	private function write_row( array $merged, $expected ): ?bool {
-		$old_value = get_option( self::OPTION_KEY );
-
-		if ( false === $expected ) {
-			$expected = false === $old_value ? null : \PerfLocale\Database\OptionWriter::bytes( $old_value );
-		}
-
-		return \PerfLocale\Database\OptionWriter::compare_and_set( self::OPTION_KEY, $merged, $old_value, $expected, true );
-	}
-
 
 	/**
 	 * Provider address settings whose change the last update() refused (see OutboundUrl::provider_address_rules()).
@@ -631,230 +567,13 @@ final class Settings {
 	}
 
 	/**
-	 * Keys that, when changed, require a rewrite-rule flush.
-	 *
-	 * @var array<int, string>
-	 */
-	private const URL_AFFECTING_KEYS = [
-		'url_mode',
-		'url_prefix_type',
-		'hide_default_prefix',
-		'translatable_post_types',
-		'translatable_taxonomies',
-		'translate_slugs',
-		'language_domains',
-		'excluded_paths',
-	];
-
-	/**
-	 * Whether any URL-affecting setting changed between two snapshots.
-	 *
-	 * @param array<string, mixed> $before Previous settings.
-	 * @param array<string, mixed> $after New settings (merged).
-	 * @return bool
-	 */
-	private function url_affecting_change( array $before, array $after ): bool {
-		foreach ( self::URL_AFFECTING_KEYS as $key ) {
-			if ( ( $before[ $key ] ?? null ) !== ( $after[ $key ] ?? null ) ) {
-				return true;
-			}
-		}
-
-		return false;
-	}
-
-	/**
-	 * Sanitize setting values.
+	 * Sanitize setting values (Util\SettingsWriter::sanitize()).
 	 *
 	 * @param array<string, mixed> $values Raw values.
 	 * @return array<string, mixed> Sanitized values.
 	 */
 	private function sanitize( array $values ): array {
-		$sanitized = [];
-
-		foreach ( $values as $key => $value ) {
-			// Only allow known keys.
-			if ( ! array_key_exists( $key, self::DEFAULTS ) ) {
-				_doing_it_wrong(
-					__METHOD__,
-					esc_html(
-						sprintf(
-							/* translators: %s is the unknown settings key being silently dropped. */
-							__( 'Settings::update() received unknown key "%s" - silently dropped. Verify the key against Settings::DEFAULTS, or extend the schema.', 'perflocale' ),
-							(string) $key
-						)
-					),
-					'1.0.0'
-				);
-				continue;
-			}
-
-			// An overridden key is not stored: the override would win on the next read.
-			if ( $this->is_overridden( $key ) ) {
-				continue;
-			}
-
-			// HTML-safe keys that use wp_kses_post instead of sanitize_text_field.
-			$is_html_key = false;
-
-			// Nested maps: the flat-array branch would turn each row into the string "Array".
-			$is_nested_array = in_array( $key, [ 'wc_currencies', 'language_fallbacks' ], true );
-
-			$sanitized[ $key ] = match ( true ) {
-				$is_nested_array => $this->sanitize_nested_array( $key, (array) $value ),
-				is_bool( self::DEFAULTS[ $key ] ) => (bool) $value,
-				is_int( self::DEFAULTS[ $key ] ) => absint( $value ),
-				is_array( self::DEFAULTS[ $key ] ) => $this->sanitize_flat_array( (array) $value ),
-				$is_html_key => wp_kses_post( (string) $value ),
-				is_string( self::DEFAULTS[ $key ] ) => sanitize_text_field( (string) $value ),
-				default => $value,
-			};
-		}
-
-		return $sanitized;
-	}
-
-	/**
-	 * Sanitize a flat settings array, keys included, and drop non-scalar values.
-	 *
-	 * String keys are slugs: sanitize_key() stops a crafted POST storing arbitrary bytes as option keys.
-	 *
-	 * @param array<int|string, mixed> $value Raw array.
-	 * @return array<int|string, string> Sanitized array.
-	 */
-	private function sanitize_flat_array( array $value ): array {
-		$out = [];
-
-		foreach ( $value as $k => $v ) {
-			if ( is_string( $k ) ) {
-				$k = sanitize_key( $k );
-
-				if ( $k === '' ) {
-					continue;
-				}
-			}
-
-			if ( ! is_scalar( $v ) ) {
-				continue;
-			}
-
-			$out[ $k ] = sanitize_text_field( (string) $v );
-		}
-
-		return $out;
-	}
-
-	/**
-	 * Sanitize a nested settings array with the sanitizer for its key.
-	 *
-	 * @param string               $key Setting key.
-	 * @param array<string, mixed> $value Raw value array.
-	 * @return array<string, mixed> Sanitized array.
-	 */
-	private function sanitize_nested_array( string $key, array $value ): array {
-		if ( $key === 'wc_currencies' ) {
-			return $this->sanitize_wc_currencies( $value );
-		}
-
-		if ( $key === 'language_fallbacks' ) {
-			return $this->sanitize_language_fallbacks( $value );
-		}
-
-		return [];
-	}
-
-	/**
-	 * Sanitize the fallback map: no self-references, empties or duplicates; chains clipped to MAX_FALLBACK_DEPTH.
-	 *
-	 * @param array<string, mixed> $raw Raw input.
-	 * @return array<string, array<int, string>>
-	 */
-	private function sanitize_language_fallbacks( array $raw ): array {
-		$out = [];
-
-		foreach ( $raw as $slug => $list ) {
-			$slug = sanitize_key( (string) $slug );
-
-			if ( $slug === '' ) {
-				continue;
-			}
-
-			if ( ! is_array( $list ) ) {
-				continue;
-			}
-
-			$clean = [];
-
-			foreach ( $list as $entry ) {
-				$entry = sanitize_key( (string) $entry );
-
-				if ( $entry === '' || $entry === $slug ) {
-					continue;
-				}
-
-				if ( in_array( $entry, $clean, true ) ) {
-					continue;
-				}
-
-				$clean[] = $entry;
-
-				if ( count( $clean ) >= self::MAX_FALLBACK_DEPTH ) {
-					break;
-				}
-			}
-
-			if ( $clean !== [] ) {
-				$out[ $slug ] = $clean;
-			}
-		}
-
-		return $out;
-	}
-
-	/**
-	 * Sanitize the per-language currency configuration array.
-	 *
-	 * Expected input: `[ 'de' => [ 'currency_code' => 'EUR', 'exchange_rate' => '1.2' ], ... ]`
-	 *
-	 * @param array<string, mixed> $raw Raw input.
-	 * @return array<string, array{currency_code: string, exchange_rate: float}> Sanitized currencies.
-	 */
-	private function sanitize_wc_currencies( array $raw ): array {
-		$out = [];
-
-		// The stored rows: a refused rate keeps the stored rate of its row.
-		$stored = (array) $this->get( 'wc_currencies', [] );
-
-		foreach ( $raw as $slug => $data ) {
-			$slug = sanitize_key( (string) $slug );
-
-			if ( $slug === '' || ! is_array( $data ) ) {
-				continue;
-			}
-
-			// Validated, never byte-truncated: half a UTF-8 character makes wpdb refuse the whole settings write.
-			$raw_code = sanitize_text_field( (string) ( $data['currency_code'] ?? '' ) );
-			$code     = preg_match( '/^[A-Za-z]{3}$/', $raw_code ) === 1 ? strtoupper( $raw_code ) : '';
-
-			if ( $code === '' ) {
-				continue;
-			}
-
-			$display  = sanitize_key( (string) ( $data['display'] ?? 'symbol' ) );
-			$position = sanitize_key( (string) ( $data['position'] ?? 'default' ) );
-
-			$out[ $slug ] = [
-				'currency_code' => $code,
-				// Not a finite number above zero: refused (rate_to_store()).
-				'exchange_rate' => \PerfLocale\WooCommerce\MultiCurrency::rate_to_store( $data['exchange_rate'] ?? 1.0, $stored[ $slug ] ?? null, $code ),
-				// Pins this currency's rate against auto-sync.
-				'manual_rate'   => ! empty( $data['manual_rate'] ),
-				'display'       => in_array( $display, [ 'symbol', 'code' ], true ) ? $display : 'symbol',
-				'position'      => in_array( $position, [ 'default', 'left', 'left_space', 'right', 'right_space' ], true ) ? $position : 'default',
-			];
-		}
-
-		return $out;
+		return $this->writer()->sanitize( $values );
 	}
 
 	/**
@@ -864,6 +583,24 @@ final class Settings {
 	 */
 	public function get_defaults(): array {
 		return self::DEFAULTS;
+	}
+
+	/**
+	 * Watch the row from the first instance on, so no read can precede the watcher.
+	 */
+	public function __construct() {
+		self::watch_row();
+	}
+
+	/**
+	 * Reset the shared memos (Settings, ResyncSwitch) after the row is added, saved or deleted.
+	 *
+	 * @return void
+	 */
+	public static function watch_row(): void {
+		foreach ( [ 'add', 'update', 'delete' ] as $op ) {
+			add_action( $op . '_option_' . self::OPTION_KEY, [ BootstrapWrites::class, 'reset_settings_memo' ], 1 );
+		}
 	}
 
 	/**
@@ -1198,12 +935,19 @@ final class Settings {
 	}
 
 	/**
-	 * Get the action when a translation is missing.
+	 * Values of missing_translation_action.
+	 */
+	public const MISSING_ACTIONS = [ 'show_default', 'show_default_noindex', 'show_404', 'redirect_default' ];
+
+	/**
+	 * Get the action when a translation is missing; an unknown stored value reads as show_default.
 	 *
-	 * @return string 'show_default', 'show_404', or 'redirect_default'.
+	 * @return string One of MISSING_ACTIONS.
 	 */
 	public function get_missing_translation_action(): string {
-		return (string) $this->get( 'missing_translation_action' );
+		$action = $this->get( 'missing_translation_action' );
+
+		return is_string( $action ) && in_array( $action, self::MISSING_ACTIONS, true ) ? $action : 'show_default';
 	}
 
 	/**

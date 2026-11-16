@@ -24,27 +24,27 @@ final class ClassicStructureGuard {
 	 * Comments, script/style elements, declarations and tags; a `>` inside a quoted attribute does not end a tag.
 	 * In a tag only a `<` that cannot start one (a quoted `A < B`), so a stray `<` costs one short scan.
 	 */
-	private const TOKEN = '/<!--.*?-->|<(script|style)\b(?:[^<>"\']++|"(?:[^"<]++|<(?![a-z\/!?]))*+"|\'(?:[^\'<]++|<(?![a-z\/!?]))*+\')*+>.*?<\/\1\s*>|<(\/?)([a-z][a-z0-9:-]*+)((?:[^<>"\']++|"(?:[^"<]++|<(?![a-z\/!?]))*+"|\'(?:[^\'<]++|<(?![a-z\/!?]))*+\')*+)>|<!(?!--)[^<>]*+>|<\?[^<>]*+>/is';
+	public const TOKEN = '/<!--.*?-->|<(script|style)\b(?:[^<>"\']++|"(?:[^"<]++|<(?![a-z\/!?]))*+"|\'(?:[^\'<]++|<(?![a-z\/!?]))*+\')*+>.*?<\/\1\s*>|<(\/?)([a-z][a-z0-9:-]*+)((?:[^<>"\']++|"(?:[^"<]++|<(?![a-z\/!?]))*+"|\'(?:[^\'<]++|<(?![a-z\/!?]))*+\')*+)>|<!(?!--)[^<>]*+>|<\?[^<>]*+>/is';
 
 	/**
 	 * Elements whose order a translation keeps, space-delimited.
 	 */
-	private const STRUCTURAL = ' address article aside blockquote caption center dd details dialog div dl dt fieldset figcaption figure footer form h1 h2 h3 h4 h5 h6 header hgroup hr li main nav ol p pre section summary table tbody td tfoot th thead tr ul ';
+	public const STRUCTURAL = ' address article aside blockquote caption center dd details dialog div dl dt fieldset figcaption figure footer form h1 h2 h3 h4 h5 h6 header hgroup hr li main nav ol p pre section summary table tbody td tfoot th thead tr ul ';
 
 	/**
 	 * Elements without a closing tag, space-delimited.
 	 */
-	private const VOID = ' area base br col embed hr img input link meta param source track wbr ';
+	public const VOID = ' area base br col embed hr img input link meta param source track wbr ';
 
 	/**
 	 * Elements whose end tag HTML may omit, space-delimited: closed by the end of an element around them.
 	 */
-	private const OPTIONAL_END = ' caption colgroup dd dt li optgroup option p rb rp rt rtc td tfoot th thead tr ';
+	public const OPTIONAL_END = ' caption colgroup dd dt li optgroup option p rb rp rt rtc td tfoot th thead tr ';
 
 	/**
 	 * Start tag => open elements at the top it closes (HTML's implied end tags), space-delimited.
 	 */
-	private const CLOSED_BY = [
+	public const CLOSED_BY = [
 		'li'       => ' li ',
 		'dt'       => ' dt dd ',
 		'dd'       => ' dt dd ',
@@ -143,10 +143,16 @@ final class ClassicStructureGuard {
 	 * Structure of an HTML text.
 	 *
 	 * @param string $html Content.
-	 * @return array{cut: int, order: string[], open: array<string, int>}|null `cut`: tag starts never closed; `order`:
-	 *         structural opening tags; `open`: opened minus closed per tag. Null when the expression fails.
+	 * @return array{cut: int, order: string[], open: array<string, int>, left: list<string>}|null `cut`: tag starts never
+	 *         closed; `order`: structural opening tags; `open`: opened minus closed per tag; `left`: elements open at the
+	 *         end. Null when the expression fails.
 	 */
 	private static function read( string $html ): ?array {
+		// TOKEN's lazy comment, script and style patterns scan to the end once per opener that never closes.
+		if ( BlockStructureGuard::unclosed_raw( $html ) > BlockStructureGuard::UNCLOSED_MAX ) {
+			return null;
+		}
+
 		$gaps = preg_replace( self::TOKEN, "\n", $html );
 
 		if ( null === $gaps || false === preg_match_all( self::TOKEN, $html, $matches, PREG_SET_ORDER | PREG_UNMATCHED_AS_NULL ) ) {
@@ -157,6 +163,7 @@ final class ClassicStructureGuard {
 			'cut'   => (int) preg_match_all( '/<[a-z\/!?]/i', $gaps ),
 			'order' => [],
 			'open'  => [],
+			'left'  => [],
 		];
 
 		// Open elements, to close the optional-end ones HTML closes implicitly.
@@ -203,14 +210,142 @@ final class ClassicStructureGuard {
 			}
 		}
 
+		$out['left'] = $stack;
+
+		return $out;
+	}
+
+	/**
+	 * Whether an HTML text opens and closes its own elements: no tag cut off, no stray end tag, and nothing left open but
+	 * elements whose end tag HTML may omit.
+	 *
+	 * @param string $html HTML.
+	 * @return bool
+	 */
+	public static function balanced( string $html ): bool {
+		$read = self::read( $html );
+
+		if ( null === $read || $read['cut'] > 0 ) {
+			return false;
+		}
+
+		$open = $read['open'];
+
+		foreach ( $read['left'] as $name ) {
+			if ( str_contains( self::OPTIONAL_END, " $name " ) ) {
+				--$open[ $name ];
+			}
+		}
+
+		return [] === array_filter( $open );
+	}
+
+	/**
+	 * Attributes whose values a provider translates: their names stay in the skeleton, their values do not.
+	 */
+	private const TRANSLATED_ATTRIBUTES = ' alt title aria-label placeholder ';
+
+	/**
+	 * An HTML text's markup in order: tags with every attribute name and value as written (those of
+	 * TRANSLATED_ATTRIBUTES without the value), script/style elements and declarations whole, and the number of tag
+	 * starts that never close; text and comments left out. One pass, linear in the length.
+	 *
+	 * @param string $html HTML.
+	 * @return string
+	 */
+	public static function skeleton( string $html ): string {
+		$out    = [];
+		$cut    = 0;
+		$length = strlen( $html );
+		$at     = strpos( $html, '<' );
+
+		while ( false !== $at ) {
+			$next = $html[ $at + 1 ] ?? '';
+
+			if ( str_starts_with( substr( $html, $at, 4 ), '<!--' ) ) {
+				$end = strpos( $html, '-->', $at + 4 );
+
+				// Unclosed: the rest is that comment.
+				if ( false === $end ) {
+					break;
+				}
+
+				$at = strpos( $html, '<', $end + 3 );
+				continue;
+			}
+
+			if ( 1 === preg_match( '/\G<(\/?)([a-z][^\s\/>]*+)((?:[^>"\'<]++|"[^"]*+"|\'[^\']*+\')*+)>/Ai', $html, $m, 0, $at ) ) {
+				$name  = $m[2];
+				$out[] = '<' . $m[1] . $name . self::attributes( $m[3] ) . '>';
+				$after = $at + strlen( $m[0] );
+				$raw   = '' === $m[1] && 1 === preg_match( '/^(?:script|style)$/i', $name );
+
+				if ( $raw ) {
+					$close = stripos( $html, '</' . $name, $after );
+
+					if ( false === $close ) {
+						$out[] = substr( $html, $after );
+						break;
+					}
+
+					$out[] = substr( $html, $after, $close - $after );
+					$after = $close;
+				}
+
+				$at = strpos( $html, '<', $after );
+				continue;
+			}
+
+			if ( '!' === $next || '?' === $next ) {
+				$end = strpos( $html, '>', $at + 2 );
+
+				if ( false !== $end ) {
+					$out[] = substr( $html, $at, $end + 1 - $at );
+					$at    = strpos( $html, '<', $end + 1 );
+					continue;
+				}
+			}
+
+			// A tag start that does not close.
+			if ( 1 === preg_match( '/[a-z\/!?]/i', $next ) ) {
+				++$cut;
+			}
+
+			$at = $at + 1 < $length ? strpos( $html, '<', $at + 1 ) : false;
+		}
+
+		return implode( "\n", $out ) . "\ncut:" . $cut;
+	}
+
+	/**
+	 * A tag's attributes in order, values as written, without the values of TRANSLATED_ATTRIBUTES.
+	 *
+	 * @param string $text The tag's text after its name.
+	 * @return string
+	 */
+	private static function attributes( string $text ): string {
+		if ( '' === trim( $text, " \t\n\r\f/" ) ) {
+			return '';
+		}
+
+		preg_match_all( '/([^\s"\'>\/=]++)(?:\s*+=\s*+("[^"]*+"|\'[^\']*+\'|[^\s"\'=<>`]++))?/', $text, $m, PREG_SET_ORDER );
+
+		$out = '';
+
+		foreach ( $m as $a ) {
+			$value = $a[2] ?? '';
+			$value = '' !== $value && ( '"' === $value[0] || "'" === $value[0] ) ? substr( $value, 1, -1 ) : $value;
+			$out  .= ' ' . $a[1] . ( str_contains( self::TRANSLATED_ATTRIBUTES, ' ' . strtolower( $a[1] ) . ' ' ) ? '' : '="' . $value . '"' );
+		}
+
 		return $out;
 	}
 
 	/**
 	 * Count an open element HTML closes without its end tag as closed; any other element stays open.
 	 *
-	 * @param array{cut: int, order: string[], open: array<string, int>} $out  Structure read so far.
-	 * @param string                                                     $name Element.
+	 * @param array{cut: int, order: string[], open: array<string, int>, left: list<string>} $out  Structure read so far.
+	 * @param string                                                                         $name Element.
 	 * @return void
 	 */
 	private static function closed_implicitly( array &$out, string $name ): void {

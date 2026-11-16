@@ -32,14 +32,35 @@ final class BootstrapAjax {
 	private const TERM_ROW_ACTIONS = [ 'inline-save-tax', 'add-tag', 'fetch-list' ];
 
 	/**
+	 * The request's AJAX action, sanitised; '' when none.
+	 *
+	 * @return string
+	 */
+	private static function action(): string {
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Routing only; each handler checks its nonce.
+		return isset( $_REQUEST['action'] ) && is_string( $_REQUEST['action'] ) ? sanitize_key( wp_unslash( $_REQUEST['action'] ) ) : '';
+	}
+
+	/**
+	 * Whether this AJAX request may run a job: Action Scheduler's async runner (an anonymous POST that runs the queue)
+	 * or a PerfLocale action. Another plugin's action, heartbeat among them, binds no job worker.
+	 *
+	 * @return bool
+	 */
+	public static function runs_jobs(): bool {
+		$action = self::action();
+
+		return 'as_async_request_queue_runner' === $action || str_starts_with( $action, 'perflocale_' );
+	}
+
+	/**
 	 * Register the AJAX services and handlers for this request's action.
 	 *
 	 * @param Plugin $plugin Service container.
 	 * @return void
 	 */
 	public static function register( Plugin $plugin ): void {
-		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Routing only; each handler checks its nonce.
-		$action = isset( $_REQUEST['action'] ) && is_string( $_REQUEST['action'] ) ? sanitize_key( wp_unslash( $_REQUEST['action'] ) ) : '';
+		$action = self::action();
 
 		// Both ids resolve on every AJAX request (an extension may get() them); each boots, wiring its Quick Edit
 		// save and column hooks, only for its row actions.
@@ -97,10 +118,33 @@ final class BootstrapAjax {
 			}
 		);
 
+		// URL bases compile triggers where they are in use (LifecycleHooks::in_use(), inline so no class loads), not the heartbeat.
+		$all = wp_load_alloptions();
+
+		if ( 'heartbeat' !== $action && ( isset( $all['perflocale_url_bases_map'] ) || isset( $all['perflocale_url_bases_dirty'] ) ) ) {
+			add_action( 'admin_init', [ self::class, 'url_bases' ], 0 );
+		} elseif ( 'heartbeat' !== $action ) {
+			// A Shop page set later may start them (LifecycleHooks::on_shop_option(), loaded then).
+			add_action( 'add_option_woocommerce_shop_page_id', [ Router\UrlBases\LifecycleHooks::class, 'on_shop_option' ] );
+			add_action( 'update_option_woocommerce_shop_page_id', [ Router\UrlBases\LifecycleHooks::class, 'on_shop_option' ] );
+		}
+
 		// Bulk tools on Settings > Translation; BulkTools loads only when one runs.
 		add_action( 'wp_ajax_perflocale_create_wc_pages', [ Admin\BulkTools::class, 'ajax_create_wc_page_translations' ] );
 		add_action( 'wp_ajax_perflocale_create_taxonomy_translations', [ Admin\BulkTools::class, 'ajax_create_taxonomy_translations' ] );
 		add_action( 'wp_ajax_perflocale_assign_post_languages', [ Admin\BulkTools::class, 'ajax_assign_post_languages' ] );
 		add_action( 'wp_ajax_perflocale_generate_missing_translations', [ Admin\BulkTools::class, 'ajax_generate_missing_translations' ] );
+	}
+
+	/**
+	 * `admin_init` in AJAX: register the URL bases compile triggers for an editor or administrator (rule 13: never for a
+	 * customer's or subscriber's call).
+	 *
+	 * @return void
+	 */
+	public static function url_bases(): void {
+		if ( current_user_can( 'edit_posts' ) || current_user_can( 'manage_options' ) ) {
+			Router\UrlBases\LifecycleHooks::register();
+		}
 	}
 }

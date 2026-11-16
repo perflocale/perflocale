@@ -13,6 +13,7 @@ use PerfLocale\Background\AbstractJob;
 use PerfLocale\Database\Repository\StringRepository;
 use PerfLocale\Database\Repository\StringTranslationRepository;
 use PerfLocale\Database\Schema;
+use PerfLocale\MachineTranslation\BlockStructureGuard;
 use PerfLocale\MachineTranslation\CallDeadline;
 use PerfLocale\MachineTranslation\DeadlineReachedException;
 use PerfLocale\MachineTranslation\TranslationService;
@@ -25,11 +26,11 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Machine-translates gettext strings into target languages: mode 'ids' (`string_ids`), 'filter' (the strings page's
- * filters) or 'all'; with skip-existing, 'filter' and 'all' select only rows still missing a target. Design:
- * docs-ai/11-code-rationale.md, "BulkStringTranslateJob: placeholders, links and groups".
+ * Machine-translates gettext strings: mode 'ids', 'filter' or 'all' (with skip-existing only rows still missing a
+ * target), or 'outdated' (answers held for review, never written). See docs-ai/11-code-rationale.md,
+ * "BulkStringTranslateJob: placeholders, links and groups".
  *
- * @phpstan-type StringItem array{id: int, row: object, original: string, format: string, texts: array<int, string>, phs: array<int, array<int, string>>, numbers: array<int, int>|null, only: array<int, bool>, token: string}
+ * @phpstan-type StringItem array{id: int, row: object, original: string, format: string, texts: array<int, string>, phs: array<int, array<int, string>>, numbers: array<int, int>|null, only: array<int, bool>, token: string, base?: string}
  */
 final class BulkStringTranslateJob extends AbstractJob {
 
@@ -38,6 +39,19 @@ final class BulkStringTranslateJob extends AbstractJob {
 	 * and keeps progress ticks under 5 s apart.
 	 */
 	private const BATCH_SIZE = 25;
+
+	/** String ids per statement when excluded domains are filtered out of an ids selection. */
+	private const EXCLUSION_CHUNK = 1000;
+
+	/** Rows per statement of the outdated selection (keyset pages in string id order: memory stays bounded). */
+	private const OUTDATED_PAGE = 50000;
+
+	/**
+	 * The options hash of the running outdated run, stored with each change it holds.
+	 *
+	 * @var string
+	 */
+	private string $options_hash = '';
 
 	/**
 	 * Checkpoint keys of a chunk's settled strings => stored or kept (true) or failed (false).
@@ -67,6 +81,12 @@ final class BulkStringTranslateJob extends AbstractJob {
 	 * Most characters of the first failure reason a result stores (a filtered provider may throw any message).
 	 */
 	private const FIRST_ERROR_MAX_CHARS = 500;
+
+	/**
+	 * A string of Unicode spaces, line breaks or NUL only: blank to a provider. Kept in PHP: the selection SQL stays the
+	 * same on every engine, so such a string is selected and keeps its source.
+	 */
+	private const SPACE_ONLY = '/^[\p{Z}\t\n\v\f\r\x{85}\x00]++$/u';
 
 	/** {@inheritDoc} */
 	public function get_type(): string {
@@ -124,10 +144,15 @@ final class BulkStringTranslateJob extends AbstractJob {
 	private function resolve_string_count( array $args ): int {
 		$mode = isset( $args['mode'] ) ? (string) $args['mode'] : 'ids';
 
+		if ( $mode === 'outdated' ) {
+			return $this->outdated_of_args( $args, 0 )['strings'];
+		}
+
 		if ( $mode === 'ids' ) {
 			$ids = is_array( $args['string_ids'] ?? null ) ? $args['string_ids'] : [];
-			// The positive-int filter resolve_string_ids() uses, so the reported 'capped' shortfall is exact.
-			return count( array_filter( array_map( 'intval', $ids ), static fn( int $id ): bool => $id > 0 ) );
+			$ids = array_values( array_filter( array_map( 'intval', $ids ), static fn( int $id ): bool => $id > 0 ) );
+			// The filters resolve_string_ids() uses, so the reported 'capped' shortfall is exact.
+			return count( $this->without_excluded_domains( $ids, $this->excluded_domains( $args ), PHP_INT_MAX ) );
 		}
 
 		$repo = new StringRepository( Plugin::get_instance()->get( 'cache' ) );
@@ -167,10 +192,14 @@ final class BulkStringTranslateJob extends AbstractJob {
 		$mode = isset( $args['mode'] ) ? (string) $args['mode'] : 'ids';
 		$cap  = self::max_per_dispatch();
 
+		if ( $mode === 'outdated' ) {
+			return $this->outdated_of_args( $args, self::keep_of( $cap ) )['ids'];
+		}
+
 		if ( $mode === 'ids' ) {
 			$ids = (array) ( $args['string_ids'] ?? [] );
 			$ids = array_values( array_filter( array_map( 'intval', $ids ), static fn( int $id ): bool => $id > 0 ) );
-			return array_slice( $ids, 0, $cap );
+			return $this->without_excluded_domains( $ids, $this->excluded_domains( $args ), $cap );
 		}
 
 		$repo = new StringRepository( Plugin::get_instance()->get( 'cache' ) );
@@ -205,7 +234,59 @@ final class BulkStringTranslateJob extends AbstractJob {
 			$filter['missing_translation_language_ids'] = $targets;
 		}
 
+		$excluded = $this->excluded_domains( $args );
+
+		if ( $excluded !== [] ) {
+			$filter['exclude_domains'] = $excluded;
+		}
+
 		return $filter;
+	}
+
+	/**
+	 * The domains the dispatching user may not send to a provider (`exclude_domains`), deduplicated.
+	 *
+	 * @param array<string, mixed> $args Dispatch args.
+	 * @return array<int, string>
+	 */
+	private function excluded_domains( array $args ): array {
+		$out = [];
+
+		foreach ( (array) ( $args['exclude_domains'] ?? [] ) as $domain ) {
+			if ( is_string( $domain ) && '' !== $domain ) {
+				$out[ $domain ] = $domain;
+			}
+		}
+
+		return array_values( $out );
+	}
+
+	/**
+	 * The first $cap ids, in order, whose string is outside every excluded domain.
+	 *
+	 * @param array<int, int>    $ids      String ids.
+	 * @param array<int, string> $excluded Excluded domains.
+	 * @param int                $cap      Most ids returned.
+	 * @return array<int, int>
+	 */
+	private function without_excluded_domains( array $ids, array $excluded, int $cap ): array {
+		if ( $ids === [] || $excluded === [] ) {
+			return array_slice( $ids, 0, max( 0, $cap ) );
+		}
+
+		$repo = new StringRepository( Plugin::get_instance()->cache() );
+		$out  = [];
+
+		// A bounded list per statement, until the cap is filled.
+		foreach ( array_chunk( $ids, self::EXCLUSION_CHUNK ) as $chunk ) {
+			if ( count( $out ) >= $cap ) {
+				break;
+			}
+
+			$out = array_merge( $out, $repo->ids_outside_domains( $chunk, $excluded ) );
+		}
+
+		return array_slice( $out, 0, max( 0, $cap ) );
 	}
 
 	/**
@@ -228,6 +309,349 @@ final class BulkStringTranslateJob extends AbstractJob {
 	}
 
 	/**
+	 * The outdated selection of a run's arguments (outdated_split()).
+	 *
+	 * @param array<string, mixed> $args Dispatch args.
+	 * @param int|null             $keep Strings kept; null: the dispatch cap.
+	 * @return array{send: array<int, list<int>>, rejected: array<int, list<int>>, ids: list<int>, strings: int, pairs: int, rejected_pairs: int}
+	 */
+	private function outdated_of_args( array $args, ?int $keep ): array {
+		$langs = [];
+
+		// Outdated strings are Content ReSync's: none while it is off.
+		if ( ! \PerfLocale\Util\ResyncSwitch::on() ) {
+			return [
+				'send'           => [],
+				'rejected'       => [],
+				'ids'            => [],
+				'strings'        => 0,
+				'pairs'          => 0,
+				'rejected_pairs' => 0,
+			];
+		}
+
+		foreach ( (array) ( $args['target_lang_ids'] ?? [] ) as $lang ) {
+			$langs[] = \PerfLocale\Util\Scalar::int( $lang );
+		}
+
+		return $this->outdated_split( $langs, $this->excluded_domains( $args ), sanitize_key( \PerfLocale\Util\Scalar::str( $args['provider_id'] ?? '' ) ), $keep );
+	}
+
+	/**
+	 * The strings a run keeps of the dispatch cap: every string when the cap is not positive.
+	 *
+	 * @param int $cap max_per_dispatch().
+	 * @return int
+	 */
+	private static function keep_of( int $cap ): int {
+		return $cap > 0 ? $cap : PHP_INT_MAX;
+	}
+
+	/**
+	 * The string ids of per-language pairs, ascending, each once.
+	 *
+	 * @param array<int, list<int>> $pairs Language id => string ids.
+	 * @return array<int, int>
+	 */
+	private static function ids_of( array $pairs ): array {
+		$ids = [];
+
+		foreach ( $pairs as $lang_ids ) {
+			foreach ( $lang_ids as $id ) {
+				$ids[ $id ] = $id;
+			}
+		}
+
+		ksort( $ids );
+
+		return array_values( $ids );
+	}
+
+	/**
+	 * The `send` part of outdated_split(), read-only.
+	 *
+	 * @param array<int, int>    $target_lang_ids Target languages.
+	 * @param array<int, string> $exclude_domains Domains left out.
+	 * @param string             $provider_id     Provider id ('' = configured).
+	 * @return array<int, list<int>> Language id => string ids, ascending.
+	 */
+	public function outdated_pairs( array $target_lang_ids, array $exclude_domains, string $provider_id = '' ): array {
+		return $this->outdated_split( $target_lang_ids, $exclude_domains, $provider_id )['send'];
+	}
+
+	/**
+	 * The string translations flagged Outdated per target language (needs_update link, non-empty translation, outside
+	 * the excluded domains, no pending change), split into `send` and `rejected`. Keyset pages never split a string's
+	 * pairs; the first `$keep` strings to send are kept, every page is counted. Public for the Strings page estimate.
+	 *
+	 * @param array<int, int>                              $target_lang_ids Target languages.
+	 * @param array<int, string>                           $exclude_domains Domains left out.
+	 * @param string                                       $provider_id     Provider id ('' = configured).
+	 * @param int|null                                     $keep            Strings kept; null: the dispatch cap; 0 keeps none.
+	 * @param (callable(array<int, list<int>>): void)|null $each_page       Receives each page's `send` pairs.
+	 * @param array<int, int>|null                         $only_ids        Only these strings (a resumed slice's selection).
+	 * @return array{send: array<int, list<int>>, rejected: array<int, list<int>>, ids: list<int>, strings: int, pairs: int, rejected_pairs: int}
+	 */
+	public function outdated_split( array $target_lang_ids, array $exclude_domains, string $provider_id = '', ?int $keep = null, ?callable $each_page = null, ?array $only_ids = null ): array {
+		$langs = array_values( array_unique( array_filter( $target_lang_ids, static fn( int $id ): bool => $id > 0 ) ) );
+		$wpdb  = $GLOBALS['wpdb'] ?? null;
+		$out   = [
+			'send'           => [],
+			'rejected'       => [],
+			'ids'            => [],
+			'strings'        => 0,
+			'pairs'          => 0,
+			'rejected_pairs' => 0,
+		];
+
+		if ( $langs === [] || ! $wpdb instanceof \wpdb || [] === $only_ids ) {
+			return $out;
+		}
+
+		$keep       = null === $keep ? self::keep_of( self::max_per_dispatch() ) : max( 0, $keep );
+		$lang_ph    = implode( ',', array_fill( 0, count( $langs ), '%d' ) );
+		$exclude    = array_values( array_filter( $exclude_domains, static fn( string $d ): bool => '' !== $d ) );
+		$domain_sql = $exclude === [] ? '' : ' AND s.domain NOT IN (' . implode( ',', array_fill( 0, count( $exclude ), '%s' ) ) . ')';
+		$only       = null === $only_ids ? [] : array_values( array_map( 'intval', $only_ids ) );
+		$only_sql   = $only === [] ? '' : ' AND l.object_id IN (' . implode( ',', array_fill( 0, count( $only ), '%d' ) ) . ')';
+		$store      = \PerfLocale\Automation\ChangeService::available();
+		$changes    = Schema::table( 'pending_changes' );
+		$string     = \PerfLocale\Enum\ObjectType::String->value;
+		$pending    = \PerfLocale\Database\Repository\PendingChangeRepository::STATUS_PENDING;
+		$held_sql   = $store ? ' AND NOT EXISTS (SELECT 1 FROM %i p WHERE p.object_type = %s AND p.object_id = l.object_id AND p.language_id = l.language_id AND p.status = %s)' : '';
+		// The pair's Reject or Undo that no later decision follows (one row at most).
+		$declined   = \PerfLocale\Database\Repository\PendingChangeRepository::PERSON_DECLINED;
+		$reject_col = $store ? ', r.base_hash AS rejected_hash, r.summary AS rejected_summary, CASE WHEN r.id IS NULL THEN NULL ELSE s.original_hash END AS rejected_source, CASE WHEN r.id IS NULL THEN NULL ELSE t.translation END AS rejected_translation, CASE WHEN r.id IS NULL THEN NULL ELSE t.extra_forms END AS rejected_forms' : '';
+		$reject_sql = $store ? ' LEFT JOIN %i r ON r.object_type = %s AND r.object_id = l.object_id AND r.language_id = l.language_id AND r.status IN (' . implode( ',', array_fill( 0, count( $declined ), '%s' ) ) . ') AND NOT EXISTS (SELECT 1 FROM %i n WHERE n.object_type = %s AND n.object_id = l.object_id AND n.language_id = l.language_id AND n.status <> %s AND n.id > r.id)' : '';
+		$values     = array_merge(
+			[ Schema::table( 'translation_links' ), Schema::table( 'strings' ), Schema::table( 'string_translations' ) ],
+			$store ? array_merge( [ $changes, $string ], $declined, [ $changes, $string, $pending ] ) : [],
+			[ $string, \PerfLocale\Enum\TranslationStatus::NeedsUpdate->value ],
+			$langs,
+			$exclude,
+			$only,
+			$store ? [ $changes, $string, $pending ] : []
+		);
+		$options    = $store ? self::current_options_hash( $provider_id ) : '';
+		// A string has at most one row per language, so a full page always holds more than one string.
+		$limit = max( self::OUTDATED_PAGE, count( $langs ) + 1 );
+		$after = 0;
+		$first = true;
+
+		do {
+			$from = $after;
+			// First page: no index may give the order (a small selection is sorted, as without LIMIT). Later pages
+			// follow the strings primary key after the last string read, so each stops after its rows.
+			$no_order = $first ? ' USE INDEX FOR ORDER BY ()' : '';
+			$keyset   = $first ? '' : ' AND l.object_id > %d';
+			$order    = $first ? 'l.object_id' : 's.id';
+			$bound    = $first ? [ $limit ] : [ $after, $limit ];
+			$first    = false;
+			// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- The lists are placeholders only; the values follow the placeholder order.
+			$rows = $wpdb->get_results(
+				$wpdb->prepare(
+					"SELECT l.object_id, l.language_id{$reject_col} FROM %i l{$no_order}
+					 INNER JOIN %i s{$no_order} ON s.id = l.object_id
+					 INNER JOIN %i t ON t.string_id = l.object_id AND t.language_id = l.language_id{$reject_sql}
+					 WHERE l.type = %s AND l.status = %s AND l.language_id IN ({$lang_ph}) AND t.translation <> ''{$domain_sql}{$only_sql}{$held_sql}{$keyset}
+					 ORDER BY {$order} ASC
+					 LIMIT %d",
+					array_merge( $values, $bound )
+				),
+				ARRAY_A
+			);
+			// phpcs:enable
+
+			$rows = is_array( $rows ) ? $rows : [];
+			$more = count( $rows ) >= $limit;
+
+			if ( $more ) {
+				// The page may end inside the last string's pairs: that string is read again with the next page.
+				$last = self::row_string( $rows[ count( $rows ) - 1 ] );
+				$cut  = count( $rows );
+
+				while ( $cut > 0 && self::row_string( $rows[ $cut - 1 ] ) === $last ) {
+					--$cut;
+				}
+
+				if ( $cut > 0 ) {
+					$rows  = array_slice( $rows, 0, $cut );
+					$after = self::row_string( $rows[ $cut - 1 ] );
+				} else {
+					$after = $last;
+				}
+			}
+
+			$page = self::split_outdated( $rows, $options );
+			unset( $rows );
+
+			if ( null !== $each_page ) {
+				$each_page( $page['send'] );
+			}
+
+			self::add_page( $out, $page, $keep );
+		} while ( $more && $after > $from );
+
+		return $out;
+	}
+
+	/**
+	 * The string id of a row of the outdated selection.
+	 *
+	 * @param mixed $row A row.
+	 * @return int
+	 */
+	private static function row_string( $row ): int {
+		return \PerfLocale\Util\Scalar::int( is_array( $row ) ? ( $row['object_id'] ?? 0 ) : 0 );
+	}
+
+	/**
+	 * Add one page to the pass: its counts, and its strings with a pair to send while fewer than `$keep` are kept.
+	 *
+	 * @param array{send: array<int, list<int>>, rejected: array<int, list<int>>, ids: list<int>, strings: int, pairs: int, rejected_pairs: int} $out  The pass so far (by ref).
+	 * @param array{send: array<int, list<int>>, rejected: array<int, list<int>>}                                                                $page One page, from split_outdated().
+	 * @param int                                                                                                                                $keep Strings kept.
+	 * @return void
+	 */
+	private static function add_page( array &$out, array $page, int $keep ): void {
+		$ids = self::ids_of( $page['send'] );
+
+		$out['strings']        += count( $ids );
+		$out['pairs']          += array_sum( array_map( 'count', $page['send'] ) );
+		$out['rejected_pairs'] += array_sum( array_map( 'count', $page['rejected'] ) );
+
+		$room = $keep - count( $out['ids'] );
+
+		if ( $room <= 0 || $ids === [] ) {
+			return;
+		}
+
+		$take = array_fill_keys( array_slice( $ids, 0, $room ), true );
+
+		foreach ( array_keys( $take ) as $id ) {
+			$out['ids'][] = $id;
+		}
+
+		foreach ( [ 'send', 'rejected' ] as $part ) {
+			foreach ( $page[ $part ] as $lang => $lang_ids ) {
+				foreach ( $lang_ids as $id ) {
+					if ( isset( $take[ $id ] ) ) {
+						$out[ $part ][ $lang ][] = $id;
+					}
+				}
+			}
+		}
+	}
+
+	/**
+	 * Split outdated selection rows: `rejected` when the pair's newest decision is a person's Reject or Undo of the
+	 * proposal this run would make (same source text, options and live translation), else `send`.
+	 *
+	 * @param array<int, mixed> $rows         Rows with object_id, language_id and, with the store, the rejected_* columns.
+	 * @param string            $options_hash The run's options hash (current_options_hash()).
+	 * @return array{send: array<int, list<int>>, rejected: array<int, list<int>>} Language id => string ids, in row order.
+	 */
+	public static function split_outdated( array $rows, string $options_hash ): array {
+		$out = [
+			'send'     => [],
+			'rejected' => [],
+		];
+
+		foreach ( $rows as $row ) {
+			$row  = is_array( $row ) ? $row : [];
+			$part = self::same_rejected_proposal( $row, $options_hash ) ? 'rejected' : 'send';
+
+			$out[ $part ][ \PerfLocale\Util\Scalar::int( $row['language_id'] ?? 0 ) ][] = \PerfLocale\Util\Scalar::int( $row['object_id'] ?? 0 );
+		}
+
+		return $out;
+	}
+
+	/**
+	 * Whether a selection row carries a person's Reject or Undo of the same proposal.
+	 *
+	 * @param array<mixed> $row          A row of the outdated selection.
+	 * @param string       $options_hash The run's options hash.
+	 * @return bool
+	 */
+	private static function same_rejected_proposal( array $row, string $options_hash ): bool {
+		$hash = \PerfLocale\Util\Scalar::str( $row['rejected_hash'] ?? '' );
+
+		if ( '' === $hash || null === ( $row['rejected_translation'] ?? null ) ) {
+			return false;
+		}
+
+		$summary = json_decode( \PerfLocale\Util\Scalar::str( $row['rejected_summary'] ?? '' ), true );
+		$summary = is_array( $summary ) ? $summary : [];
+		$source  = \PerfLocale\Util\Scalar::str( $summary['source_hash'] ?? '' );
+
+		return '' !== $source
+			&& \PerfLocale\Strings\StrIdentMigration::same_source_id( $source, \PerfLocale\Util\Scalar::str( $row['rejected_source'] ?? '' ), \PerfLocale\Util\Scalar::int( $row['object_id'] ?? 0 ) )
+			&& hash_equals( $options_hash, \PerfLocale\Util\Scalar::str( $summary['options_hash'] ?? '' ) )
+			&& hash_equals( $hash, \PerfLocale\Automation\StringTarget::stored_hash( \PerfLocale\Util\Scalar::str( $row['rejected_translation'] ), \PerfLocale\Util\Scalar::str( $row['rejected_forms'] ?? '' ) ) );
+	}
+
+	/**
+	 * The hash of the options that shape an outdated proposal: context on or off and, when on, its character limit.
+	 *
+	 * @param bool $with_context The run sends context (outdated_context_on()).
+	 * @param int  $max_chars    The context character limit.
+	 * @return string
+	 */
+	public static function outdated_options_hash( bool $with_context, int $max_chars ): string {
+		return hash( 'sha256', (string) wp_json_encode( $with_context ? [ 'context', $max_chars ] : [] ) );
+	}
+
+	/**
+	 * The options hash an outdated run would have now.
+	 *
+	 * @param string $provider_id Provider id ('' = configured).
+	 * @return string
+	 */
+	public static function current_options_hash( string $provider_id ): string {
+		$plugin  = Plugin::get_instance();
+		$service = new TranslationService( $plugin->settings(), $plugin->cache() );
+		$on      = self::outdated_context_on( $service, $provider_id );
+
+		return self::outdated_options_hash( $on, $on ? \PerfLocale\MachineTranslation\ContextSettings::max_chars( $plugin->settings() ) : 0 );
+	}
+
+	/**
+	 * The summary of a held outdated change, which a later run compares after a person's Reject or Undo.
+	 *
+	 * @param string $source_hash  The string's `original_hash`.
+	 * @param string $options_hash The run's options hash.
+	 * @return array{outdated: true, source_hash: string, options_hash: string}
+	 */
+	public static function hold_summary( string $source_hash, string $options_hash ): array {
+		return [
+			'outdated'     => true,
+			'source_hash'  => $source_hash,
+			'options_hash' => $options_hash,
+		];
+	}
+
+	/**
+	 * The pairs a person's Reject or Undo leaves out: every page's count of a pass, or one split's `rejected` pairs.
+	 *
+	 * @param array{send: array<int, list<int>>, rejected: array<int, list<int>>, rejected_pairs?: int} $split From outdated_split() or split_outdated().
+	 * @return int
+	 */
+	public static function rejected_count( array $split ): int {
+		if ( isset( $split['rejected_pairs'] ) ) {
+			return $split['rejected_pairs'];
+		}
+
+		$count = 0;
+
+		foreach ( $split['rejected'] as $ids ) {
+			$count += count( $ids );
+		}
+
+		return $count;
+	}
+
+	/**
 	 * Why a dispatch selected no rows.
 	 *
 	 * @param array<string, mixed> $args Dispatch args.
@@ -235,6 +659,10 @@ final class BulkStringTranslateJob extends AbstractJob {
 	 */
 	private function nothing_selected_reason( array $args ): string {
 		$mode = isset( $args['mode'] ) ? (string) $args['mode'] : 'ids';
+
+		if ( $mode === 'outdated' ) {
+			return __( 'No string translation in the chosen languages is flagged Outdated.', 'perflocale' );
+		}
 
 		if ( $mode !== 'ids' ) {
 			$filter = $this->selection_filter( $args );
@@ -264,9 +692,28 @@ final class BulkStringTranslateJob extends AbstractJob {
 	 * @throws DeadlineReachedException In a run that is not a slice: the deadline is its caller's.
 	 */
 	public function execute( array $args, callable $progress ): array {
+		// Rights again at run time: a queued run outlives a role change.
+		if ( ! current_user_can( 'perflocale_manage_translations' ) || ! current_user_can( 'perflocale_use_mt' ) ) {
+			$reason = current_user_can( 'perflocale_manage_translations' )
+				? __( 'Machine translation is not permitted for the dispatching user (perflocale_use_mt).', 'perflocale' )
+				: __( 'Permission revoked or dispatching user no longer has access.', 'perflocale' );
+
+			return $this->run_result( 0, 0, 0, 0, 0, 0, $reason, true );
+		}
+
+		// Domains this user may not see now are left out, whatever the dispatch recorded.
+		$args['exclude_domains'] = array_values( array_unique( array_merge( $this->excluded_domains( $args ), \PerfLocale\Strings\Domains::restricted_for_current_user() ) ) );
+
 		$target_lang_ids = array_values( array_filter( array_map( 'intval', (array) ( $args['target_lang_ids'] ?? [] ) ) ) );
 		$provider_id     = sanitize_key( (string) ( $args['provider_id'] ?? '' ) );
-		$skip_existing   = isset( $args['skip_existing'] ) ? (bool) $args['skip_existing'] : true;
+		$outdated        = ( $args['mode'] ?? '' ) === 'outdated';
+
+		if ( $outdated && ! \PerfLocale\Util\ResyncSwitch::on() ) {
+			return $this->run_result( 0, 0, 0, 0, 0, 0, \PerfLocale\Util\ResyncOff::refused_text(), true );
+		}
+
+		// An outdated run sends strings that have a translation: it never skips them.
+		$skip_existing = ! $outdated && ( isset( $args['skip_existing'] ) ? (bool) $args['skip_existing'] : true );
 
 		if ( $target_lang_ids === [] ) {
 			return $this->empty_result( __( 'No target languages provided.', 'perflocale' ) );
@@ -285,9 +732,31 @@ final class BulkStringTranslateJob extends AbstractJob {
 			}
 		}
 
-		$string_ids = null !== $resume ? $resume['string_ids'] : $this->resolve_string_ids( $args );
+		// An outdated run reads its selection in one pass; a resumed slice reads its pairs among the stored strings.
+		$split              = null;
+		$rejected           = null !== $resume ? ( $resume['skipped_rejected'] ?? 0 ) : 0;
+		$this->options_hash = '';
+
+		if ( $outdated ) {
+			$this->options_hash = self::current_options_hash( $provider_id );
+			$split              = $this->outdated_split( $target_lang_ids, $this->excluded_domains( $args ), $provider_id, self::keep_of( self::max_per_dispatch() ), null, null !== $resume ? $resume['string_ids'] : null );
+			self::stop_on_failed_read();
+			$rejected = null !== $resume ? $rejected : self::rejected_count( $split );
+		}
+
+		$string_ids = null !== $resume ? $resume['string_ids'] : ( null !== $split ? $split['ids'] : $this->resolve_string_ids( $args ) );
 		if ( $string_ids === [] ) {
-			return $this->empty_result( $this->nothing_selected_reason( $args ) );
+			$result = $this->empty_result(
+				$rejected > 0
+					? __( 'No outdated string translation in the chosen languages is sent again: the machine translation of each was rejected or undone by a person, and its source text, its translation and the context sent with it have not changed since.', 'perflocale' )
+					: $this->nothing_selected_reason( $args )
+			);
+
+			if ( $rejected > 0 ) {
+				$result['skipped_rejected'] = $rejected;
+			}
+
+			return $result;
 		}
 
 		// Report rows beyond the per-dispatch cap, so the operator knows to run again.
@@ -295,7 +764,7 @@ final class BulkStringTranslateJob extends AbstractJob {
 		if ( null !== $resume ) {
 			$dropped = $resume['capped'];
 		} elseif ( count( $string_ids ) >= self::max_per_dispatch() ) {
-			$dropped = max( 0, $this->resolve_string_count( $args ) - count( $string_ids ) );
+			$dropped = max( 0, ( null !== $split ? $split['strings'] : $this->resolve_string_count( $args ) ) - count( $string_ids ) );
 		}
 
 		$plugin   = Plugin::get_instance();
@@ -326,8 +795,20 @@ final class BulkStringTranslateJob extends AbstractJob {
 
 		$per_string = ! $this->provider_batches_natively( $service, $provider_id );
 
+		// With context each string's live translation goes with it: one request per string, progress after each.
+		$with_context = $outdated && self::outdated_context_on( $service, $provider_id );
+		$context_max  = $with_context ? \PerfLocale\MachineTranslation\ContextSettings::max_chars( $plugin->settings() ) : 0;
+		$per_string   = $per_string || $with_context;
+
 		// Load every source row once; the set is already capped, so the SELECT-IN stays tractable.
-		$strings_by_id = $this->load_strings_by_ids( $string_ids );
+		$strings_by_id = $this->load_strings_by_ids( $string_ids, $outdated );
+
+		// An outdated run's pairs to send per language (a pair a person's Reject or Undo leaves out is not among them).
+		$outdated_in = [];
+
+		foreach ( null === $split ? [] : $split['send'] as $lang_id => $lang_ids ) {
+			$outdated_in[ $lang_id ] = array_fill_keys( $lang_ids, true );
+		}
 
 		$n_ids      = count( $string_ids );
 		$total      = $n_ids * count( $target_lang_ids );
@@ -338,6 +819,7 @@ final class BulkStringTranslateJob extends AbstractJob {
 		// cache sync and file regeneration; apart from $skipped so empty-source runs regenerate nothing.
 		$already_translated = 0;
 		$failed             = 0;
+		$held               = 0;
 		$first_error        = '';
 		$breaker_stopped    = false;
 		$breaker_error      = '';
@@ -351,6 +833,8 @@ final class BulkStringTranslateJob extends AbstractJob {
 				'failed'             => $failed,
 				'first_error'        => $first_error,
 			] = $resume;
+
+			$held = $resume['held'] ?? 0;
 		}
 
 		// Strings of the resumed chunk its stopped run settled: id => true (stored or kept) or false (failed).
@@ -457,7 +941,7 @@ final class BulkStringTranslateJob extends AbstractJob {
 						if ( $done >= 1
 							&& ( ( $slice_max_pairs > 0 && $done >= $slice_max_pairs )
 								|| ( $slice_seconds > 0 && microtime( true ) - $slice_began >= $slice_seconds ) )
-							&& self::fits_result_cap( $this->stopped_result( $total, $translated, $skipped, $failed, count( $target_lang_ids ), $dropped, $first_error, $processed, $already_translated, $encoded_ids ) )
+							&& self::fits_result_cap( $this->stopped_result( $total, $translated, $skipped, $failed, count( $target_lang_ids ), $dropped, $first_error, $processed, $already_translated, $encoded_ids, $held, $rejected ) )
 						) {
 							$stopped      = true;
 							$stop_settled = $chunk_settled;
@@ -465,18 +949,18 @@ final class BulkStringTranslateJob extends AbstractJob {
 						}
 
 						$items        = [];
-						$unit_start   = [ $processed, $translated, $skipped, $already_translated, $failed, $first_error ];
+						$unit_start   = [ $processed, $translated, $skipped, $already_translated, $failed, $first_error, $held ];
 						$unit_settled = [];
 
 						// The batch's existing translations in one query; a missing key is no or an empty translation,
 						// as get() === ''.
 						if ( null === $existing_for_batch ) {
-							$existing_for_batch = $skip_existing
+							$existing_for_batch = $skip_existing || $with_context
 								? $translation_repo->get_many( $batch_ids, (int) $target_lang->id )
 								: [];
 
 							// Unread is not "untranslated": skip-existing would overwrite.
-							if ( $skip_existing ) {
+							if ( $skip_existing || $with_context ) {
 								self::stop_on_failed_read();
 							}
 						}
@@ -484,13 +968,22 @@ final class BulkStringTranslateJob extends AbstractJob {
 						foreach ( $chunk_ids as $sid ) {
 							// Settled by the stopped run: counted, not sent again.
 							if ( isset( $chunk_settled[ $sid ] ) ) {
-								if ( $chunk_settled[ $sid ] ) {
+								if ( $chunk_settled[ $sid ] && $outdated ) {
+									++$held;
+								} elseif ( $chunk_settled[ $sid ] ) {
 									++$skipped;
 									++$already_translated;
 								} else {
 									++$failed;
 								}
 
+								++$processed;
+								continue;
+							}
+
+							// An outdated run sends only the pairs flagged Outdated in this language.
+							if ( $outdated && ! isset( $outdated_in[ $target_lang_id ][ $sid ] ) ) {
+								++$skipped;
 								++$processed;
 								continue;
 							}
@@ -511,7 +1004,7 @@ final class BulkStringTranslateJob extends AbstractJob {
 								continue;
 							}
 
-							if ( trim( (string) $row->original ) === '' ) {
+							if ( trim( (string) $row->original, StringRepository::BLANK_CHARS ) === '' ) {
 								++$skipped;
 								++$processed;
 								continue;
@@ -527,19 +1020,84 @@ final class BulkStringTranslateJob extends AbstractJob {
 
 						if ( '' !== $encoded_ids ) {
 							try {
-								$this->unit_checkpoint( $progress, $unit_start, $total, count( $target_lang_ids ), $dropped, $encoded_ids, (int) $items[0]['id'], $target_lang_slug, $chunk_settled );
+								$this->unit_checkpoint( $progress, $unit_start, $total, count( $target_lang_ids ), $dropped, $encoded_ids, (int) $items[0]['id'], $target_lang_slug, $chunk_settled, $rejected );
 							} catch ( \PerfLocale\Background\JobCanceledException $e ) {
 								// A cancel here stores the unit's start: strings the chunk only skipped can lie before
 								// unsent ones.
-								[ $processed, $translated, $skipped, $already_translated, $failed, $first_error ] = $unit_start;
+								[ $processed, $translated, $skipped, $already_translated, $failed, $first_error, $held ] = $unit_start;
 								throw $e;
 							}
 						}
 
+						// Each held answer is based on the state sent, so a save during the provider call reads as an edit.
+						if ( $outdated ) {
+							$sent = \PerfLocale\Automation\StringTarget::snapshot( array_column( $items, 'id' ), $target_lang_id );
+
+							foreach ( $items as $k => $item ) {
+								$state               = $sent[ $item['id'] ] ?? null;
+								$items[ $k ]['base'] = null === $state ? '' : \PerfLocale\Automation\StringTarget::hash( $state['translation'], $state['extra_forms'] );
+							}
+						}
+
+						// A string without a letter (digits, punctuation, placeholders only) keeps its source, unsent, unless the filter sends it.
+						// An outdated run holds it for review like any answer.
+						foreach ( $items as $k => $item ) {
+							if ( BlockStructureGuard::has_letter( str_replace( PlaceholderMasker::mask( $item['original'] )[1], '', $item['original'] ) ) ) {
+								continue;
+							}
+
+							$send = false;
+
+							if ( 1 !== preg_match( self::SPACE_ONLY, $item['original'] ) ) {
+								/**
+								 * Filter whether a string without a letter (digits, punctuation, placeholders) goes to machine translation,
+								 * for example to localize digits. Blank strings (only spaces of any kind, tabs, line breaks or NUL) are
+								 * never sent and never reach it.
+								 *
+								 * @hook  perflocale/strings/translate_letterless
+								 * @since 1.0.8
+								 *
+								 * @param bool   $send          Default false: the string keeps its source.
+								 * @param string $original      The string's original.
+								 * @param string $language_code Target language code.
+								 * @return bool
+								 */
+								$send = (bool) apply_filters( 'perflocale/strings/translate_letterless', false, $item['original'], $target_lang_slug );
+							}
+
+							if ( $send ) {
+								continue;
+							}
+
+							$failed_before = $failed;
+							$this->settle_item( $group_repo, $translation_repo, $item, $item['texts'], $target_lang_id, $translated, $failed, $processed, $first_error, $skip_existing, $skipped, $already_translated, $outdated, $held );
+							$unit_settled[ $item['id'] ] = $failed === $failed_before;
+							unset( $items[ $k ] );
+						}
+
+						$items = array_values( $items );
+
+						if ( [] === $items ) {
+							$tick( $processed );
+							continue;
+						}
+
+						// The context of each item: its live translation (an outdated run with context only).
+						$contexts = [];
+
+						if ( $with_context ) {
+							foreach ( $items as $k => $item ) {
+								$contexts[ $k ] = self::string_context( $item, $existing_for_batch[ $item['id'] ] ?? '', $context_max, $source_lang_slug, $target_lang_slug, $service, $provider_id );
+							}
+						}
+
 						if ( $per_string ) {
-							foreach ( $items as $item ) {
+							foreach ( $items as $k => $item ) {
 								try {
-									$outputs = $service->translate_batch_texts( $item['texts'], $source_lang_slug, $target_lang_slug, $provider_id, false, $item['format'], array_fill( 0, count( $item['texts'] ), self::item_label( $item ) ) );
+									$labels  = array_fill( 0, count( $item['texts'] ), self::item_label( $item ) );
+									$outputs = '' === ( $contexts[ $k ] ?? '' )
+										? $service->translate_batch_texts( $item['texts'], $source_lang_slug, $target_lang_slug, $provider_id, false, $item['format'], $labels )
+										: $service->translate_batch_texts_with_context( $item['texts'], array_fill( 0, count( $item['texts'] ), $contexts[ $k ] ), $source_lang_slug, $target_lang_slug, $provider_id, false, $item['format'], $labels );
 								} catch ( \PerfLocale\Concurrency\BreakerOpenException $e ) {
 									// Provider breaker tripped: every further call would throw at once. The job pauses
 									// at this unit.
@@ -553,7 +1111,7 @@ final class BulkStringTranslateJob extends AbstractJob {
 										throw $e;
 									}
 
-									[ $processed, $translated, $skipped, $already_translated, $failed, $first_error ] = $unit_start;
+									[ $processed, $translated, $skipped, $already_translated, $failed, $first_error, $held ] = $unit_start;
 									$continue_at  = $e->retry_at();
 									$unit_stopped = ! $e->paced();
 									$stopped      = true;
@@ -569,7 +1127,7 @@ final class BulkStringTranslateJob extends AbstractJob {
 									continue;
 								}
 
-								$this->settle_item( $group_repo, $translation_repo, $item, $outputs, $target_lang_id, $translated, $failed, $processed, $first_error, $skip_existing, $skipped, $already_translated );
+								$this->settle_item( $group_repo, $translation_repo, $item, $outputs, $target_lang_id, $translated, $failed, $processed, $first_error, $skip_existing, $skipped, $already_translated, $outdated, $held );
 								$progress( $processed, $total );
 							}
 
@@ -594,12 +1152,13 @@ final class BulkStringTranslateJob extends AbstractJob {
 								}
 							}
 
+							// A run with context goes one string at a time (per_string): a batch has none.
 							try {
 								$results = $service->translate_batch_texts( $flat, $source_lang_slug, $target_lang_slug, $provider_id, false, (string) $format, $labels );
 							} catch ( \PerfLocale\Concurrency\BreakerOpenException $e ) {
 								// The chunk runs again on Retry, its settled format groups named, so its counts go back
 								// too.
-								[ $processed, $translated, $skipped, $already_translated, $failed, $first_error ] = $unit_start;
+								[ $processed, $translated, $skipped, $already_translated, $failed, $first_error, $held ] = $unit_start;
 								$breaker_error   = $e->getMessage();
 								$breaker_stopped = true;
 								$stop_settled    = $unit_settled + $chunk_settled;
@@ -611,7 +1170,7 @@ final class BulkStringTranslateJob extends AbstractJob {
 									throw $e;
 								}
 
-								[ $processed, $translated, $skipped, $already_translated, $failed, $first_error ] = $unit_start;
+								[ $processed, $translated, $skipped, $already_translated, $failed, $first_error, $held ] = $unit_start;
 								$continue_at  = $e->retry_at();
 								$unit_stopped = ! $e->paced();
 								$stopped      = true;
@@ -632,7 +1191,7 @@ final class BulkStringTranslateJob extends AbstractJob {
 
 							foreach ( $keys as $k ) {
 								$failed_before = $failed;
-								$this->settle_item( $group_repo, $translation_repo, $items[ $k ], array_slice( $results, $slices[ $k ][0], $slices[ $k ][1] ), $target_lang_id, $translated, $failed, $processed, $first_error, $skip_existing, $skipped, $already_translated );
+								$this->settle_item( $group_repo, $translation_repo, $items[ $k ], array_slice( $results, $slices[ $k ][0], $slices[ $k ][1] ), $target_lang_id, $translated, $failed, $processed, $first_error, $skip_existing, $skipped, $already_translated, $outdated, $held );
 								$unit_settled[ (int) $items[ $k ]['id'] ] = $failed === $failed_before;
 							}
 						}
@@ -647,7 +1206,7 @@ final class BulkStringTranslateJob extends AbstractJob {
 				$progress( $processed, $total );
 			} else {
 				// The end step's checkpoint: a kill while publishing resumes past the last string and names the step.
-				$point = $this->stopped_result( $total, $translated, $skipped, $failed, count( $target_lang_ids ), $dropped, $first_error, $processed, $already_translated, $encoded_ids );
+				$point = $this->stopped_result( $total, $translated, $skipped, $failed, count( $target_lang_ids ), $dropped, $first_error, $processed, $already_translated, $encoded_ids, $held, $rejected );
 				unset( $point['__perflocale_continue'] );
 
 				$progress(
@@ -664,10 +1223,10 @@ final class BulkStringTranslateJob extends AbstractJob {
 			// The worker stores these counts on the canceled job; a slice's are a checkpoint (every unit before it
 			// settled).
 			if ( '' === $encoded_ids ) {
-				$e->set_result( $this->run_result( $total, $translated, $skipped, $failed, count( $target_lang_ids ), $dropped, $first_error, false ) );
+				$e->set_result( $this->run_result( $total, $translated, $skipped, $failed, count( $target_lang_ids ), $dropped, $first_error, false, $held, $rejected ) );
 			} else {
 				// The resumed chunk's settled strings still count when the cancel came at its start.
-				$point = self::with_settled( $this->stopped_result( $total, $translated, $skipped, $failed, count( $target_lang_ids ), $dropped, $first_error, $processed, $already_translated, $encoded_ids ), $chunk_settled );
+				$point = self::with_settled( $this->stopped_result( $total, $translated, $skipped, $failed, count( $target_lang_ids ), $dropped, $first_error, $processed, $already_translated, $encoded_ids, $held, $rejected ), $chunk_settled );
 				unset( $point['__perflocale_continue'] );
 				$e->set_result( [ '__perflocale_checkpoint' => true ] + $point );
 			}
@@ -691,7 +1250,7 @@ final class BulkStringTranslateJob extends AbstractJob {
 		}
 
 		if ( $stopped ) {
-			$result = self::with_settled( $this->stopped_result( $total, $translated, $skipped, $failed, count( $target_lang_ids ), $dropped, $first_error, $processed, $already_translated, $encoded_ids ), $stop_settled );
+			$result = self::with_settled( $this->stopped_result( $total, $translated, $skipped, $failed, count( $target_lang_ids ), $dropped, $first_error, $processed, $already_translated, $encoded_ids, $held, $rejected ), $stop_settled );
 
 			if ( $continue_at > 0 ) {
 				$result['__perflocale_continue_at'] = $continue_at;
@@ -708,8 +1267,8 @@ final class BulkStringTranslateJob extends AbstractJob {
 		// An open breaker with strings left fails the run (never complete), at a checkpoint Retry continues from.
 		if ( $breaker_stopped ) {
 			$result = '' !== $encoded_ids
-				? self::with_settled( $this->stopped_result( $total, $translated, $skipped, $failed, count( $target_lang_ids ), $dropped, $first_error, $processed, $already_translated, $encoded_ids ), $stop_settled )
-				: $this->run_result( $total, $translated, $skipped, $failed, count( $target_lang_ids ), $dropped, $first_error, false );
+				? self::with_settled( $this->stopped_result( $total, $translated, $skipped, $failed, count( $target_lang_ids ), $dropped, $first_error, $processed, $already_translated, $encoded_ids, $held, $rejected ), $stop_settled )
+				: $this->run_result( $total, $translated, $skipped, $failed, count( $target_lang_ids ), $dropped, $first_error, false, $held, $rejected );
 
 			unset( $result['__perflocale_continue'] );
 			$result['run_failed']                 = true;
@@ -723,9 +1282,132 @@ final class BulkStringTranslateJob extends AbstractJob {
 			return $result;
 		}
 
-		$run_failed = $translated === 0 && $failed > 0 && $first_error !== '';
+		$run_failed = $translated === 0 && $held === 0 && $failed > 0 && $first_error !== '';
 
-		return $this->run_result( $total, $translated, $skipped, $failed, count( $target_lang_ids ), $dropped, $first_error, $run_failed );
+		return $this->run_result( $total, $translated, $skipped, $failed, count( $target_lang_ids ), $dropped, $first_error, $run_failed, $held, $rejected );
+	}
+
+	/**
+	 * Whether an outdated run sends each string's live translation as context: the context setting is not Off,
+	 * "Include the previous translation" is on and the provider takes context.
+	 *
+	 * @param TranslationService $service     Service.
+	 * @param string             $provider_id Provider id ('' = configured).
+	 * @return bool
+	 */
+	public static function outdated_context_on( TranslationService $service, string $provider_id ): bool {
+		$settings = Plugin::get_instance()->settings();
+
+		if ( 'off' === \PerfLocale\MachineTranslation\ContextSettings::mode( $settings ) || ! \PerfLocale\MachineTranslation\ContextSettings::previous( $settings ) ) {
+			return false;
+		}
+
+		try {
+			return $service->provider_supports_context( $service->get_provider( $provider_id ) );
+		} catch ( \RuntimeException $e ) {
+			unset( $e );
+
+			return false;
+		}
+	}
+
+	/**
+	 * The context of one outdated string: its live translation, through `perflocale/mt/context`.
+	 *
+	 * @param array<string, mixed> $item        From build_item().
+	 * @phpstan-param StringItem $item
+	 * @param string               $previous    The live translation.
+	 * @param int                  $max_chars   The character limit.
+	 * @param string               $source_lang Source language slug.
+	 * @param string               $target_lang Target language slug.
+	 * @param TranslationService   $service     Service.
+	 * @param string               $provider_id Provider id ('' = configured).
+	 * @return string
+	 */
+	private static function string_context( array $item, string $previous, int $max_chars, string $source_lang, string $target_lang, TranslationService $service, string $provider_id ): string {
+		try {
+			$provider = $service->get_provider( $provider_id )->get_id();
+		} catch ( \RuntimeException $e ) {
+			unset( $e );
+			$provider = $provider_id;
+		}
+
+		return \PerfLocale\Resync\ContextBuilder::for_string(
+			(string) ( $item['texts'][0] ?? '' ),
+			$previous,
+			$item['format'],
+			$max_chars,
+			[
+				'object_type'               => 'string',
+				'object_id'                 => $item['id'],
+				'source_object_id'          => $item['id'],
+				'post_type'                 => '',
+				'source_language'           => $source_lang,
+				'target_language'           => $target_lang,
+				'trigger'                   => 'bulk_string_translate',
+				'provider'                  => $provider,
+				'provider_supports_context' => true,
+				'job_id'                    => '',
+				'user_id'                   => get_current_user_id(),
+			]
+		);
+	}
+
+	/**
+	 * The context characters an outdated run in one language sends and the provider bills (the Strings page
+	 * estimate): each string's context once per text it is sent as; 0 without billed context.
+	 *
+	 * @param array<int, int> $ids         The outdated string ids of the language.
+	 * @param int             $language_id Target language id.
+	 * @return int
+	 */
+	public function outdated_context_chars( array $ids, int $language_id ): int {
+		$plugin   = Plugin::get_instance();
+		$settings = $plugin->settings();
+		$service  = new TranslationService( $settings, $plugin->cache() );
+
+		if ( $ids === [] || ! self::outdated_context_on( $service, '' ) ) {
+			return 0;
+		}
+
+		try {
+			if ( ! $service->context_billed( $service->get_provider() ) ) {
+				return 0;
+			}
+		} catch ( \RuntimeException $e ) {
+			unset( $e );
+
+			return 0;
+		}
+
+		$lang    = [];
+		$default = $plugin->lang_repo()->get_default();
+
+		foreach ( $plugin->lang_repo()->get_active() as $active ) {
+			$vars = get_object_vars( $active );
+
+			if ( \PerfLocale\Util\Scalar::int( $vars['id'] ?? 0 ) === $language_id ) {
+				$lang = $vars;
+			}
+		}
+
+		if ( [] === $lang || ! $default ) {
+			return 0;
+		}
+
+		$slug        = \PerfLocale\Util\Scalar::str( $lang['slug'] ?? '' );
+		$locale      = is_string( $lang['locale'] ?? null ) && $lang['locale'] !== '' ? $lang['locale'] : $slug;
+		$source_slug = \PerfLocale\Util\Scalar::str( get_object_vars( $default )['slug'] ?? '' );
+		$live        = ( new StringTranslationRepository( $plugin->cache() ) )->get_many( $ids, $language_id );
+		$max_chars   = \PerfLocale\MachineTranslation\ContextSettings::max_chars( $settings );
+		$chars       = 0;
+
+		foreach ( $this->load_strings_by_ids( $ids ) as $row ) {
+			$item   = self::build_item( $row, $locale );
+			$chars += \PerfLocale\Util\Utf8::length( self::string_context( $item, $live[ $item['id'] ] ?? '', $max_chars, $source_slug, $slug, $service, '' ) ) * count( $item['texts'] );
+		}
+
+		return $chars;
 	}
 
 	/**
@@ -798,7 +1480,12 @@ final class BulkStringTranslateJob extends AbstractJob {
 		$settings = $plugin->get( 'settings' );
 
 		foreach ( $target_lang_ids as $tlid ) {
-			$cache->delete( 'all_string_translations_' . (int) $tlid, 'perflocale_strings' );
+			$cache->delete( 'all_str2_translations_' . (int) $tlid, 'perflocale_strings' );
+		}
+
+		if ( $cache instanceof \PerfLocale\Cache\CacheManager ) {
+			require_once __DIR__ . '/../../Cache/CacheDiagnostics.php';
+			\PerfLocale\Cache\CacheDiagnostics::forget_map_sizes( $cache, $target_lang_ids );
 		}
 
 		if ( (string) $settings->get( 'string_translation_mode', '' ) === 'files' ) {
@@ -850,7 +1537,7 @@ final class BulkStringTranslateJob extends AbstractJob {
 	 *
 	 * @param array<mixed> $resume    Result stored by the previous slice.
 	 * @param int          $n_targets Target languages of the job.
-	 * @return array{string_ids: array<int, int>, processed: int, translated: int, skipped: int, already_translated: int, failed: int, first_error: string, capped: int, settled: array<int, bool>}|null
+	 * @return array{string_ids: array<int, int>, processed: int, translated: int, skipped: int, already_translated: int, failed: int, first_error: string, capped: int, settled: array<int, bool>, held?: int, skipped_rejected?: int}|null
 	 */
 	private static function checkpoint( array $resume, int $n_targets ): ?array {
 		$ids = is_string( $resume['string_ids'] ?? null ) ? self::decode_ids( $resume['string_ids'] ) : null;
@@ -860,6 +1547,10 @@ final class BulkStringTranslateJob extends AbstractJob {
 		}
 
 		$count = static fn( string $key ): int => is_int( $resume[ $key ] ?? null ) ? $resume[ $key ] : -1;
+		// An outdated run's counts; absent in every other run's checkpoint.
+		$extra = static fn( string $key ): int => array_key_exists( $key, $resume ) ? $count( $key ) : 0;
+		$held  = $extra( 'held' );
+		$left  = $extra( 'skipped_rejected' );
 		$out   = [
 			'string_ids'         => $ids,
 			'processed'          => $count( 'processed' ),
@@ -871,15 +1562,23 @@ final class BulkStringTranslateJob extends AbstractJob {
 			'capped'             => $count( 'capped' ),
 		];
 
-		if ( min( $out['processed'], $out['translated'], $out['skipped'], $out['already_translated'], $out['failed'], $out['capped'] ) < 0
+		if ( min( $out['processed'], $out['translated'], $out['skipped'], $out['already_translated'], $out['failed'], $out['capped'], $held, $left ) < 0
 			|| $out['processed'] > count( $ids ) * $n_targets
-			|| $out['processed'] !== $out['translated'] + $out['skipped'] + $out['failed']
+			|| $out['processed'] !== $out['translated'] + $out['skipped'] + $out['failed'] + $held
 			|| $out['already_translated'] > $out['skipped']
 		) {
 			return null;
 		}
 
 		$out['settled'] = self::settled( $resume );
+
+		if ( $held > 0 ) {
+			$out['held'] = $held;
+		}
+
+		if ( $left > 0 ) {
+			$out['skipped_rejected'] = $left;
+		}
 
 		return $out;
 	}
@@ -1012,6 +1711,8 @@ final class BulkStringTranslateJob extends AbstractJob {
 	 * @param bool                                                       $skip_existing    Keep a value saved meanwhile.
 	 * @param int                                                        $skipped          Skipped count (by ref).
 	 * @param int                                                        $already          Already-translated count (by ref).
+	 * @param bool                                                       $hold             Hold the answer for review instead of writing it (an outdated run).
+	 * @param int                                                        $held             Held count (by ref).
 	 * @return void
 	 */
 	private function settle_item(
@@ -1026,9 +1727,11 @@ final class BulkStringTranslateJob extends AbstractJob {
 		string &$first_error,
 		bool $skip_existing,
 		int &$skipped,
-		int &$already
+		int &$already,
+		bool $hold = false,
+		int &$held = 0
 	): void {
-		$outcome = $this->persist_item( $group_repo, $translation_repo, $item, $outputs, $language_id, $skip_existing );
+		$outcome = $this->persist_item( $group_repo, $translation_repo, $item, $outputs, $language_id, $hold, $skip_existing );
 
 		++$processed;
 
@@ -1044,6 +1747,11 @@ final class BulkStringTranslateJob extends AbstractJob {
 
 		if ( ! $outcome['saved'] ) {
 			++$failed;
+			return;
+		}
+
+		if ( $hold ) {
+			++$held;
 			return;
 		}
 
@@ -1078,9 +1786,11 @@ final class BulkStringTranslateJob extends AbstractJob {
 	 * @param int    $capped      Rows still missing beyond the per-dispatch cap.
 	 * @param string $first_error First failure reason.
 	 * @param bool   $run_failed  Nothing was translated and the run failed.
+	 * @param int    $held        Held for review (an outdated run).
+	 * @param int    $rejected    Outdated pairs a person's Reject or Undo left out.
 	 * @return array<string, mixed>
 	 */
-	private function run_result( int $total, int $translated, int $skipped, int $failed, int $targets, int $capped, string $first_error, bool $run_failed ): array {
+	private function run_result( int $total, int $translated, int $skipped, int $failed, int $targets, int $capped, string $first_error, bool $run_failed, int $held = 0, int $rejected = 0 ): array {
 		// Cut so the result always fits the jobs row's result cap.
 		if ( mb_strlen( $first_error ) > self::FIRST_ERROR_MAX_CHARS ) {
 			$first_error = mb_substr( $first_error, 0, self::FIRST_ERROR_MAX_CHARS ) . '...';
@@ -1095,6 +1805,14 @@ final class BulkStringTranslateJob extends AbstractJob {
 			'capped'      => $capped,
 			'first_error' => $first_error,
 		];
+
+		if ( $held > 0 ) {
+			$result['held'] = $held;
+		}
+
+		if ( $rejected > 0 ) {
+			$result['skipped_rejected'] = $rejected;
+		}
 
 		if ( $run_failed ) {
 			$result['run_failed'] = true;
@@ -1116,10 +1834,12 @@ final class BulkStringTranslateJob extends AbstractJob {
 	 * @param int    $processed          Pairs done.
 	 * @param int    $already_translated Skipped as already translated.
 	 * @param string $encoded_ids        The selection (encode_ids()).
+	 * @param int    $held               Held for review.
+	 * @param int    $rejected           Outdated pairs a person's Reject or Undo left out.
 	 * @return array<string, mixed>
 	 */
-	private function stopped_result( int $total, int $translated, int $skipped, int $failed, int $targets, int $capped, string $first_error, int $processed, int $already_translated, string $encoded_ids ): array {
-		$result = $this->run_result( $total, $translated, $skipped, $failed, $targets, $capped, $first_error, false );
+	private function stopped_result( int $total, int $translated, int $skipped, int $failed, int $targets, int $capped, string $first_error, int $processed, int $already_translated, string $encoded_ids, int $held = 0, int $rejected = 0 ): array {
+		$result = $this->run_result( $total, $translated, $skipped, $failed, $targets, $capped, $first_error, false, $held, $rejected );
 
 		$result['processed']             = $processed;
 		$result['already_translated']    = $already_translated;
@@ -1133,7 +1853,7 @@ final class BulkStringTranslateJob extends AbstractJob {
 	 * Report the checkpoint before a unit's provider call: the unit's start, so a kill re-sends that unit only.
 	 *
 	 * @param callable               $progress    Progress callback.
-	 * @param array<int, int|string> $at          Processed, translated, skipped, already translated, failed, first error at the unit's start.
+	 * @param array<int, int|string> $at          Processed, translated, skipped, already translated, failed, first error, held at the unit's start.
 	 * @param int                    $total       Pairs in the run.
 	 * @param int                    $targets     Target languages.
 	 * @param int                    $capped      Rows beyond the per-dispatch cap.
@@ -1141,13 +1861,14 @@ final class BulkStringTranslateJob extends AbstractJob {
 	 * @param int                    $string_id   The unit's first string.
 	 * @param string                 $slug        Target language slug.
 	 * @param array<int, bool>       $settled     Strings of the chunk a stopped run settled.
-	 * @phpstan-param array{0: int, 1: int, 2: int, 3: int, 4: int, 5: string} $at
+	 * @param int                    $rejected    Outdated pairs a person's Reject or Undo left out.
+	 * @phpstan-param array{0: int, 1: int, 2: int, 3: int, 4: int, 5: string, 6: int} $at
 	 * @return void
 	 */
-	private function unit_checkpoint( callable $progress, array $at, int $total, int $targets, int $capped, string $encoded_ids, int $string_id, string $slug, array $settled ): void {
-		[ $processed, $translated, $skipped, $already_translated, $failed, $first_error ] = $at;
+	private function unit_checkpoint( callable $progress, array $at, int $total, int $targets, int $capped, string $encoded_ids, int $string_id, string $slug, array $settled, int $rejected = 0 ): void {
+		[ $processed, $translated, $skipped, $already_translated, $failed, $first_error, $held ] = $at;
 
-		$point = self::with_settled( $this->stopped_result( $total, $translated, $skipped, $failed, $targets, $capped, $first_error, $processed, $already_translated, $encoded_ids ), $settled );
+		$point = self::with_settled( $this->stopped_result( $total, $translated, $skipped, $failed, $targets, $capped, $first_error, $processed, $already_translated, $encoded_ids, $held, $rejected ), $settled );
 		unset( $point['__perflocale_continue'] );
 
 		$progress(
@@ -1410,6 +2131,7 @@ final class BulkStringTranslateJob extends AbstractJob {
 	 * @phpstan-param StringItem $item
 	 * @param string[]                                                   $outputs          Provider answers, parallel to the item's texts.
 	 * @param int                                                        $language_id      Target language id.
+	 * @param bool                                                       $hold             Hold the checked answer for review instead of saving it.
 	 * @param bool                                                       $skip_existing    Keep a value saved meanwhile.
 	 * @return array{saved: bool, error: string, translation: string, kept?: bool}
 	 */
@@ -1419,7 +2141,8 @@ final class BulkStringTranslateJob extends AbstractJob {
 		array $item,
 		array $outputs,
 		int $language_id,
-		bool $skip_existing
+		bool $hold = false,
+		bool $skip_existing = false
 	): array {
 		$string_id   = (int) $item['id'];
 		$original    = (string) $item['original'];
@@ -1452,7 +2175,9 @@ final class BulkStringTranslateJob extends AbstractJob {
 				break;
 			}
 
-			$text         = PlaceholderMasker::restore( $out, $item['phs'][ $i ] ?? [] );
+			// The MT allowlist with the placeholders back, the source form's own held elements kept.
+			$form_source  = PlaceholderMasker::restore( (string) ( $item['texts'][ $i ] ?? '' ), $item['phs'][ $i ] ?? [] );
+			$text         = TranslationService::sanitize_mt_value_kept( PlaceholderMasker::restore( $out, $item['phs'][ $i ] ?? [] ), $form_source, $kept );
 			$check_source = $original;
 
 			if ( is_array( $item['numbers'] ) ) {
@@ -1517,7 +2242,18 @@ final class BulkStringTranslateJob extends AbstractJob {
 				$text = self::keep_edge_whitespace( $original, $text );
 			}
 
-			$forms[] = $text;
+			// Kept source markup under the acting user's rules (the Strings screen's KSES without unfiltered_html).
+			$forms[] = $kept ? \PerfLocale\Resync\SaveProbe::as_user( $text ) : $text;
+		}
+
+		if ( $hold ) {
+			$hold_error = self::hold_item( $item, $language_id, $forms, $forms_error, $this->options_hash );
+
+			return [
+				'saved'       => '' === $hold_error,
+				'error'       => '' === $hold_error ? $forms_error : $hold_error,
+				'translation' => $forms[0],
+			];
 		}
 
 		// As stored now: a person may have saved a value while the provider worked.
@@ -1596,6 +2332,77 @@ final class BulkStringTranslateJob extends AbstractJob {
 			'error'       => $error,
 			'translation' => $forms[0],
 		];
+	}
+
+	/**
+	 * Hold one outdated string's new translation for review: a pending string change based on the translation the
+	 * run sent (item base), so Apply refuses it once a person changed that translation. Nothing live changes.
+	 *
+	 * @param array<string, mixed> $item         From build_item().
+	 * @phpstan-param StringItem $item
+	 * @param int                  $language_id  Target language id.
+	 * @param array<int, string>   $forms        The checked translation, form 1 first.
+	 * @param string               $forms_error  Why a later plural form was dropped ('' when none).
+	 * @param string               $options_hash The run's options hash (hold_summary()).
+	 * @return string '' when held, else the reason.
+	 */
+	private static function hold_item( array $item, int $language_id, array $forms, string $forms_error, string $options_hash ): string {
+		$string_id = (int) $item['id'];
+		$state     = \PerfLocale\Automation\StringTarget::state( $string_id, $language_id );
+		$base      = $item['base'] ?? '';
+
+		if ( null === $state || ( false !== $state && '' === $state['translation'] ) ) {
+			return sprintf(
+				/* translators: %d: string ID. */
+				__( 'String #%d has no translation to update any more.', 'perflocale' ),
+				$string_id
+			);
+		}
+
+		if ( false === $state || '' === $base ) {
+			return sprintf(
+				/* translators: %d: string ID. */
+				__( 'String #%d could not be read, so its new translation was not held for review.', 'perflocale' ),
+				$string_id
+			);
+		}
+
+		// Plural forms 2..N only when every form came back; otherwise the stored forms stay.
+		$extra = is_array( $item['numbers'] ) && '' === $forms_error && count( $forms ) > 1 ? array_slice( $forms, 1 ) : null;
+
+		$held = \PerfLocale\Automation\ChangeService::hold(
+			[
+				'area'         => \PerfLocale\Automation\Policy::AREA_STRING,
+				'object_type'  => \PerfLocale\Enum\ObjectType::String->value,
+				'object_id'    => $string_id,
+				'source_id'    => 0,
+				'language_id'  => $language_id,
+				'origin'       => 'machine',
+				'trigger_name' => 'resync_strings',
+				'job_id'       => class_exists( \PerfLocale\Background\WorkerRunner::class, false ) ? \PerfLocale\Background\WorkerRunner::current_job_id( 'bulk_string_translate' ) : '',
+				'user_id'      => get_current_user_id(),
+				'actor'        => \PerfLocale\Automation\Policy::current_actor(),
+				'decision'     => \PerfLocale\Automation\Policy::REVIEW,
+				'reason'       => 'outdated',
+				'payload'      => [
+					'translation' => $forms[0],
+					'extra_forms' => $extra,
+				],
+				'summary'      => self::hold_summary( \PerfLocale\Util\Scalar::str( $item['row']->original_hash ?? '' ), $options_hash ),
+				'base_hash'    => $base,
+			]
+		);
+
+		if ( 'held' === $held['status'] ) {
+			return '';
+		}
+
+		return sprintf(
+			/* translators: 1: string ID, 2: reason code. */
+			__( 'The new translation of string #%1$d could not be held for review (%2$s).', 'perflocale' ),
+			$string_id,
+			$held['status']
+		);
 	}
 
 	/**
@@ -1685,8 +2492,9 @@ final class BulkStringTranslateJob extends AbstractJob {
 		$minted_group_id   = 0;
 
 		if ( ! $group_repo->is_string_group( $group_id ) ) {
-			$group_id        = $this->mint_string_group( $string_id );
-			$minted_group_id = $group_id;
+			$own             = false;
+			$group_id        = $this->mint_string_group( $string_id, $original_group_id, $own );
+			$minted_group_id = $own ? $group_id : 0;
 
 			if ( $group_id === 0 ) {
 				return sprintf(
@@ -1788,7 +2596,8 @@ final class BulkStringTranslateJob extends AbstractJob {
 		$minted   = 0;
 
 		if ( ! $group_repo->is_string_group( $group_id ) ) {
-			$minted = $this->mint_string_group( $string_id );
+			$own    = false;
+			$minted = $this->mint_string_group( $string_id, $now['group_id'], $own );
 
 			if ( $minted === 0 ) {
 				return sprintf(
@@ -1808,7 +2617,7 @@ final class BulkStringTranslateJob extends AbstractJob {
 
 		if ( null === $link ) {
 			if ( ! self::link_if_free( $group_repo, $group_id, $string_id, $language_id ) ) {
-				if ( $minted > 0 ) {
+				if ( $minted > 0 && $own ) {
 					self::undo_group_repair( $row, $string_id, $minted, $now['group_id'] );
 				}
 
@@ -2080,15 +2889,17 @@ final class BulkStringTranslateJob extends AbstractJob {
 	 * TranslationFileGenerator's repair do). Both are checked: a failure reclaims the group and returns 0, so the row
 	 * counts failed. Why: docs-ai/11-code-rationale.md, "BulkStringTranslateJob: save order and group repair".
 	 *
-	 * @param int $string_id Row in the `strings` table to repair.
-	 * @return int New group id, or 0 when the repair could not be completed.
+	 * @param int  $string_id Row in the `strings` table to repair.
+	 * @param int  $from      The group the caller read: the string moves only while it names it.
+	 * @param bool $own       Receives whether the group is this call's (false: another writer's repair won).
+	 * @return int New group id, the winner's string group, or 0 when the repair could not be completed.
 	 */
-	private function mint_string_group( int $string_id ): int {
-		if ( $string_id <= 0 ) {
+	private function mint_string_group( int $string_id, int $from, bool &$own = false ): int {
+		global $wpdb;
+
+		if ( $string_id <= 0 || ! $wpdb instanceof \wpdb ) {
 			return 0;
 		}
-
-		global $wpdb;
 
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Self-heal write; there is no cache to consult and no repository accessor that mints a bare string group.
 		$inserted = $wpdb->insert(
@@ -2109,32 +2920,28 @@ final class BulkStringTranslateJob extends AbstractJob {
 			return 0;
 		}
 
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Self-heal write, keyed on the primary key.
-		$updated = $wpdb->update(
-			Schema::table( 'strings' ),
-			[ 'group_id' => $group_id ],
-			[ 'id' => $string_id ],
-			[ '%d' ],
-			[ '%d' ]
-		);
+		$taken = \PerfLocale\Database\Repository\StringGroupAssigner::repoint( $wpdb, $string_id, $from, $group_id );
 
-		if ( ! is_int( $updated ) || $updated < 1 ) {
+		if ( 0 === $taken ) {
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Reclaiming the group this method just created, by primary key.
 			$wpdb->delete( Schema::table( 'translation_groups' ), [ 'id' => $group_id ], [ '%d' ] );
 
 			return 0;
 		}
 
-		return $group_id;
+		$own = $taken === $group_id;
+
+		return $taken;
 	}
 
 	/**
 	 * Load every source-string row in one query.
 	 *
 	 * @param int[] $ids
+	 * @param bool  $with_hash Also read `original_hash` (an outdated run's hold summary).
 	 * @return array<int, object> string_id => row
 	 */
-	private function load_strings_by_ids( array $ids ): array {
+	private function load_strings_by_ids( array $ids, bool $with_hash = false ): array {
 		if ( $ids === [] ) {
 			return [];
 		}
@@ -2146,7 +2953,7 @@ final class BulkStringTranslateJob extends AbstractJob {
 		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- Replacements are assembled with array_merge()/unpacking, which WPCS cannot count; the %i table names lead, then the values in placeholder order.
 		$rows = $wpdb->get_results(
 			$wpdb->prepare(
-				"SELECT id, group_id, domain, context, original FROM %i WHERE id IN ({$placeholders})",
+				'SELECT id, group_id, domain, context, original' . ( $with_hash ? ', original_hash' : '' ) . " FROM %i WHERE id IN ({$placeholders})",
 				$table,
 				...$ids
 			)

@@ -17,7 +17,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Fetches exchange rates on a schedule from a provider a site registers, and stores them per language.
+ * Fetches exchange rates on a schedule (the built-in ECB source or a registered provider) and stores them per language.
  */
 final class ExchangeRateSync {
 
@@ -45,11 +45,17 @@ final class ExchangeRateSync {
 	public const RATES_OPTION = 'perflocale_exchange_rates';
 
 	/**
-	 * Built-in provider definitions.
+	 * Built-in provider definitions; `ecb` is fetched by EcbRates.
 	 *
 	 * @var array<string, array{name: string, needs_key: bool, key_setting: string}>
 	 */
-	private const PROVIDERS = [];
+	private const PROVIDERS = [
+		'ecb' => [
+			'name'        => 'European Central Bank',
+			'needs_key'   => false,
+			'key_setting' => '',
+		],
+	];
 
 	/**
 	 * Available sync intervals, keyed by interval setting slug.
@@ -81,6 +87,13 @@ final class ExchangeRateSync {
 	 * @var array<string, float>
 	 */
 	private array $accepted_rates = [];
+
+	/**
+	 * This run's EcbRates reason or note, and whether its failure is the store's setup (kept off the breaker).
+	 *
+	 * @var array{0: string, 1: bool}
+	 */
+	private array $fetch_note = [ '', false ];
 
 	/**
 	 * Constructor.
@@ -267,7 +280,7 @@ final class ExchangeRateSync {
 			)
 			: sprintf(
 				/* translators: %s: Human-readable time since last sync, or "never". */
-				__( 'Automatic exchange-rate sync is on, but no rate source is configured, so rates cannot update (last sync: %s). Register a provider with the perflocale/woocommerce/exchange_rate_providers filter, supply rates directly with perflocale/woocommerce/exchange_rates_fetched, or turn auto-sync off in the Currencies settings.', 'perflocale' ),
+				__( 'Automatic exchange-rate sync is on, but no rate source is configured, so rates cannot update (last sync: %s). Select the European Central Bank as the rate provider, register a provider with the perflocale/woocommerce/exchange_rate_providers filter, supply rates directly with perflocale/woocommerce/exchange_rates_fetched, or turn auto-sync off in the Currencies settings.', 'perflocale' ),
 				$last_synced
 			);
 
@@ -492,7 +505,8 @@ final class ExchangeRateSync {
 		$breaker_key = 'fx_sync';
 
 		// Track recurring-handler timing for the Jobs admin panel.
-		$started_at = time();
+		$started_at       = time();
+		$this->fetch_note = [ '', false ];
 
 		// Captured up front so a blog switch mid-sync cannot write one blog's rates into another.
 		$origin_blog_id = function_exists( 'get_current_blog_id' ) ? (int) get_current_blog_id() : 0;
@@ -500,8 +514,7 @@ final class ExchangeRateSync {
 		// Raw option, not get_woocommerce_currency(): MultiCurrency filters that to the language's currency.
 		$base_currency = (string) get_option( 'woocommerce_currency', 'USD' );
 
-		if ( is_multisite() && $origin_blog_id > 0 && $origin_blog_id !== (int) get_current_blog_id() ) {
-			$this->log_sync_error( 'Aborting sync: blog context changed mid-request.' );
+		if ( $this->blog_switched( $origin_blog_id ) ) {
 			return [];
 		}
 		$providers   = $this->get_providers();
@@ -596,6 +609,10 @@ final class ExchangeRateSync {
 			? $this->fetch_rates( $provider_id, $provider, $base_currency, array_keys( $target_codes ), $api_key )
 			: [];
 
+		if ( $this->blog_switched( $origin_blog_id ) ) {
+			return [];
+		}
+
 		/**
 		 * Filter fetched exchange rates before they are saved.
 		 *
@@ -605,10 +622,19 @@ final class ExchangeRateSync {
 		 */
 		$rates = (array) apply_filters( 'perflocale/woocommerce/exchange_rates_fetched', $rates, $base_currency, $provider_id );
 
+		// Rechecked here: this filter may switch blogs and not switch back.
+		if ( $this->blog_switched( $origin_blog_id ) ) {
+			return [];
+		}
+
 		if ( empty( $rates ) ) {
-			$this->log_sync_error( 'No rates returned from ' . ( $provider['name'] ?? ( $provider_id !== '' ? $provider_id : 'the exchange_rates_fetched filter' ) ) );
-			// Provider failure: feed the breaker.
-			\PerfLocale\Concurrency\Breaker::record_failure( $breaker_key, 'fetch_empty' );
+			$this->log_sync_error( $this->fetch_note[0] !== '' ? $this->fetch_note[0] : 'No rates returned from ' . ( $provider['name'] ?? ( $provider_id !== '' ? $provider_id : 'the exchange_rates_fetched filter' ) ) );
+
+			// Provider failure: feed the breaker. A setup fault (an unpublished currency) is not retried away.
+			if ( ! $this->fetch_note[1] ) {
+				\PerfLocale\Concurrency\Breaker::record_failure( $breaker_key, 'fetch_empty' );
+			}
+
 			return [];
 		}
 
@@ -642,8 +668,8 @@ final class ExchangeRateSync {
 				continue;
 			}
 
-			// Checked as stored: a tiny rate rounds to 0.
-			$value = MultiCurrency::usable_rate( round( (float) $raw, 6 ) );
+			// Stored unrounded: 6 decimals put IDR -> EUR (0.0000495) about 1% off; amounts round at the price decimals.
+			$value = MultiCurrency::usable_rate( $raw );
 
 			if ( null === $value ) {
 				$rejected[ $code ] = (string) $raw;
@@ -654,6 +680,9 @@ final class ExchangeRateSync {
 			$accepted[ $code ]       = $value;
 		}
 
+		// One stored message: the rejected rates, then the source's note (currencies it does not publish).
+		$notes = [];
+
 		if ( $rejected !== [] ) {
 			$pairs = [];
 
@@ -661,13 +690,19 @@ final class ExchangeRateSync {
 				$pairs[] = $code . '=' . $value;
 			}
 
-			$this->log_sync_error(
-				sprintf(
-					/* translators: %s: comma-separated list of currency=value pairs that were rejected. */
-					__( 'Ignored invalid exchange rates (must be a positive number): %s', 'perflocale' ),
-					implode( ', ', $pairs )
-				)
+			$notes[] = sprintf(
+				/* translators: %s: comma-separated list of currency=value pairs that were rejected. */
+				__( 'Ignored invalid exchange rates (must be a positive number): %s', 'perflocale' ),
+				implode( ', ', $pairs )
 			);
+		}
+
+		if ( $this->fetch_note[0] !== '' ) {
+			$notes[] = $this->fetch_note[0];
+		}
+
+		if ( $notes !== [] ) {
+			$this->log_sync_error( implode( ' ', $notes ) );
 		}
 
 		// Every target currency came back invalid: a provider fault, not a success.
@@ -726,6 +761,25 @@ final class ExchangeRateSync {
 	}
 
 	/**
+	 * Whether the request left the blog the sync started on; the abort is logged on that blog, nothing on this one.
+	 *
+	 * @param int $origin_blog_id Blog id at the start of the sync.
+	 * @return bool
+	 * @phpstan-impure Callbacks between two calls may switch blogs.
+	 */
+	private function blog_switched( int $origin_blog_id ): bool {
+		if ( ! is_multisite() || $origin_blog_id <= 0 || $origin_blog_id === (int) get_current_blog_id() ) {
+			return false;
+		}
+
+		switch_to_blog( $origin_blog_id );
+		$this->log_sync_error( 'Aborting sync: blog context changed mid-request.' );
+		restore_current_blog();
+
+		return true;
+	}
+
+	/**
 	 * Fetch rates from the selected provider.
 	 *
 	 * @param string                                                                                $provider_id Provider slug.
@@ -734,6 +788,7 @@ final class ExchangeRateSync {
 	 * @param array<int, string>                                                                    $targets Target currency codes.
 	 * @param string                                                                                $api_key API key (empty if not needed).
 	 * @return array<string, float> Currency code => exchange rate.
+	 * @phpstan-impure Sets $fetch_note.
 	 */
 	private function fetch_rates( string $provider_id, array $provider, string $base, array $targets, string $api_key ): array {
 		// Allow custom providers to supply a callback.
@@ -741,12 +796,20 @@ final class ExchangeRateSync {
 			try {
 				return (array) call_user_func( $provider['fetch_callback'], $base, $targets, $api_key );
 			} catch ( \Throwable $e ) {
-				$this->log_sync_error( 'Custom provider error: ' . $e->getMessage() );
+				// Logged by the caller after its blog check: the callback may have left this blog.
+				$this->fetch_note = [ 'Custom provider error: ' . $e->getMessage(), false ];
 				return [];
 			}
 		}
 
-		// No bundled providers: only a registered fetch_callback or the exchange_rates_fetched filter.
+		if ( $provider_id === 'ecb' ) {
+			require_once __DIR__ . '/EcbRates.php';
+			[ $rates, $note, $setup ] = EcbRates::fetch( $base, $targets );
+			$this->fetch_note         = [ $note, $setup ];
+
+			return $rates;
+		}
+
 		return [];
 	}
 
@@ -795,8 +858,16 @@ final class ExchangeRateSync {
 		// See docs-ai/11-code-rationale.md, "ExchangeRateSync: last error write".
 		$existing = get_option( 'perflocale_exchange_rate_last_error', [] );
 
+		// Rewritten after a later sync, or Site Health reads the old timestamp as resolved.
 		if ( is_array( $existing ) && isset( $existing['message'] ) && $existing['message'] === $message ) {
-			return;
+			$last = get_option( self::LAST_SYNC_OPTION, [] );
+
+			$then    = is_int( $existing['timestamp'] ?? null ) ? $existing['timestamp'] : 0;
+			$last_ts = is_array( $last ) && is_int( $last['timestamp'] ?? null ) ? $last['timestamp'] : 0;
+
+			if ( $then >= $last_ts ) {
+				return;
+			}
 		}
 
 		update_option(
@@ -845,7 +916,8 @@ final class ExchangeRateSync {
 			[
 				'rates'     => $this->accepted_rates,
 				'timestamp' => $last_sync['timestamp'] ?? time(),
-				'message'   => __( 'Exchange rates updated successfully.', 'perflocale' ),
+				// The source's note names currencies it does not publish, which keep their stored rate.
+				'message'   => __( 'Exchange rates updated successfully.', 'perflocale' ) . ( $this->fetch_note[0] !== '' ? ' ' . $this->fetch_note[0] : '' ),
 			]
 		);
 	}

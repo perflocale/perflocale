@@ -26,6 +26,9 @@ final class TranslatorRole {
 	 */
 	public const ROLE_SLUG = 'perflocale_translator';
 
+	/** Option: the role as a keep-data uninstall removed it (name, caps), for the next activation; never exported. */
+	public const ROLE_SNAPSHOT_OPTION = 'perflocale_translator_role_snapshot';
+
 	/**
 	 * All custom capabilities.
 	 */
@@ -37,18 +40,6 @@ final class TranslatorRole {
 		'perflocale_manage_addons',
 		'perflocale_use_mt',
 		'perflocale_import_export',
-	];
-
-	/**
-	 * Retired capabilities, still stripped on deactivation and uninstall.
-	 *
-	 * Retire a capability by moving it here, never by deleting it: remove_roles() strips only listed ones.
-	 *
-	 * @var array<int, string>
-	 */
-	private const LEGACY_CAPABILITIES = [
-		// Not granted by PerfLocale; stripped on deactivation and uninstall.
-		'perflocale_manage_glossary',
 	];
 
 	/**
@@ -113,7 +104,7 @@ final class TranslatorRole {
 	private const SHOP_MANAGER_ROLE = 'shop_manager';
 
 	/**
-	 * Option recording the Shop Manager grant (`granted`, and `removed` after a deactivation).
+	 * Option recording the Shop Manager grant (`granted`, and `removed` once the grant came off).
 	 *
 	 * Autoloaded: read on every admin_init of a WooCommerce site. While it exists the grant is never repeated.
 	 */
@@ -421,7 +412,7 @@ final class TranslatorRole {
 			return;
 		}
 
-		// After a deactivation: restore only what the filter still grants with the same value (never widens the
+		// The grant came off: restore only what the filter still grants with the same value (never widens the
 		// role), and only where the role has no entry (an owner's deny stays).
 		$granted = isset( $stored['granted'] ) && is_array( $stored['granted'] ) ? self::normalise_caps( $stored['granted'] ) : [];
 		$removed = is_array( $stored['removed'] ) ? array_filter( $stored['removed'], 'is_string' ) : [];
@@ -436,13 +427,14 @@ final class TranslatorRole {
 	}
 
 	/**
-	 * On deactivation, take the recorded Shop Manager grant off and note what the owner had already removed.
+	 * On a preserve-mode uninstall, take the recorded Shop Manager grant off and note what the owner had already
+	 * removed; the record stays, so a reinstall's grant pass puts the rest back. A record with `removed` is left as it is.
 	 *
-	 * A record that already has `removed` (a second deactivation) is left as it is.
+	 * @internal Called by SiteCleanup's preserve-mode uninstall only.
 	 *
 	 * @return void
 	 */
-	private static function strip_shop_manager_caps(): void {
+	public static function strip_shop_manager_caps(): void {
 		$stored = get_option( self::SHOP_MANAGER_OPTION, false );
 
 		if ( ! is_array( $stored ) || isset( $stored['removed'] ) || ! isset( $stored['granted'] ) || ! is_array( $stored['granted'] ) ) {
@@ -477,78 +469,41 @@ final class TranslatorRole {
 	}
 
 	/**
-	 * Remove all custom roles and capabilities on plugin deactivation.
+	 * Before the Translator role is removed, record the owner's removed and denied defaults in the ledger.
 	 *
-	 * First records the owner's removed and denied defaults in the ledger, so reactivation restores them.
+	 * @internal Called by SiteCleanup's preserve-mode uninstall only.
 	 *
 	 * @return void
 	 */
-	public static function remove_roles(): void {
+	public static function record_translator_ledger(): void {
 		$translator = get_role( self::ROLE_SLUG );
 
-		if ( null !== $translator ) {
-			$granted = self::translator_ledger()['granted'];
-			$removed = [];
-			$denied  = [];
+		if ( null === $translator ) {
+			return;
+		}
 
-			foreach ( self::translator_caps() as $cap => $grant ) {
-				if ( true === $grant && true === ( $granted[ $cap ] ?? null ) && empty( $translator->capabilities[ $cap ] ) ) {
-					if ( array_key_exists( $cap, $translator->capabilities ) ) {
-						$denied[] = $cap;
-					} else {
-						$removed[] = $cap;
-					}
+		$granted = self::translator_ledger()['granted'];
+		$removed = [];
+		$denied  = [];
+
+		foreach ( self::translator_caps() as $cap => $grant ) {
+			if ( true === $grant && true === ( $granted[ $cap ] ?? null ) && empty( $translator->capabilities[ $cap ] ) ) {
+				if ( array_key_exists( $cap, $translator->capabilities ) ) {
+					$denied[] = $cap;
+				} else {
+					$removed[] = $cap;
 				}
 			}
-
-			update_option(
-				self::TRANSLATOR_LEDGER_OPTION,
-				[
-					'granted' => $granted,
-					'removed' => $removed,
-					'denied'  => $denied,
-				],
-				false
-			);
 		}
 
-		remove_role( self::ROLE_SLUG );
-
-		self::strip_shop_manager_caps();
-
-		/**
-		 * Filter which WordPress roles have PerfLocale capabilities removed on plugin deactivation.
-		 *
-		 * Remove a role slug from this array to keep its PerfLocale capabilities after deactivation.
-		 *
-		 * @hook perflocale/roles/cap_roles
-		 *
-		 * @param string[] $roles Role slugs to strip. Default: ['administrator', 'editor'].
-		 */
-		$roles = (array) apply_filters( 'perflocale/roles/cap_roles', [ 'administrator', 'editor' ] );
-
-		foreach ( $roles as $role_slug ) {
-			$role = get_role( sanitize_key( (string) $role_slug ) );
-
-			if ( ! $role ) {
-				continue;
-			}
-
-			foreach ( self::CAPABILITIES as $cap ) {
-				$role->remove_cap( $cap );
-			}
-
-			// Retired capabilities too, or they stay on the role forever.
-			foreach ( self::LEGACY_CAPABILITIES as $cap ) {
-				$role->remove_cap( $cap );
-			}
-		}
-
-		// Orphan user-level PerfLocale capabilities; one sweep shared with SiteCleanup so the two cannot drift.
-		if ( class_exists( \PerfLocale\Database\SiteCleanup::class ) ) {
-			\PerfLocale\Database\SiteCleanup::sweep_orphan_user_caps();
-		}
-
-		delete_option( 'perflocale_caps_version' );
+		update_option(
+			self::TRANSLATOR_LEDGER_OPTION,
+			[
+				'granted' => $granted,
+				'removed' => $removed,
+				'denied'  => $denied,
+			],
+			false
+		);
 	}
 }

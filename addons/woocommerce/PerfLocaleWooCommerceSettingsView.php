@@ -19,6 +19,16 @@ if ( ! defined( 'ABSPATH' ) ) {
 final class PerfLocaleWooCommerceSettingsView {
 
 	/**
+	 * A rate as the input's value: the shortest text that reads back as the same float (not 14 digits).
+	 *
+	 * @param mixed $rate Synced or stored rate.
+	 * @return string
+	 */
+	public static function rate_attr( mixed $rate ): string {
+		return is_numeric( $rate ) ? (string) wp_json_encode( (float) $rate ) : '1';
+	}
+
+	/**
 	 * The subtab content (see PerfLocaleWooCommerce::render_settings_subtab()).
 	 *
 	 * @param \PerfLocale\Settings $settings The plugin settings service.
@@ -90,7 +100,7 @@ final class PerfLocaleWooCommerceSettingsView {
 			<th scope="row"><?php echo esc_html__( 'WooCommerce Pages', 'perflocale' ); ?></th>
 			<td>
 				<p class="description" style="margin:0 0 8px;">
-					<?php echo esc_html__( 'Create translation stubs for Cart, Checkout, My Account, and Shop pages in all active languages. Page titles will be translated using local WordPress translations first, then machine translation if enabled. Existing translations will not be affected.', 'perflocale' ); ?>
+					<?php echo esc_html__( 'Create translation stubs for Cart, Checkout, My Account, and Shop pages in all active languages. Page titles will be translated using local WordPress translations first, then machine translation if enabled. Existing translations keep their slug, status and title.', 'perflocale' ); ?>
 				</p>
 				<div style="display:flex;align-items:center;gap:8px;">
 					<button type="button" class="button" id="perflocale-create-wc-pages">
@@ -169,7 +179,7 @@ final class PerfLocaleWooCommerceSettingsView {
 		<tr id="perflocale-wc-currency-table" data-perflocale-show-if='{"wc_currency_per_lang":true}'
 		<?php
 		if ( ! $currency_per_lang ) {
-			echo ' style="display:none;"'; }
+			echo ' hidden'; }
 		?>
 		>
 			<th scope="row"><?php echo esc_html__( 'Exchange Rates', 'perflocale' ); ?></th>
@@ -240,9 +250,9 @@ final class PerfLocaleWooCommerceSettingsView {
 								<td>
 									<input type="number"
 										name="<?php echo esc_attr( $prefix ); ?>[exchange_rate]"
-										value="<?php echo esc_attr( (string) $rate ); ?>"
-										min="0.0001"
-										step="0.0001"
+										value="<?php echo esc_attr( self::rate_attr( $rate ) ); ?>"
+										min="0"
+										step="any"
 										class="small-text perflocale-rate-input"
 										style="width:100%;"
 										<?php
@@ -298,7 +308,7 @@ final class PerfLocaleWooCommerceSettingsView {
 		<tr id="perflocale-wc-auto-sync-section" data-perflocale-show-if='{"wc_currency_per_lang":true}'
 		<?php
 		if ( ! $currency_per_lang ) {
-			echo ' style="display:none;"'; }
+			echo ' hidden'; }
 		?>
 		>
 			<th scope="row"><?php echo esc_html__( 'Auto-Sync Rates', 'perflocale' ); ?></th>
@@ -314,7 +324,7 @@ final class PerfLocaleWooCommerceSettingsView {
 		<tr id="perflocale-wc-sync-provider" data-perflocale-show-if='{"op":"AND","rules":[{"wc_currency_per_lang":true},{"wc_exchange_rate_auto":true}]}'
 		<?php
 		if ( ! $currency_per_lang || ! $auto_sync ) {
-			echo ' style="display:none;"'; }
+			echo ' hidden'; }
 		?>
 		>
 			<th scope="row"><?php echo esc_html__( 'Rate Provider', 'perflocale' ); ?></th>
@@ -336,6 +346,7 @@ final class PerfLocaleWooCommerceSettingsView {
 								?>
 							</option>
 						<?php endif; ?>
+						<option value="" <?php selected( $rate_provider, '' ); ?> data-needs-key="0" data-key-setting=""><?php echo esc_html__( 'None', 'perflocale' ); ?></option>
 						<?php foreach ( $providers as $pid => $prov ) : ?>
 							<option value="<?php echo esc_attr( $pid ); ?>" <?php selected( $rate_provider, $pid ); ?>
 								data-needs-key="<?php echo esc_attr( ! empty( $prov['needs_key'] ) ? '1' : '0' ); ?>"
@@ -346,6 +357,8 @@ final class PerfLocaleWooCommerceSettingsView {
 					</select>
 				<?php endif; ?>
 				<p class="description" style="margin-top:6px;">
+					<?php echo esc_html__( 'The European Central Bank needs no key: it publishes reference rates for about 30 currencies once per working day; a currency it does not publish needs a manual rate.', 'perflocale' ); ?>
+					<br>
 					<?php echo esc_html__( 'Register a rate provider with the perflocale/woocommerce/exchange_rate_providers filter, or supply rates directly from perflocale/woocommerce/exchange_rates_fetched.', 'perflocale' ); ?>
 					<br>
 					<a href="https://perflocale.com/docs/exchange-rates/#sync-intervals" target="_blank" rel="noopener"><?php echo esc_html__( 'Exchange rate providers docs', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
@@ -356,7 +369,7 @@ final class PerfLocaleWooCommerceSettingsView {
 		<tr id="perflocale-wc-sync-interval" data-perflocale-show-if='{"op":"AND","rules":[{"wc_currency_per_lang":true},{"wc_exchange_rate_auto":true}]}'
 		<?php
 		if ( ! $currency_per_lang || ! $auto_sync ) {
-			echo ' style="display:none;"'; }
+			echo ' hidden'; }
 		?>
 		>
 			<th scope="row"><?php echo esc_html__( 'Sync Interval', 'perflocale' ); ?></th>
@@ -373,7 +386,7 @@ final class PerfLocaleWooCommerceSettingsView {
 		</tr>
 
 		<?php
-		// No API-key fields: PerfLocale bundles no rate provider.
+		// No API-key fields: the built-in ECB source needs none.
 		$key_fields = [];
 
 		foreach ( $key_fields as $field_key => $field ) :
@@ -395,7 +408,7 @@ final class PerfLocaleWooCommerceSettingsView {
 		<tr class="perflocale-api-key-row" data-provider="<?php echo esc_attr( $field['provider'] ); ?>" data-perflocale-show-if="<?php echo esc_attr( (string) $show_if_json ); ?>" 
 			<?php
 			if ( ! $is_visible ) {
-				echo 'style="display:none;"'; }
+				echo 'hidden'; }
 			?>
 		>
 			<th scope="row"><?php echo esc_html( $field['label'] ); ?></th>
@@ -436,7 +449,7 @@ final class PerfLocaleWooCommerceSettingsView {
 		<tr id="perflocale-wc-sync-status" data-perflocale-show-if='{"op":"AND","rules":[{"wc_currency_per_lang":true},{"wc_exchange_rate_auto":true}]}'
 		<?php
 		if ( ! $currency_per_lang || ! $auto_sync ) {
-			echo ' style="display:none;"'; }
+			echo ' hidden'; }
 		?>
 		>
 			<th scope="row"><?php echo esc_html__( 'Sync Status', 'perflocale' ); ?></th>

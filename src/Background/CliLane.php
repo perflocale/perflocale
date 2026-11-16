@@ -89,10 +89,23 @@ final class CliLane {
 	 * @return string Error message; '' when reset.
 	 */
 	private static function retry( string $job_id, array $state, array $args ): string {
+		// As `jobs retry`: reset and schedule as one step against a Cancel (JobState::control()).
+		return JobState::control( $job_id, static fn(): string => self::retry_held( $job_id, $state, $args ) ) ?? "Job {$job_id} is being changed by another request. Try again in a moment.";
+	}
+
+	/**
+	 * retry() under the job's control lock; the reset matches only the version read before it.
+	 *
+	 * @param string               $job_id Job identifier.
+	 * @param array<string, mixed> $state  Row read before the hold.
+	 * @param array<string, mixed> $args   Worker args with the blog sentinel.
+	 * @return string Error message; '' when reset.
+	 */
+	private static function retry_held( string $job_id, array $state, array $args ): string {
 		$version = $state['version'] ?? null;
 
 		if ( ! is_int( $version ) || ! JobState::reset_for_retry( $job_id, true, -1, -1, $version ) ) {
-			return "Could not reset job {$job_id} for retry (its state changed concurrently).";
+			return '' !== JobState::retry_refused() ? JobState::retry_refused() : "Could not reset job {$job_id} for retry (its state changed concurrently).";
 		}
 
 		$runner = JobRunnerFactory::pick();

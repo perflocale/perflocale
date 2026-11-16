@@ -34,6 +34,31 @@ final class ObjectPermission {
 
 		$can = current_user_can( $capability, $post_id );
 
+		return self::host_answer( $can, $action, $post_id );
+	}
+
+	/**
+	 * Core's edit_post and the host's answer, both: for routes that never act on a host-only type, so the host can
+	 * refuse but not grant.
+	 *
+	 * @since 1.0.8
+	 *
+	 * @param int $post_id Post ID.
+	 * @return bool
+	 */
+	public static function edit_narrowed( int $post_id ): bool {
+		return current_user_can( 'edit_post', $post_id ) && self::host_answer( true, 'edit', $post_id );
+	}
+
+	/**
+	 * The perflocale/object/user_can answer for the current user, given core's.
+	 *
+	 * @param bool   $can     Core's answer.
+	 * @param string $action  Semantic action.
+	 * @param int    $post_id Post ID.
+	 * @return bool
+	 */
+	private static function host_answer( bool $can, string $action, int $post_id ): bool {
 		// For the filter to switch on (a listener answers for its own type only); read and filtered on every check, as
 		// a host may count the filter's runs (did_filter()).
 		$post_type = (string) get_post_type( $post_id );
@@ -58,6 +83,23 @@ final class ObjectPermission {
 		 * @return bool
 		 */
 		return (bool) apply_filters( 'perflocale/object/user_can', $can, $action, $post_id, $post_type );
+	}
+
+	/**
+	 * Whether the current user may read a post's text: `read_post`, and for a password-protected post the edit right
+	 * (core's REST gives protected content only to an editor or a password holder, and no automated read has one).
+	 *
+	 * @since 1.0.8
+	 *
+	 * @param \WP_Post $post The post.
+	 * @return bool
+	 */
+	public static function read_text( \WP_Post $post ): bool {
+		if ( ! self::check( 'read', 'read_post', $post->ID ) ) {
+			return false;
+		}
+
+		return '' === (string) $post->post_password || self::check( 'edit', 'edit_post', $post->ID );
 	}
 
 	/**

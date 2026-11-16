@@ -1,21 +1,26 @@
 /**
  * PerfLocale - admin Settings page progressive enhancements.
  *
+ * Dependent rows: the server prints each with the `hidden` attribute from the
+ * stored value; these only follow the control on change (the first call is a
+ * no-op unless the browser restored another form value). No style.display.
+ *
  * Switcher tab: rows tagged with `data-perflocale-show-when-display="<value>"`
- * are shown only when the Display Mode select matches `<value>`. No-ops on
- * tabs where the trigger select isn't present.
+ * show only when the Display Mode select matches `<value>`.
  *
  * URL & Routing tab: the per-language domain table
- * (`#perflocale-domain-config`) is shown only while the "Per-language domain"
- * URL mode is selected. The server renders it in every mode, hidden outside
- * domain mode, so a save keeps the stored domains; this only follows the
- * radio. No-ops on tabs without the URL mode radios.
+ * (`#perflocale-domain-config`) shows only in "Per-language domain" URL mode.
+ * It is printed in every mode so a save keeps the stored domains.
  *
  * URL & Routing tab: the GeoIP rows (`.perflocale-geo-field`) follow the
  * GeoIP checkbox (`#perflocale-geo-enabled`).
  *
  * Export & Import tab: "Select All" (`#perflocale-export-all`) ticks or
- * clears every export section, and follows them when they change. The import
+ * clears every export section, and follows them when they change.
+ *
+ * URL & Routing > URL Bases, "Stop redirecting old addresses": "Select All"
+ * (`#perflocale-ub-forget-all`) is shown and ticks or clears every row; without
+ * this script it stays hidden and each row is ticked on its own. The import
  * form's upload in pieces is the first function below.
  *
  * Translation tab: the three bulk tools are the last function below.
@@ -373,12 +378,14 @@
 
 			rows.forEach( function ( row ) {
 				var needed = row.getAttribute( 'data-perflocale-show-when-display' );
-				row.style.display = ( needed === current ) ? '' : 'none';
+				row.hidden = needed !== current;
 			} );
 		}
 
 		displaySelect.addEventListener( 'change', apply );
 		apply();
+
+		return apply;
 	}
 
 	function syncDomainConfig() {
@@ -389,11 +396,22 @@
 			return;
 		}
 
+		function apply() {
+			var checked = [].filter.call( radios, function ( r ) {
+				return r.checked;
+			} )[ 0 ];
+
+			if ( checked ) {
+				config.hidden = checked.value !== 'domain';
+			}
+		}
+
 		radios.forEach( function ( radio ) {
-			radio.addEventListener( 'change', function () {
-				config.style.display = ( this.value === 'domain' ) ? '' : 'none';
-			} );
+			radio.addEventListener( 'change', apply );
 		} );
+		apply();
+
+		return apply;
 	}
 
 	function syncGeoFields() {
@@ -406,12 +424,14 @@
 		function toggle() {
 			var on = geo.checked;
 			document.querySelectorAll( '.perflocale-geo-field' ).forEach( function ( tr ) {
-				tr.style.display = on ? '' : 'none';
+				tr.hidden = ! on;
 			} );
 		}
 
 		geo.addEventListener( 'change', toggle );
 		toggle();
+
+		return toggle;
 	}
 
 	function syncExportSelectAll() {
@@ -437,11 +457,55 @@
 		} );
 	}
 
+	function syncUrlBasesForgetAll() {
+		var allCb = document.getElementById( 'perflocale-ub-forget-all' );
+		var boxes = document.querySelectorAll( 'input[name="ub_forget_entries[]"]' );
+
+		if ( ! allCb || ! boxes.length ) {
+			return;
+		}
+
+		allCb.parentNode.hidden = false;
+
+		allCb.addEventListener( 'change', function () {
+			boxes.forEach( function ( cb ) {
+				cb.checked = allCb.checked;
+			} );
+		} );
+
+		boxes.forEach( function ( cb ) {
+			cb.addEventListener( 'change', function () {
+				var ticked = [].filter.call( boxes, function ( c ) {
+					return c.checked;
+				} ).length;
+
+				allCb.checked       = ticked === boxes.length;
+				allCb.indeterminate = ticked > 0 && ticked < boxes.length;
+			} );
+		} );
+	}
+
 	function init() {
-		syncDisplayRows();
-		syncDomainConfig();
-		syncGeoFields();
+		var appliers = [ syncDisplayRows(), syncDomainConfig(), syncGeoFields() ].filter( Boolean );
+
 		syncExportSelectAll();
+		syncUrlBasesForgetAll();
+
+		if ( ! appliers.length ) {
+			return;
+		}
+
+		// Back/forward restores control values after init without a change event: apply once more (a matching row is not written).
+		var reconcile = function () {
+			setTimeout( function () {
+				appliers.forEach( function ( apply ) {
+					apply();
+				} );
+			}, 0 );
+		};
+
+		window.addEventListener( 'pageshow', reconcile );
+		window.addEventListener( 'load', reconcile );
 	}
 
 	if ( document.readyState === 'loading' ) {
@@ -452,7 +516,7 @@
 } )();
 
 /*
- * Settings > Translation: the three bulk tools, Create Taxonomy Translations,
+ * Settings > Translation > Bulk Translation: the three bulk tools, Create Taxonomy Translations,
  * Assign Default Language to Unlinked Posts and Generate Missing Translations.
  * Each button runs its admin-ajax action in batches through
  * window.perflocaleBulkFetch (admin-bulk-fetch.js, a dependency of this script
@@ -568,6 +632,8 @@
 		}
 		btn.addEventListener( 'click', function () {
 			var st = {};
+			// Resume point the server hands back (type index, last post ID).
+			var cursor = { type_index: 0, after_id: 0 };
 			var progress = document.getElementById( 'perflocale-postlang-progress' );
 			var bar = document.getElementById( 'perflocale-postlang-bar' );
 			var status = document.getElementById( 'perflocale-postlang-status' );
@@ -589,6 +655,8 @@
 				var data = new FormData();
 				data.append( 'action', 'perflocale_assign_post_languages' );
 				data.append( '_nonce', d.postLangNonce );
+				data.append( 'type_index', cursor.type_index );
+				data.append( 'after_id', cursor.after_id );
 				perflocaleBulkFetch( data, st )
 					.then( function ( resp ) {
 						clearInterval( pInterval );
@@ -602,6 +670,8 @@
 							return;
 						}
 						if ( resp.data && resp.data.remaining > 0 ) {
+							cursor.type_index = resp.data.type_index || 0;
+							cursor.after_id = resp.data.after_id || 0;
 							if ( status ) status.textContent = resp.data.message || d.i18nAssigning;
 							pct = 0;
 							pInterval = setInterval( function () {

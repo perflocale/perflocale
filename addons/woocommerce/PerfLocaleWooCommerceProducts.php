@@ -183,8 +183,8 @@ final class PerfLocaleWooCommerceProducts {
 					$nv->set_shipping_class_id( (int) $sv->get_shipping_class_id( 'edit' ) );
 					$nv->set_menu_order( (int) $sv->get_menu_order( 'edit' ) );
 					$nv->set_image_id( (int) $sv->get_image_id( 'edit' ) );
-					// Description seeds the translation; the translator owns it after.
-					$nv->set_description( (string) $sv->get_description( 'edit' ) );
+					// Description seeds the translation; the translator owns it after. WooCommerce's own rule for every user.
+					$nv->set_description( wp_kses_post( (string) $sv->get_description( 'edit' ) ) );
 
 					$sku = (string) $sv->get_sku( 'edit' );
 
@@ -335,12 +335,12 @@ final class PerfLocaleWooCommerceProducts {
 		$needed = 0;
 
 		foreach ( $descriptions as $text ) {
-			$needed += mb_strlen( $text );
+			$needed += \PerfLocale\Util\Utf8::length( $text );
 		}
 
 		foreach ( $options as $list ) {
 			foreach ( $list as $option ) {
-				$needed += mb_strlen( $option );
+				$needed += \PerfLocale\Util\Utf8::length( $option );
 			}
 		}
 
@@ -683,7 +683,8 @@ final class PerfLocaleWooCommerceProducts {
 				continue;
 			}
 
-			$restored = \PerfLocale\Translation\PlaceholderMasker::restore( $translated, $m[1] );
+			// The MT allowlist with the placeholders back, the source's own held elements kept.
+			$restored = \PerfLocale\MachineTranslation\TranslationService::sanitize_mt_value_kept( \PerfLocale\Translation\PlaceholderMasker::restore( $translated, $m[1] ), $descriptions[ $vid ], $kept );
 
 			if ( ! \PerfLocale\Translation\PlaceholderMasker::preserves_placeholders( $descriptions[ $vid ], $restored ) ) {
 				$errors[] = 'placeholder lost';
@@ -708,7 +709,8 @@ final class PerfLocaleWooCommerceProducts {
 				continue;
 			}
 
-			$variation->set_description( $restored );
+			// Kept source markup under WooCommerce's own rule for a variation description (wp_kses_post() for every user).
+			$variation->set_description( $kept ? wp_kses_post( $restored ) : $restored );
 			$variation->save();
 			require_once __DIR__ . '/PerfLocaleWooCommerceVariationText.php';
 			\PerfLocaleWooCommerceVariationText::keep_backslashes( $variation );

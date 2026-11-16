@@ -10,6 +10,7 @@ declare( strict_types=1 );
 namespace PerfLocale\Admin\Pages;
 
 use PerfLocale\Database\DataRegistry;
+use PerfLocale\MachineTranslation\Provider\ExternalAgencyProvider;
 use PerfLocale\Settings;
 use PerfLocale\Util\OutboundUrl;
 
@@ -27,6 +28,45 @@ final class SettingsPage {
 	 * printed into the form, and kept when the input is submitted empty.
 	 */
 	private const MT_SECRET_KEYS = [ 'mt_deepl_api_key', 'mt_google_api_key', 'mt_microsoft_api_key', 'mt_libre_api_key', 'mt_agency_api_key' ];
+
+	/** Integer fields read with absint(), checked first on the posted text => whether 0 is valid (an empty field saves it, else the default). */
+	private const ABSINT_FIELDS = [
+		'cookie_lifetime'       => false,
+		'geo_cache_hours'       => true,
+		'mt_monthly_char_limit' => true,
+		'mt_context_neighbours' => false,
+		'mt_context_max_chars'  => false,
+	];
+
+	/** Main tab keys, in order. */
+	private const TABS = [ 'url-routing', 'translation', 'seo', 'performance', 'language-switcher', 'addons', 'export-import', 'advanced' ];
+
+	/** Subtabs of a main tab, in order; the first is the tab's own address. */
+	public const SUBTABS = [
+		'url-routing' => [ 'general', 'redirects', 'url-bases' ],
+		'translation' => [ 'general', 'content-resync', 'bulk' ],
+	];
+
+	/** Settings keys each subtab form stores; every other key keeps its stored value. */
+	private const SUBTAB_FIELDS = [
+		'url-routing' => [
+			'general'   => [ 'url_mode', 'url_prefix_type', 'hide_default_prefix', 'language_domains', 'missing_translation_action', 'language_fallbacks', 'excluded_paths' ],
+			'redirects' => [ 'redirect_browser_lang', 'redirect_geo_enabled', 'redirect_edge_hint_enabled', 'redirect_priority_order', 'geo_provider', 'geo_cache_hours', 'geo_country_map', 'cookie_lifetime', 'disable_language_cookie' ],
+		],
+		'translation' => [
+			'general'        => [ 'translatable_post_types', 'translatable_taxonomies', 'default_translation_status', 'auto_create_stubs', 'sync_fields', 'translate_slugs', 'sync_term_hierarchy' ],
+			'content-resync' => [ 'resync_enabled', 'resync_excluded', 'resync_changed_parts', 'resync_match_threshold', 'resync_keep_exceptions', 'resync_person_blocks' ],
+		],
+	];
+
+	/** History rows from which a Replace import's delete of them is said to take minutes (LB-09: 100 000 rows 13-33 s). */
+	private const REPLACE_SLOW_ROWS = 100000;
+
+	/** History data size from which the same is said: 100 MB. */
+	private const REPLACE_SLOW_BYTES = 104857600;
+
+	/** History data size from which some clusters refuse the transaction (Group Replication 150 MB, Galera 2 GB): 1 GB. */
+	private const REPLACE_HUGE_BYTES = 1073741824;
 
 	/**
 	 * Plugin settings.
@@ -49,6 +89,13 @@ final class SettingsPage {
 	 * @var array<int, string>
 	 */
 	private static array $refused_sync_fields = [];
+
+	/**
+	 * ABSINT_FIELDS keys the last save refused as not a whole number.
+	 *
+	 * @var array<int, string>
+	 */
+	private static array $refused_numbers = [];
 
 	/**
 	 * Whether the last {@see extract_tab_values()} refused a new agency URL that is not https.
@@ -130,6 +177,15 @@ final class SettingsPage {
 			true
 		);
 
+		// One-row tab strip with a "More" menu.
+		wp_enqueue_script(
+			'perflocale-settings-tabs',
+			PERFLOCALE_URL . 'assets/js/settings-tabs.js',
+			[],
+			PERFLOCALE_VERSION,
+			true
+		);
+
 		// Conditional fields of the auto-generated addon subtab; a no-op without an addon form.
 		wp_enqueue_script(
 			'perflocale-addon-settings-conditional',
@@ -148,12 +204,12 @@ final class SettingsPage {
 	public function render(): void {
 		// Form processing is handled by AdminController on admin_init.
 
-		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Tab routing only.
-		$active_tab = isset( $_GET['tab'] ) ? sanitize_key( wp_unslash( $_GET['tab'] ) ) : 'url-routing';
-
-		if ( ! array_key_exists( $active_tab, $this->tabs ) ) {
-			$active_tab = 'url-routing';
-		}
+		// phpcs:disable WordPress.Security.NonceVerification.Recommended -- Tab routing only.
+		[ $active_tab, $active_subtab ] = self::route(
+			isset( $_GET['tab'] ) && is_string( $_GET['tab'] ) ? sanitize_key( wp_unslash( $_GET['tab'] ) ) : '',
+			isset( $_GET['subtab'] ) && is_string( $_GET['subtab'] ) ? sanitize_key( wp_unslash( $_GET['subtab'] ) ) : ''
+		);
+		// phpcs:enable WordPress.Security.NonceVerification.Recommended
 
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only message display.
 		$message = isset( $_GET['settings-updated'] ) ? sanitize_text_field( wp_unslash( $_GET['settings-updated'] ) ) : '';
@@ -168,7 +224,19 @@ final class SettingsPage {
 		$agency_url_refused = isset( $_GET['mt-agency-http'] );
 
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only message display.
+		$rate_refused = isset( $_GET['rate-refused'] ) && is_string( $_GET['rate-refused'] ) ? array_filter( array_map( 'trim', explode( ',', sanitize_text_field( wp_unslash( $_GET['rate-refused'] ) ) ) ) ) : [];
+
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only message display.
+		$slug_clash = isset( $_GET['slug-clash'] );
+
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only message display.
+		$number_refused = isset( $_GET['number-refused'] ) && is_string( $_GET['number-refused'] ) ? self::refused_number_labels( sanitize_text_field( wp_unslash( $_GET['number-refused'] ) ) ) : [];
+
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only message display.
 		$sync_refused = isset( $_GET['sync-refused'] ) && is_string( $_GET['sync-refused'] ) ? array_filter( array_map( 'trim', explode( ',', sanitize_text_field( wp_unslash( $_GET['sync-refused'] ) ) ) ) ) : [];
+
+		// Read from the parsed lists, so a redirect argument that prints no refusal notice keeps the plain line.
+		$any_refused = [] !== $number_refused || [] !== $rate_refused || [] !== $sync_refused || $agency_url_refused || $address_refused;
 
 		?>
 		<div class="wrap perflocale-settings">
@@ -177,11 +245,36 @@ final class SettingsPage {
 
 			<?php if ( $message === 'true' ) : ?>
 				<div class="notice notice-success is-dismissible">
-					<p><?php echo esc_html__( 'Settings saved successfully.', 'perflocale' ); ?></p>
+					<p><?php echo $any_refused ? esc_html__( 'Other settings saved.', 'perflocale' ) : esc_html__( 'Settings saved successfully.', 'perflocale' ); ?></p>
 				</div>
 			<?php elseif ( $message === 'false' ) : ?>
 				<div class="notice notice-error is-dismissible">
 					<p><?php echo esc_html( self::save_failed_text( $save_failed ) ); ?></p>
+				</div>
+			<?php endif; ?>
+
+			<?php if ( [] !== $rate_refused ) : ?>
+				<div class="notice notice-error is-dismissible">
+					<p>
+						<?php
+						printf(
+							/* translators: %s: comma-separated list of languages with their currency code. */
+							esc_html__( 'Exchange rate not saved for %s: it must be a number above 0 and at most 1000000000 (with Manual ticked or Auto-Sync off, no synced rate replaces it). The stored row is unchanged.', 'perflocale' ),
+							wp_kses( implode( ', ', array_map( static fn( string $row ): string => '<code>' . esc_html( $row ) . '</code>', $rate_refused ) ), [ 'code' => [] ] )
+						);
+						?>
+					</p>
+				</div>
+			<?php endif; ?>
+
+			<?php if ( [] !== $number_refused ) : ?>
+				<div class="notice notice-error is-dismissible">
+					<p>
+						<?php
+						/* translators: %s: comma-separated field labels, such as Cookie Lifetime. */
+						echo esc_html( sprintf( __( 'Not saved: %s. Enter a whole number (digits only); the stored value is kept.', 'perflocale' ), implode( ', ', $number_refused ) ) );
+						?>
+					</p>
 				</div>
 			<?php endif; ?>
 
@@ -200,6 +293,13 @@ final class SettingsPage {
 				</div>
 			<?php endif; ?>
 
+			<?php
+			if ( $slug_clash ) {
+				require_once dirname( __DIR__ ) . '/SlugClashNotice.php';
+				\PerfLocale\Admin\SlugClashNotice::box( \PerfLocale\Admin\SlugClashNotice::lines( $this->settings ) );
+			}
+			?>
+
 			<?php if ( $agency_url_refused ) : ?>
 				<div class="notice notice-error is-dismissible">
 					<p><?php echo esc_html( sprintf( /* translators: %s: filter name */ __( 'Agency Endpoint URL not saved: it must start with https:// (http:// only for a host added to the %s filter). Enter an https:// address and save again; the stored URL and API key are unchanged.', 'perflocale' ), 'perflocale/mt/trusted_hosts' ) ); ?></p>
@@ -217,40 +317,24 @@ final class SettingsPage {
 			// On multisite, ms-settings.php resolves the host against the site list before any plugin loads,
 			// so unregistered language hostnames get "site does not exist". Checked on the tab that sets the
 			// mode; SiteHealth::language_host_report() costs no query outside multisite host modes.
-			if ( $active_tab === 'url-routing' ) :
+			if ( $active_tab === 'url-routing' && 'general' === $active_subtab ) :
 				$perflocale_host_report = \PerfLocale\Admin\SiteHealth::language_host_report();
 
-				if ( $perflocale_host_report['applies'] && $perflocale_host_report['unresolved'] !== [] ) :
-					$perflocale_unresolved = [];
-
-					foreach ( $perflocale_host_report['unresolved'] as $perflocale_bad_host ) {
-						$perflocale_unresolved[] = '<code>' . esc_html( $perflocale_bad_host ) . '</code>';
-					}
+				if ( $perflocale_host_report['applies'] && ( $perflocale_host_report['unresolved'] !== [] || $perflocale_host_report['conflicts'] !== [] ) ) :
 					?>
 					<div class="notice notice-error">
 						<p><strong>
 							<?php
 							printf(
 								/* translators: %s: URL mode label, e.g. "subdomain". */
-								esc_html__( '%s URL mode generates hostnames this network cannot resolve.', 'perflocale' ),
+								esc_html__( '%s URL mode generates hostnames that do not reach this site.', 'perflocale' ),
 								'<code>' . esc_html( (string) $perflocale_host_report['mode'] ) . '</code>'
 							);
 							?>
 						</strong></p>
+						<?php echo wp_kses_post( \PerfLocale\Admin\SiteHealth::host_problems( $perflocale_host_report ) ); ?>
 						<p>
-							<?php
-							printf(
-								/* translators: %s: comma-separated list of hostnames, each wrapped in a code element. */
-								wp_kses_post( __( 'These hostnames are not registered as sites in this network: %s. On multisite, WordPress matches the requested hostname against the network\'s site list before any plugin loads, so a visitor following a translated link gets the "site does not exist" screen instead of a translation.', 'perflocale' ) ),
-								wp_kses_post( implode( ', ', $perflocale_unresolved ) )
-							);
-							?>
-						</p>
-						<p>
-							<?php echo esc_html__( 'Add each hostname as a site in the network (and point its DNS or server alias at this install), or switch back to subdirectory or query URL mode, which keep this site\'s hostname.', 'perflocale' ); ?>
-						</p>
-						<p>
-							<a href="<?php echo esc_url( network_admin_url( 'site-new.php' ) ); ?>"><?php echo esc_html__( 'Add a site to the network', 'perflocale' ); ?></a>
+							<a href="<?php echo esc_url( network_admin_url( 'sites.php' ) ); ?>"><?php echo esc_html__( 'Review the network\'s site list', 'perflocale' ); ?></a>
 							<span style="color:#c3c4c7;"> &middot; </span>
 							<a href="https://perflocale.com/docs/multisite/#url-modes" target="_blank" rel="noopener"><?php echo esc_html__( 'URL modes on a network', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
 						</p>
@@ -300,13 +384,19 @@ final class SettingsPage {
 			$repaired = isset( $_GET['repaired'] ) ? absint( $_GET['repaired'] ) : 0;
 			// phpcs:ignore WordPress.Security.NonceVerification.Recommended
 			$files_read_failed = isset( $_GET['files_read_failed'] ) ? absint( $_GET['files_read_failed'] ) : 0;
+			// phpcs:ignore WordPress.Security.NonceVerification.Recommended
+			$files_skipped = isset( $_GET['files_skipped'] ) && is_numeric( $_GET['files_skipped'] ) ? max( 0, (int) $_GET['files_skipped'] ) : 0;
+			// phpcs:ignore WordPress.Security.NonceVerification.Recommended
+			$files_queued = ! empty( $_GET['files_queued'] );
 
 			if ( $files_generated >= 0 ) :
 				?>
-				<div class="notice <?php echo esc_attr( $files_read_failed > 0 ? 'notice-error' : 'notice-success' ); ?> is-dismissible">
+				<div class="notice <?php echo esc_attr( $files_read_failed > 0 ? 'notice-error' : ( $files_queued ? 'notice-info' : 'notice-success' ) ); ?> is-dismissible">
 					<p>
 						<?php
-						if ( $files_read_failed > 0 ) {
+						if ( $files_queued ) {
+							esc_html_e( 'Another regeneration of the translation files is running. This one runs in the background after it.', 'perflocale' );
+						} elseif ( $files_read_failed > 0 ) {
 							printf(
 								/* translators: 1: number of files generated, 2: number of languages whose translations could not be read */
 								esc_html__( 'Translation files were not fully regenerated. %1$d file(s) generated. The translations of %2$d language(s) could not be read from the database, so their existing translation files were kept. Try again, and check the database if this repeats.', 'perflocale' ),
@@ -329,6 +419,18 @@ final class SettingsPage {
 								absint( $repaired )
 							);
 						}
+
+						// The locales come from the run's own record, not from the URL.
+						$skipped_record = $files_skipped > 0 ? get_option( \PerfLocale\Strings\TranslationFileGenerator::TOO_LARGE_OPTION, [] ) : [];
+
+						if ( is_array( $skipped_record ) && is_array( $skipped_record['too_large'] ?? null ) && [] !== $skipped_record['too_large'] ) {
+							echo ' ';
+							printf(
+								/* translators: %s: comma-separated locales */
+								esc_html__( 'Skipped: %s (too large for the PHP memory limit, see Tools > Site Health).', 'perflocale' ),
+								esc_html( implode( ', ', array_map( 'strval', array_keys( $skipped_record['too_large'] ) ) ) )
+							);
+						}
 						?>
 					</p>
 				</div>
@@ -340,16 +442,16 @@ final class SettingsPage {
 			}
 			?>
 
-			<nav class="nav-tab-wrapper" style="position: sticky; top: 32px; background: #f0f0f1; z-index: 10; display: flex; align-items: flex-end;">
-				<div class="perflocale-settings-tabs__items" style="flex: 1 1 auto; display: flex; align-items: flex-end;">
+			<nav class="nav-tab-wrapper perflocale-settings-tabs" aria-label="<?php echo esc_attr__( 'Settings sections', 'perflocale' ); ?>" data-more-label="<?php echo esc_attr__( 'More', 'perflocale' ); ?>">
+				<div class="perflocale-settings-tabs__items">
 					<?php foreach ( $this->tabs as $tab_key => $tab_label ) : ?>
 						<a href="<?php echo esc_url( admin_url( 'admin.php?page=perflocale-settings&tab=' . $tab_key ) ); ?>"
-							class="nav-tab <?php echo esc_attr( $active_tab === $tab_key ? 'nav-tab-active' : '' ); ?>">
+							class="nav-tab <?php echo esc_attr( $active_tab === $tab_key ? 'nav-tab-active' : '' ); ?>"<?php echo $active_tab === $tab_key ? ' aria-current="page"' : ''; ?>>
 							<?php echo esc_html( $tab_label ); ?>
 						</a>
 					<?php endforeach; ?>
 				</div>
-				<?php $this->render_tab_help_link( $active_tab ); ?>
+				<?php $this->render_tab_help_link( $active_tab, $active_subtab ); ?>
 			</nav>
 
 			<form class="perflocale-settings-tabs-mobile" method="get" action="<?php echo esc_url( admin_url( 'admin.php' ) ); ?>">
@@ -363,36 +465,63 @@ final class SettingsPage {
 					class="perflocale-settings-tabs-mobile__select"
 				>
 					<?php foreach ( $this->tabs as $tab_key => $tab_label ) : ?>
-						<option
-							value="<?php echo esc_attr( $tab_key ); ?>"
-							<?php selected( $active_tab, $tab_key ); ?>
-						>
-							<?php echo esc_html( $tab_label ); ?>
-						</option>
+						<?php if ( isset( self::SUBTABS[ $tab_key ] ) ) : ?>
+							<optgroup label="<?php echo esc_attr( $tab_label ); ?>">
+								<?php foreach ( $this->subtab_labels( $tab_key ) as $sub_key => $sub_label ) : ?>
+									<?php // "tab__subtab": a GET form sends one value; route() splits it. ?>
+									<option value="<?php echo esc_attr( 'general' === $sub_key ? $tab_key : $tab_key . '__' . $sub_key ); ?>" <?php selected( $active_tab === $tab_key && $active_subtab === $sub_key ); ?>>
+										<?php echo esc_html( $sub_label ); ?>
+									</option>
+								<?php endforeach; ?>
+							</optgroup>
+						<?php else : ?>
+							<option
+								value="<?php echo esc_attr( $tab_key ); ?>"
+								<?php selected( $active_tab, $tab_key ); ?>
+							>
+								<?php echo esc_html( $tab_label ); ?>
+							</option>
+						<?php endif; ?>
 					<?php endforeach; ?>
 				</select>
 				<button type="submit" class="button perflocale-settings-tabs-mobile__go"><?php echo esc_html__( 'Go', 'perflocale' ); ?></button>
 			</form>
 
+			<?php
+			if ( isset( self::SUBTABS[ $active_tab ] ) ) {
+				self::render_subtabs( $active_tab, $this->tabs[ $active_tab ], $this->subtab_labels( $active_tab ), $active_subtab );
+			}
+			?>
+
 			<?php if ( $active_tab === 'export-import' ) : ?>
 				<?php $this->render_export_import_tab(); ?>
 			<?php elseif ( $active_tab === 'addons' ) : ?>
 				<?php $this->render_addons_tab(); ?>
+			<?php elseif ( 'url-bases' === $active_subtab ) : ?>
+				<?php ( new \PerfLocale\Admin\UrlBases\Tab() )->render(); ?>
+			<?php elseif ( 'bulk' === $active_subtab ) : ?>
+				<?php // Buttons only: nothing to save, so no form and no Save button. ?>
+				<table class="form-table" role="presentation">
+					<?php $this->render_translation_tab( 'bulk' ); ?>
+				</table>
 			<?php else : ?>
-			<form method="post" action="<?php echo esc_url( admin_url( 'admin.php?page=perflocale-settings&tab=' . $active_tab ) ); ?>">
+			<form method="post" action="<?php echo esc_url( self::tab_url( $active_tab, $active_subtab ) ); ?>">
 				<?php wp_nonce_field( 'perflocale_save_settings' ); ?>
 				<input type="hidden" name="perflocale_settings_tab" value="<?php echo esc_attr( $active_tab ); ?>">
+				<?php if ( '' !== $active_subtab ) : ?>
+					<input type="hidden" name="perflocale_settings_subtab" value="<?php echo esc_attr( $active_subtab ); ?>">
+				<?php endif; ?>
 
 				<table class="form-table" role="presentation">
 					<?php
 					match ( $active_tab ) {
-						'url-routing' => $this->render_url_routing_tab(),
-						'translation' => $this->render_translation_tab(),
+						'url-routing' => $this->render_url_routing_tab( $active_subtab ),
+						'translation' => $this->render_translation_tab( $active_subtab ),
 						'seo' => $this->render_seo_tab(),
 						'language-switcher' => $this->render_language_switcher_tab(),
 						'performance' => $this->render_performance_tab(),
 						'advanced' => $this->render_advanced_tab(),
-						default => $this->render_url_routing_tab(),
+						default => $this->render_url_routing_tab( 'general' ),
 					};
 	?>
 				</table>
@@ -401,6 +530,94 @@ final class SettingsPage {
 			</form>
 			<?php endif; ?>
 		</div>
+		<?php
+	}
+
+	/**
+	 * The tab and subtab a request opens, old addresses included (tab=url-bases, the small-screen "tab__subtab").
+	 *
+	 * @param string $tab    Requested tab key.
+	 * @param string $subtab Requested subtab key.
+	 * @return array{0: string, 1: string} Tab, then subtab ('' for a tab without subtabs).
+	 */
+	public static function route( string $tab, string $subtab ): array {
+		if ( 'url-bases' === $tab ) {
+			[ $tab, $subtab ] = [ 'url-routing', 'url-bases' ];
+		} elseif ( str_contains( $tab, '__' ) ) {
+			[ $tab, $subtab ] = explode( '__', $tab, 2 );
+		}
+
+		if ( ! in_array( $tab, self::TABS, true ) ) {
+			$tab = 'url-routing';
+		}
+
+		$subs = self::SUBTABS[ $tab ] ?? [];
+
+		if ( [] === $subs ) {
+			return [ $tab, '' ];
+		}
+
+		return [ $tab, in_array( $subtab, $subs, true ) ? $subtab : $subs[0] ];
+	}
+
+	/**
+	 * The address of a tab or subtab.
+	 *
+	 * @param string $tab    Tab key.
+	 * @param string $subtab Subtab key; '' or the first subtab gives the tab's own address.
+	 * @return string
+	 */
+	public static function tab_url( string $tab, string $subtab = '' ): string {
+		$url = 'admin.php?page=perflocale-settings&tab=' . $tab;
+
+		if ( '' !== $subtab && $subtab !== ( self::SUBTABS[ $tab ][0] ?? '' ) ) {
+			$url .= '&subtab=' . $subtab;
+		}
+
+		return admin_url( $url );
+	}
+
+	/**
+	 * Subtab labels of a tab, in order.
+	 *
+	 * @param string $tab Tab key.
+	 * @return array<string, string>
+	 */
+	private function subtab_labels( string $tab ): array {
+		$labels = [
+			'general'        => __( 'General', 'perflocale' ),
+			'redirects'      => __( 'Visitor Redirects', 'perflocale' ),
+			'url-bases'      => __( 'URL Bases', 'perflocale' ),
+			'content-resync' => __( 'Content ReSync', 'perflocale' ),
+			'bulk'           => __( 'Bulk Translation', 'perflocale' ),
+		];
+
+		$out = [];
+
+		foreach ( self::SUBTABS[ $tab ] ?? [] as $key ) {
+			$out[ $key ] = $labels[ $key ];
+		}
+
+		return $out;
+	}
+
+	/**
+	 * The subtab row under a tab (the `perflocale-subtabs` component).
+	 *
+	 * @param string                $tab       Tab key.
+	 * @param string                $tab_label Tab label, for the row's accessible name.
+	 * @param array<string, string> $items     Subtab key => label.
+	 * @param string                $active    Active subtab key.
+	 * @return void
+	 */
+	private static function render_subtabs( string $tab, string $tab_label, array $items, string $active ): void {
+		?>
+		<nav class="perflocale-subtabs" aria-label="<?php echo esc_attr( $tab_label ); ?>">
+			<?php foreach ( $items as $key => $label ) : ?>
+				<?php // The old #perflocale-content-resync links land here; settings-tabs.js opens the subtab. ?>
+				<a class="perflocale-subtabs__item<?php echo $key === $active ? ' is-active' : ''; ?>" href="<?php echo esc_url( self::tab_url( $tab, $key ) ); ?>"<?php echo $key === $active ? ' aria-current="page"' : ''; ?><?php echo 'content-resync' === $key ? ' id="perflocale-content-resync"' : ''; ?>><?php echo esc_html( $label ); ?></a>
+			<?php endforeach; ?>
+		</nav>
 		<?php
 	}
 
@@ -611,14 +828,17 @@ final class SettingsPage {
 	/**
 	 * Render a right-aligned "Help" nav-tab inside the settings tab bar.
 	 *
-	 * Opens the docs page of the active tab in a new tab; unknown tabs get the docs index.
+	 * Opens the docs page of the active tab or subtab in a new tab; unknown tabs get the docs index.
 	 *
-	 * @param string $active_tab Active settings tab key.
+	 * @param string $active_tab    Active settings tab key.
+	 * @param string $active_subtab Active subtab key, '' for none.
 	 * @return void
 	 */
-	private function render_tab_help_link( string $active_tab ): void {
+	private function render_tab_help_link( string $active_tab, string $active_subtab = '' ): void {
 		$map = [
 			'url-routing'       => 'https://perflocale.com/docs/url-routing/',
+			'redirects'         => 'https://perflocale.com/docs/url-routing/#detection-order',
+			'url-bases'         => 'https://perflocale.com/docs/url-bases/',
 			'translation'       => 'https://perflocale.com/docs/content-translation/',
 			'seo'               => 'https://perflocale.com/docs/seo/',
 			'performance'       => 'https://perflocale.com/docs/production-tuning/',
@@ -628,14 +848,13 @@ final class SettingsPage {
 			'advanced'          => 'https://perflocale.com/docs/hooks/',
 		];
 
-		$url = $map[ $active_tab ] ?? 'https://perflocale.com/docs/';
+		$url = $map[ $active_subtab ] ?? $map[ $active_tab ] ?? 'https://perflocale.com/docs/';
 
 		?>
 		<a href="<?php echo esc_url( $url ); ?>"
 			target="_blank"
 			rel="noopener"
 			class="nav-tab perflocale-help-tab perflocale-btn-icon perflocale-btn-icon--md"
-			style="margin-left:auto;margin-right:0;color:#50575e;"
 			title="<?php echo esc_attr__( 'Open documentation for this tab in a new window', 'perflocale' ); ?>">
 			<span class="dashicons dashicons-editor-help"></span>
 			<?php echo esc_html__( 'Help', 'perflocale' ); ?>
@@ -679,12 +898,11 @@ final class SettingsPage {
 				'hide_default_prefix'        => isset( $_POST['hide_default_prefix'] ),
 				'redirect_browser_lang'      => isset( $_POST['redirect_browser_lang'] ),
 				'redirect_geo_enabled'       => isset( $_POST['redirect_geo_enabled'] ),
-				// The provider select renders only when a provider is registered;
-				// without one, keep the stored id.
+				// A form without the select keeps the stored id.
 				'geo_provider'               => isset( $_POST['geo_provider'] ) ? sanitize_key( wp_unslash( $_POST['geo_provider'] ) ) : $this->stored_string( 'geo_provider', '' ),
 				'geo_cache_hours'            => isset( $_POST['geo_cache_hours'] ) ? absint( $_POST['geo_cache_hours'] ) : 24,
 				'geo_country_map'            => $this->sanitize_geo_country_map( $_POST['geo_country_map'] ?? [] ), // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized,WordPress.Security.ValidatedSanitizedInput.MissingUnslash -- sanitize_geo_country_map handles unslash + per-key sanitisation.
-				'missing_translation_action' => isset( $_POST['missing_translation_action'] ) && in_array( $_POST['missing_translation_action'], [ 'show_default', 'show_404', 'redirect_default' ], true ) ? sanitize_key( wp_unslash( $_POST['missing_translation_action'] ) ) : 'show_default',
+				'missing_translation_action' => isset( $_POST['missing_translation_action'] ) && in_array( $_POST['missing_translation_action'], \PerfLocale\Settings::MISSING_ACTIONS, true ) ? sanitize_key( wp_unslash( $_POST['missing_translation_action'] ) ) : 'show_default',
 				'language_fallbacks'         => self::merge_language_map(
 					array_filter( (array) $this->settings->get( 'language_fallbacks', [] ), 'is_array' ),
 					self::keep_unrendered_fallback_targets(
@@ -763,29 +981,48 @@ final class SettingsPage {
 						: null
 				),
 			],
-			'translation' => $values         = [
-				// The tab never offers `attachment` (translation_tab_post_types()),
-				// so it counts as rendered and unticked: a stored one is not kept.
-				'translatable_post_types'    => self::pair_block_template_types(
-					self::merge_checkbox_list(
-						isset( $_POST['translatable_post_types'] ) ? array_map( 'sanitize_key', (array) $_POST['translatable_post_types'] ) : [],
-						(array) $this->settings->get( 'translatable_post_types', [] ),
-						$this->settings->get_translatable_post_types(),
-						array_merge( [ 'attachment' ], ...array_map( 'array_keys', $this->translation_tab_post_types() ) )
-					)
-				),
-				'translatable_taxonomies'    => self::merge_checkbox_list(
-					isset( $_POST['translatable_taxonomies'] ) ? array_map( 'sanitize_key', (array) $_POST['translatable_taxonomies'] ) : [],
-					(array) $this->settings->get( 'translatable_taxonomies', [] ),
-					$this->settings->get_translatable_taxonomies(),
-					array_map( 'strval', array_keys( get_taxonomies( [ 'public' => true ] ) ) )
-				),
-				'default_translation_status' => isset( $_POST['default_translation_status'] ) ? sanitize_text_field( wp_unslash( $_POST['default_translation_status'] ) ) : 'empty',
-				'auto_create_stubs'          => isset( $_POST['auto_create_stubs'] ),
-				'sync_fields'                => $this->merge_sync_fields(),
-				'translate_slugs'            => isset( $_POST['translate_slugs'] ),
-				'sync_term_hierarchy'        => isset( $_POST['sync_term_hierarchy'] ),
-			],
+			'translation' => $values = array_merge(
+				[
+					// The tab never offers `attachment` (translation_tab_post_types()),
+					// so it counts as rendered and unticked: a stored one is not kept.
+					'translatable_post_types'    => self::pair_block_template_types(
+						self::merge_checkbox_list(
+							isset( $_POST['translatable_post_types'] ) ? array_map( 'sanitize_key', (array) $_POST['translatable_post_types'] ) : [],
+							(array) $this->settings->get( 'translatable_post_types', [] ),
+							$this->settings->get_translatable_post_types(),
+							array_merge( [ 'attachment' ], ...array_map( 'array_keys', $this->translation_tab_post_types() ) )
+						)
+					),
+					'translatable_taxonomies'    => self::merge_checkbox_list(
+						isset( $_POST['translatable_taxonomies'] ) ? array_map( 'sanitize_key', (array) $_POST['translatable_taxonomies'] ) : [],
+						(array) $this->settings->get( 'translatable_taxonomies', [] ),
+						$this->settings->get_translatable_taxonomies(),
+						array_map( 'strval', array_keys( get_taxonomies( [ 'public' => true ] ) ) )
+					),
+					'default_translation_status' => isset( $_POST['default_translation_status'] ) ? sanitize_text_field( wp_unslash( $_POST['default_translation_status'] ) ) : 'empty',
+					'auto_create_stubs'          => isset( $_POST['auto_create_stubs'] ),
+					'sync_fields'                => $this->merge_sync_fields(),
+					'translate_slugs'            => isset( $_POST['translate_slugs'] ),
+					'sync_term_hierarchy'        => isset( $_POST['sync_term_hierarchy'] ),
+					'resync_enabled'             => isset( $_POST['resync_enabled'] ),
+				],
+				// While Content ReSync is off its fields are not printed: the stored values are kept.
+				\PerfLocale\Util\ResyncSwitch::on() ? [
+					// Stored as exclusions, so a type translated later is included; an exclusion the form does not offer is kept.
+					'resync_excluded'        => \PerfLocale\Resync\Scope::exclusions(
+						isset( $_POST['resync_included'] ) ? array_values( array_filter( array_map( static fn ( string $entry ): string => sanitize_key( $entry ), \PerfLocale\Util\Scalar::strings( wp_unslash( $_POST['resync_included'] ) ) ) ) ) : [], // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Each entry passes sanitize_key(), and only entries the form offers are kept.
+
+						array_values( array_filter( (array) $this->settings->get( 'resync_excluded', [] ), 'is_string' ) ),
+						array_map( 'strval', array_keys( $this->resync_include_entries() ) )
+					),
+					// "Machine translated" needs machine translation on; an unoffered value saves the default; no field keeps the stored one.
+					'resync_changed_parts'   => isset( $_POST['resync_changed_parts'] ) ? \PerfLocale\Resync\ResyncSettings::changed_parts_choice( sanitize_key( \PerfLocale\Util\Scalar::str( wp_unslash( $_POST['resync_changed_parts'] ) ) ), $this->settings->mt_enabled() ) : \PerfLocale\Resync\ResyncSettings::changed_parts( $this->settings ), // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- sanitize_key() on the string, then only the offered values are kept.
+					'resync_match_threshold' => isset( $_POST['resync_match_threshold'] ) ? \PerfLocale\Resync\ResyncSettings::match_threshold_choice( sanitize_key( \PerfLocale\Util\Scalar::str( wp_unslash( $_POST['resync_match_threshold'] ) ) ) ) : \PerfLocale\Resync\ResyncSettings::match_threshold( $this->settings ), // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- sanitize_key() on the string, then only the offered values are kept.
+					'resync_keep_exceptions' => isset( $_POST['resync_keep_exceptions'] ),
+					// A value the form does not offer saves the default; a save without the field keeps the stored choice.
+					'resync_person_blocks'   => isset( $_POST['resync_person_blocks'] ) ? \PerfLocale\Resync\ResyncSettings::person_blocks_choice( sanitize_key( \PerfLocale\Util\Scalar::str( wp_unslash( $_POST['resync_person_blocks'] ) ) ) ) : \PerfLocale\Resync\ResyncSettings::person_blocks( $this->settings ), // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- sanitize_key() on the string, then only the offered values are kept.
+				] : []
+			),
 			// With MT off the tab prints only mt_enabled: the other fields are read only while the stored flag
 			// is on (extraction runs before Settings::update()), or unprinted fields would save as cleared and
 			// mt_auto_translate_languages would become the no-language scope.
@@ -802,6 +1039,7 @@ final class SettingsPage {
 				'mt_agency_url'                => isset( $_POST['mt_agency_url'] ) ? esc_url_raw( wp_unslash( $_POST['mt_agency_url'] ) ) : '',
 				'mt_agency_api_key'            => isset( $_POST['mt_agency_api_key'] ) ? sanitize_text_field( wp_unslash( $_POST['mt_agency_api_key'] ) ) : '',
 				'mt_agency_batch'              => isset( $_POST['mt_agency_batch'] ),
+				'mt_agency_max_chars'          => isset( $_POST['mt_agency_max_chars'] ) ? ExternalAgencyProvider::max_chars_value( wp_unslash( $_POST['mt_agency_max_chars'] ) ) : 0, // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Reduced to an int in bounds by max_chars_value().
 				'mt_auto_translate_on_publish' => isset( $_POST['mt_auto_translate_on_publish'] ),
 				// Active slugs only; with every target checked store [] ("all"), so later languages are included.
 				'mt_auto_translate_languages'  => ( function (): array {
@@ -829,7 +1067,13 @@ final class SettingsPage {
 				'mt_auto_translate_on_create'  => isset( $_POST['mt_auto_translate_on_create'] ),
 				'mt_monthly_char_limit'        => isset( $_POST['mt_monthly_char_limit'] ) ? absint( $_POST['mt_monthly_char_limit'] ) : 500000,
 				'mt_bulk_strings_enabled'      => isset( $_POST['mt_bulk_strings_enabled'] ),
+				'mt_meta_seo'                  => isset( $_POST['mt_meta_seo'] ),
+				'mt_meta_seo_keywords'         => isset( $_POST['mt_meta_seo_keywords'] ),
 				'mt_meta_custom_fields'        => isset( $_POST['mt_meta_custom_fields'] ),
+				'mt_context_mode'              => isset( $_POST['mt_context_mode'] ) && in_array( sanitize_key( \PerfLocale\Util\Scalar::str( wp_unslash( $_POST['mt_context_mode'] ) ) ), \PerfLocale\MachineTranslation\ContextSettings::MODES, true ) ? sanitize_key( \PerfLocale\Util\Scalar::str( wp_unslash( $_POST['mt_context_mode'] ) ) ) : 'off', // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- One of ContextSettings::MODES after sanitize_key().
+				'mt_context_neighbours'        => isset( $_POST['mt_context_neighbours'] ) ? max( \PerfLocale\MachineTranslation\ContextSettings::NEIGHBOURS_MIN, min( \PerfLocale\MachineTranslation\ContextSettings::NEIGHBOURS_MAX, absint( \PerfLocale\Util\Scalar::str( wp_unslash( $_POST['mt_context_neighbours'] ) ) ) ) ) : 2, // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- absint() and clamped.
+				'mt_context_previous'          => isset( $_POST['mt_context_previous'] ),
+				'mt_context_max_chars'         => isset( $_POST['mt_context_max_chars'] ) ? max( \PerfLocale\MachineTranslation\ContextSettings::MAX_CHARS_MIN, min( \PerfLocale\MachineTranslation\ContextSettings::MAX_CHARS_MAX, absint( \PerfLocale\Util\Scalar::str( wp_unslash( $_POST['mt_context_max_chars'] ) ) ) ) ) : 1500, // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- absint() and clamped.
 			] : [
 				'mt_enabled' => isset( $_POST['mt_enabled'] ),
 			],
@@ -917,14 +1161,38 @@ final class SettingsPage {
 					? (array) $this->settings->get( 'wc_currencies', [] )
 					: ( class_exists( 'PerfLocaleWooCommerce' ) ? \PerfLocaleWooCommerce::sanitize_currencies_post() : [] ),
 				'wc_exchange_rate_auto'     => isset( $_POST['wc_exchange_rate_auto'] ),
-				// The provider select renders only when a provider is registered;
-				// without one, keep the stored id.
+				// A form without the select keeps the stored id.
 				'wc_exchange_rate_provider' => isset( $_POST['wc_exchange_rate_provider'] ) ? sanitize_key( wp_unslash( $_POST['wc_exchange_rate_provider'] ) ) : $this->stored_string( 'wc_exchange_rate_provider', '' ),
 				'wc_exchange_rate_interval' => isset( $_POST['wc_exchange_rate_interval'] ) ? sanitize_key( wp_unslash( $_POST['wc_exchange_rate_interval'] ) ) : 'daily',
 			],
 			'export-import' => $values = [], // Export/import handled separately via admin_init.
 			default => $values         = [],
 		};
+
+		// A subtab form stores only its own keys; an unknown subtab stores nothing. A post without one is the whole tab.
+		if ( isset( self::SUBTAB_FIELDS[ $tab ], $_POST['perflocale_settings_subtab'] ) ) {
+			$subtab = is_string( $_POST['perflocale_settings_subtab'] ) ? sanitize_key( wp_unslash( $_POST['perflocale_settings_subtab'] ) ) : '';
+			$values = array_intersect_key( $values, array_flip( self::SUBTAB_FIELDS[ $tab ][ $subtab ] ?? [] ) );
+		}
+
+		// Judged by the writer's rule on the posted text: a refused key is unset, so the stored value stays.
+		$defaults              = $this->settings->get_defaults();
+		self::$refused_numbers = [];
+
+		foreach ( self::ABSINT_FIELDS as $field => $zero_valid ) {
+			if ( ! isset( $values[ $field ], $_POST[ $field ] ) ) {
+				continue;
+			}
+
+			$raw = wp_unslash( $_POST[ $field ] ); // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Only compared and shape-checked.
+
+			if ( '' === $raw ) {
+				$values[ $field ] = $zero_valid ? 0 : ( $defaults[ $field ] ?? 0 );
+			} elseif ( ! \PerfLocale\Util\SettingsWriter::fits_shape( $field, $raw, $defaults[ $field ] ?? 0 ) ) {
+				unset( $values[ $field ] );
+				self::$refused_numbers[] = $field;
+			}
+		}
 		// phpcs:enable WordPress.Security.NonceVerification.Missing
 
 		// The key inputs render empty, so an empty one keeps the stored key.
@@ -938,8 +1206,8 @@ final class SettingsPage {
 			}
 		}
 
-		// Allow external addons to provide their sanitized values.
-		if ( empty( $values ) ) {
+		// External add-on subtabs give their sanitized values; a core tab's post never reaches them.
+		if ( empty( $values ) && ! isset( self::SUBTAB_FIELDS[ $tab ] ) ) {
 			/**
 			 * Filter settings values for external addon subtabs.
 			 *
@@ -1332,24 +1600,21 @@ final class SettingsPage {
 	}
 
 	/**
-	 * Render the URL & Routing tab fields.
+	 * Render a URL & Routing subtab's fields.
 	 *
+	 * @param string $subtab 'general' or 'redirects'.
 	 * @return void
 	 */
-	private function render_url_routing_tab(): void {
-		$url_mode         = $this->settings->get_url_mode();
-		$hide_default     = $this->settings->hide_default_prefix();
-		$redirect_browser = (bool) $this->settings->get( 'redirect_browser_lang' );
-		$redirect_geo     = (bool) $this->settings->get( 'redirect_geo_enabled' );
-		// The edge-hint redirect needs its own toggle and edge integration on.
-		$redirect_edge_hint    = (bool) $this->settings->get( 'redirect_edge_hint_enabled' )
-			&& $this->settings->edge_integration_enabled();
-		$geo_provider          = (string) $this->settings->get( 'geo_provider', '' );
-		$geo_cache_hours       = (int) $this->settings->get( 'geo_cache_hours', 24 );
-		$geo_country_map       = (array) $this->settings->get( 'geo_country_map', [] );
-		$missing_action        = $this->settings->get_missing_translation_action();
-		$cookie_lifetime       = (int) $this->settings->get( 'cookie_lifetime' );
-		$excluded_paths        = $this->settings->get_excluded_paths();
+	private function render_url_routing_tab( string $subtab = 'general' ): void {
+		if ( 'redirects' === $subtab ) {
+			$this->render_visitor_redirects_tab();
+			return;
+		}
+
+		$url_mode       = $this->settings->get_url_mode();
+		$hide_default   = $this->settings->hide_default_prefix();
+		$missing_action = $this->settings->get_missing_translation_action();
+		$excluded_paths = $this->settings->get_excluded_paths();
 
 		?>
 		<tr>
@@ -1380,7 +1645,7 @@ final class SettingsPage {
 						<?php echo esc_html__( 'Query parameter mode works with every permalink structure - including Plain - and every server. The default language always uses clean URLs without the parameter.', 'perflocale' ); ?>
 					</p>
 					<p class="description" style="margin-top:6px;">
-						<?php echo esc_html__( 'Subdirectory needs no DNS work and concentrates SEO value on one hostname; subdomain and domain-per-language require DNS, a TLS certificate, and - on multisite - every language hostname registered as a site.', 'perflocale' ); ?>
+						<?php echo esc_html__( 'Subdirectory needs no DNS work and concentrates SEO value on one hostname; subdomains and per-language domains require DNS, a TLS certificate, and - on multisite - every language hostname registered as a site.', 'perflocale' ); ?>
 						<a href="https://perflocale.com/docs/url-routing/#url-structure" target="_blank" rel="noopener"><?php echo esc_html__( 'Compare the four URL modes', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
 					</p>
 				</fieldset>
@@ -1393,7 +1658,7 @@ final class SettingsPage {
 				$domains   = $this->settings->get_language_domains();
 				$base_host = wp_parse_url( home_url(), PHP_URL_HOST ) ?: 'example.com';
 				?>
-				<div id="perflocale-domain-config" style="margin-top:12px;<?php echo esc_attr( $url_mode !== 'domain' ? 'display:none;' : '' ); ?>">
+				<div id="perflocale-domain-config" style="margin-top:12px;"<?php echo 'domain' !== $url_mode ? ' hidden' : ''; ?>>
 					<p class="description" style="margin-bottom:8px;">
 						<?php echo esc_html__( 'Configure the domain for each language. DNS must be pointed to this server.', 'perflocale' ); ?>
 					</p>
@@ -1456,6 +1721,152 @@ final class SettingsPage {
 				<p class="description"><?php echo esc_html__( 'When enabled, the default language uses clean URLs without a language prefix.', 'perflocale' ); ?></p>
 			</td>
 		</tr>
+		<tr>
+			<th scope="row">
+				<label for="perflocale-missing-action"><?php echo esc_html__( 'Missing Translation', 'perflocale' ); ?></label>
+			</th>
+			<td>
+				<select id="perflocale-missing-action" name="missing_translation_action">
+					<option value="show_default" <?php selected( $missing_action, 'show_default' ); ?>><?php echo esc_html__( 'Show content in default language', 'perflocale' ); ?></option>
+					<option value="show_default_noindex" <?php selected( $missing_action, 'show_default_noindex' ); ?>><?php echo esc_html__( 'Show content in default language, not indexed (noindex)', 'perflocale' ); ?></option>
+					<option value="show_404" <?php selected( $missing_action, 'show_404' ); ?>><?php echo esc_html__( 'Show 404 error', 'perflocale' ); ?></option>
+					<option value="redirect_default" <?php selected( $missing_action, 'redirect_default' ); ?>><?php echo esc_html__( 'Redirect to the original version', 'perflocale' ); ?></option>
+				</select>
+				<p class="description"><?php echo esc_html__( 'Applies to single posts, pages and products reached in a language they have no published translation in. Archives (categories, tags) are not covered yet.', 'perflocale' ); ?></p>
+				<?php
+				require_once __DIR__ . '/../SiteHealth/FallbackPages.php';
+				\PerfLocale\Admin\SiteHealth\FallbackPages::setting_line();
+				?>
+				<p class="description" style="margin-top:4px;">
+					<a href="https://perflocale.com/docs/language-fallbacks/#seo" target="_blank" rel="noopener"><?php echo esc_html__( 'Compare the three modes (SEO + UX tradeoffs)', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
+				</p>
+			</td>
+		</tr>
+		<?php
+		// Fallback chains: each list is the exact order tried, with no walk through other chains.
+		$all_langs = ( new \PerfLocale\Database\Repository\LanguageRepository( \PerfLocale\Plugin::get_instance()->get( 'cache' ) ) )->get_active();
+		$fallbacks = $this->settings->get_language_fallbacks();
+
+		// At most 4 fallbacks, and never more than the other active languages.
+		$max_fb = min( 4, max( 1, count( $all_langs ) - 1 ) );
+
+		// Build a quick slug→lang map for pretty labels on prefilled chips.
+		$lang_by_slug = [];
+		foreach ( $all_langs as $l ) {
+			$lang_by_slug[ $l->slug ] = $l;
+		}
+
+		if ( count( $all_langs ) > 1 ) :
+			?>
+		<tr>
+			<th scope="row"><?php echo esc_html__( 'Language Fallbacks', 'perflocale' ); ?></th>
+			<td>
+				<p class="description" style="margin-bottom:10px;">
+					<?php echo esc_html__( 'When a translation is missing, fall back to these languages in order. The first one that has a published translation wins - a single redirect is issued, never a chain of hops. If every slot is empty or unresolved, the "Missing Translation Action" above applies.', 'perflocale' ); ?>
+					<a href="https://perflocale.com/docs/language-fallbacks/#seo" target="_blank" rel="noopener" style="margin-left:4px;"><?php echo esc_html__( 'Fallback chain docs', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
+				</p>
+
+<div class="pl-fb-editor" data-max="<?php echo esc_attr( (string) $max_fb ); ?>">
+					<?php
+					foreach ( $all_langs as $lang ) :
+						// Chips are for active targets only, so only those count
+						// toward the cap. A stored target that is not active stays
+						// stored (keep_unrendered_fallback_targets()).
+						$flag        = \PerfLocale\Helper::get_flag_emoji( $lang );
+						$current_row = array_values( array_filter( (array) ( $fallbacks[ $lang->slug ] ?? [] ), static fn( $s ) => $s !== '' && $s !== $lang->slug && isset( $lang_by_slug[ $s ] ) ) );
+						$current_row = array_slice( $current_row, 0, $max_fb );
+						?>
+						<div class="pl-fb-row" data-slug="<?php echo esc_attr( $lang->slug ); ?>">
+							<div class="pl-fb-row__label">
+								<span class="pl-fb-flag"><?php echo esc_html( $flag ); ?></span>
+								<span class="pl-fb-row__name"><?php echo esc_html( $lang->native_name ?: $lang->name ); ?></span>
+							</div>
+
+							<div class="pl-fb-row__body <?php echo count( $current_row ) >= $max_fb ? 'pl-fb-row__body--full' : ''; ?>"
+								role="group"
+								aria-label="<?php echo esc_attr( sprintf( /* translators: %s: language name */ __( 'Fallback chain for %s', 'perflocale' ), $lang->native_name ?: $lang->name ) ); ?>">
+
+								<span class="pl-fb-empty"><?php echo esc_html__( 'No fallbacks - uses Missing Translation Action.', 'perflocale' ); ?></span>
+
+								<?php
+								foreach ( $current_row as $idx => $fb_slug ) :
+									$fb_lang = $lang_by_slug[ $fb_slug ] ?? null;
+									if ( ! $fb_lang ) {
+										continue; }
+									$fb_flag = \PerfLocale\Helper::get_flag_emoji( $fb_lang );
+									$fb_name = $fb_lang->native_name ?: $fb_lang->name;
+									?>
+									<div class="pl-fb-chip" data-slug="<?php echo esc_attr( $fb_slug ); ?>"
+										draggable="true"
+										tabindex="0"
+										aria-roledescription="<?php echo esc_attr__( 'Draggable fallback', 'perflocale' ); ?>"
+										aria-label="<?php echo esc_attr( sprintf( /* translators: 1: ordinal position, 2: language name or redirect method name */ __( 'Position %1$d: %2$s', 'perflocale' ), $idx + 1, $fb_name ) ); ?>">
+										<span class="pl-fb-chip__grip" aria-hidden="true">⋮⋮</span>
+										<span class="pl-fb-chip__move" aria-hidden="false"><button type="button" class="pl-fb-chip__up" aria-label="<?php echo esc_attr__( 'Move earlier', 'perflocale' ); ?>" title="<?php echo esc_attr__( 'Move earlier', 'perflocale' ); ?>">&#9650;</button><button type="button" class="pl-fb-chip__down" aria-label="<?php echo esc_attr__( 'Move later', 'perflocale' ); ?>" title="<?php echo esc_attr__( 'Move later', 'perflocale' ); ?>">&#9660;</button></span>
+										<span class="pl-fb-chip__pos"><?php echo esc_html( (string) ( $idx + 1 ) ); ?></span>
+										<span class="pl-fb-chip__name"><?php echo esc_html( $fb_flag . ' ' . $fb_name ); ?></span>
+										<button type="button" class="pl-fb-chip__remove" aria-label="<?php echo esc_attr( sprintf( /* translators: %s: language name */ __( 'Remove %s fallback', 'perflocale' ), $fb_name ) ); ?>" title="<?php echo esc_attr__( 'Remove fallback', 'perflocale' ); ?>">&times;</button>
+										<input type="hidden" name="language_fallbacks[<?php echo esc_attr( $lang->slug ); ?>][]" value="<?php echo esc_attr( $fb_slug ); ?>">
+									</div>
+								<?php endforeach; ?>
+
+								<select class="pl-fb-row__picker" aria-label="<?php echo esc_attr__( 'Add fallback language', 'perflocale' ); ?>">
+									<option value="">&#43; <?php echo esc_html__( 'Add fallback', 'perflocale' ); ?></option>
+									<?php
+									foreach ( $all_langs as $opt_lang ) :
+										if ( $opt_lang->slug === $lang->slug ) {
+											continue; }
+										$opt_flag = \PerfLocale\Helper::get_flag_emoji( $opt_lang );
+										$opt_name = $opt_lang->native_name ?: $opt_lang->name;
+										$already  = in_array( $opt_lang->slug, $current_row, true );
+										?>
+										<option
+											value="<?php echo esc_attr( $opt_lang->slug ); ?>"
+											data-flag="<?php echo esc_attr( $opt_flag ); ?>"
+											data-name="<?php echo esc_attr( $opt_name ); ?>"
+											<?php echo $already ? 'disabled hidden' : ''; ?>
+										>
+											<?php echo esc_html( $opt_flag . ' ' . $opt_name ); ?>
+										</option>
+									<?php endforeach; ?>
+								</select>
+							</div>
+						</div>
+					<?php endforeach; ?>
+				</div>
+
+			</td>
+		</tr>
+		<?php endif; ?>
+		<tr>
+			<th scope="row">
+				<label for="perflocale-excluded-paths"><?php echo esc_html__( 'Excluded Paths', 'perflocale' ); ?></label>
+			</th>
+			<td>
+				<textarea id="perflocale-excluded-paths" name="excluded_paths" rows="5" class="large-text code"><?php echo esc_textarea( implode( "\n", $excluded_paths ) ); ?></textarea>
+				<p class="description"><?php echo esc_html__( 'One path per line. These URL paths will bypass language routing.', 'perflocale' ); ?></p>
+			</td>
+		</tr>
+		<?php
+	}
+
+	/**
+	 * Render the URL & Routing > Visitor Redirects fields: first-visit redirects, their order and the language cookie.
+	 *
+	 * @return void
+	 */
+	private function render_visitor_redirects_tab(): void {
+		$redirect_browser = (bool) $this->settings->get( 'redirect_browser_lang' );
+		$redirect_geo     = (bool) $this->settings->get( 'redirect_geo_enabled' );
+		// The edge-hint redirect needs its own toggle and edge integration on.
+		$redirect_edge_hint = (bool) $this->settings->get( 'redirect_edge_hint_enabled' )
+			&& $this->settings->edge_integration_enabled();
+		$geo_provider       = (string) $this->settings->get( 'geo_provider', '' );
+		$geo_cache_hours    = (int) $this->settings->get( 'geo_cache_hours', 24 );
+		$geo_country_map    = (array) $this->settings->get( 'geo_country_map', [] );
+		$cookie_lifetime    = (int) $this->settings->get( 'cookie_lifetime' );
+
+		?>
 		<tr>
 			<th scope="row"><?php echo esc_html__( 'Browser Language Redirect', 'perflocale' ); ?></th>
 			<td>
@@ -1567,42 +1978,50 @@ final class SettingsPage {
 		</tr>
 		<?php endif; ?>
 
-		<tr class="perflocale-geo-field">
+		<tr class="perflocale-geo-field"<?php echo $redirect_geo ? '' : ' hidden'; ?>>
 			<th scope="row"><?php echo esc_html__( 'GeoIP Provider', 'perflocale' ); ?></th>
 			<td>
-				<?php $geo_providers = \PerfLocale\Router\GeoRedirect::get_providers(); ?>
-				<?php if ( empty( $geo_providers ) ) : ?>
-					<p class="description" style="margin-top:0;">
-						<?php echo esc_html__( 'No geolocation provider is registered. PerfLocale does not bundle one, so no visitor IP is ever sent to a third party unless your site arranges it.', 'perflocale' ); ?>
-					</p>
-					<p class="description" style="margin-top:6px;">
-						<?php echo esc_html__( 'Register a provider with the perflocale/geo/providers filter, or return a country code directly from perflocale/geo/lookup_country - a one-liner when your CDN already sends one, such as Cloudflare CF-IPCountry.', 'perflocale' ); ?>
-						<a href="https://perflocale.com/docs/geo-redirect/#geoip-provider" target="_blank" rel="noopener" style="margin-left:4px;"><?php echo esc_html__( 'Provider examples', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
-					</p>
-				<?php else : ?>
-					<select id="perflocale-geo-provider" name="geo_provider">
-						<?php
-						// A stored id no provider registers (its plugin is off, or the id changed) gets its own option,
-						// so saving the tab unchanged keeps it instead of posting the first registered one.
-						if ( '' !== $geo_provider && ! isset( $geo_providers[ $geo_provider ] ) ) :
+				<?php
+				$geo_providers = \PerfLocale\Router\GeoRedirect::get_providers();
+				require_once __DIR__ . '/../../Router/GeoHeaderSource.php';
+				$geo_headers = \PerfLocale\Router\GeoHeaderSource::labels( $geo_providers );
+				?>
+				<select id="perflocale-geo-provider" name="geo_provider">
+					<?php
+					// A stored id nothing offers (its plugin is off, or the id changed) gets its own option,
+					// so saving the tab unchanged keeps it.
+					if ( '' !== $geo_provider && ! isset( $geo_headers[ $geo_provider ] ) && ! isset( $geo_providers[ $geo_provider ] ) ) :
+						?>
+						<option value="<?php echo esc_attr( $geo_provider ); ?>" selected="selected">
+							<?php
+							/* translators: %s: provider id stored in the settings. */
+							echo esc_html( sprintf( __( '%s (not registered)', 'perflocale' ), $geo_provider ) );
 							?>
-							<option value="<?php echo esc_attr( $geo_provider ); ?>" selected="selected">
-								<?php
-								/* translators: %s: provider id stored in the settings. */
-								echo esc_html( sprintf( __( '%s (not registered)', 'perflocale' ), $geo_provider ) );
-								?>
-							</option>
-						<?php endif; ?>
-						<?php foreach ( $geo_providers as $pid => $pdef ) : ?>
-							<option value="<?php echo esc_attr( $pid ); ?>" <?php selected( $geo_provider, $pid ); ?>><?php echo esc_html( (string) ( $pdef['name'] ?? $pid ) ); ?></option>
+						</option>
+					<?php endif; ?>
+					<option value="" <?php selected( $geo_provider, '' ); ?>><?php echo esc_html__( 'None', 'perflocale' ); ?></option>
+					<optgroup label="<?php echo esc_attr__( 'CDN or server header', 'perflocale' ); ?>">
+						<?php foreach ( $geo_headers as $pid => $label ) : ?>
+							<option value="<?php echo esc_attr( $pid ); ?>" <?php selected( $geo_provider, $pid ); ?>><?php echo esc_html( $label ); ?></option>
 						<?php endforeach; ?>
-					</select>
-					<p class="description"><?php echo esc_html__( 'Registered by your site via the perflocale/geo/providers filter.', 'perflocale' ); ?></p>
-				<?php endif; ?>
+					</optgroup>
+					<?php if ( ! empty( $geo_providers ) ) : ?>
+						<optgroup label="<?php echo esc_attr__( 'Registered by your site', 'perflocale' ); ?>">
+							<?php foreach ( $geo_providers as $pid => $pdef ) : ?>
+								<option value="<?php echo esc_attr( $pid ); ?>" <?php selected( $geo_provider, $pid ); ?>><?php echo esc_html( (string) ( $pdef['name'] ?? $pid ) ); ?></option>
+							<?php endforeach; ?>
+						</optgroup>
+					<?php endif; ?>
+				</select>
+				<p class="description"><?php echo esc_html__( 'A CDN or server header sends no visitor IP anywhere and is never cached. A CDN header counts only on requests from that CDN: Cloudflare\'s published addresses, or the addresses in geo_trusted_proxies (needed for CloudFront and behind a load balancer).', 'perflocale' ); ?></p>
+				<p class="description" style="margin-top:6px;">
+					<?php echo esc_html__( 'Or register a provider with the perflocale/geo/providers filter, or return a country code from perflocale/geo/lookup_country.', 'perflocale' ); ?>
+					<a href="https://perflocale.com/docs/geo-redirect/#geoip-provider" target="_blank" rel="noopener" style="margin-left:4px;"><?php echo esc_html__( 'Provider examples', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
+				</p>
 			</td>
 		</tr>
 
-		<tr class="perflocale-geo-field">
+		<tr class="perflocale-geo-field"<?php echo $redirect_geo ? '' : ' hidden'; ?>>
 			<th scope="row">
 				<label for="perflocale-geo-cache"><?php echo esc_html__( 'Cache Duration', 'perflocale' ); ?></label>
 			</th>
@@ -1622,7 +2041,7 @@ final class SettingsPage {
 
 		if ( count( $geo_mappable ) >= 1 ) :
 			?>
-		<tr class="perflocale-geo-field">
+		<tr class="perflocale-geo-field"<?php echo $redirect_geo ? '' : ' hidden'; ?>>
 			<th scope="row"><?php echo esc_html__( 'Country Mapping', 'perflocale' ); ?></th>
 			<td>
 				<p class="description" style="margin-bottom:8px;"><?php echo esc_html__( 'Map country codes to languages. Comma-separated ISO 3166-1 alpha-2 codes (e.g., US,GB,AU).', 'perflocale' ); ?></p>
@@ -1692,117 +2111,6 @@ final class SettingsPage {
 		<?php endif; ?>
 		<tr>
 			<th scope="row">
-				<label for="perflocale-missing-action"><?php echo esc_html__( 'Missing Translation', 'perflocale' ); ?></label>
-			</th>
-			<td>
-				<select id="perflocale-missing-action" name="missing_translation_action">
-					<option value="show_default" <?php selected( $missing_action, 'show_default' ); ?>><?php echo esc_html__( 'Show content in default language', 'perflocale' ); ?></option>
-					<option value="show_404" <?php selected( $missing_action, 'show_404' ); ?>><?php echo esc_html__( 'Show 404 error', 'perflocale' ); ?></option>
-					<option value="redirect_default" <?php selected( $missing_action, 'redirect_default' ); ?>><?php echo esc_html__( 'Redirect to default language version', 'perflocale' ); ?></option>
-				</select>
-				<p class="description" style="margin-top:4px;">
-					<a href="https://perflocale.com/docs/language-fallbacks/#seo" target="_blank" rel="noopener"><?php echo esc_html__( 'Compare the three modes (SEO + UX tradeoffs)', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
-				</p>
-			</td>
-		</tr>
-		<?php
-		// Fallback chains: each list is the exact order tried, with no walk through other chains.
-		$all_langs = ( new \PerfLocale\Database\Repository\LanguageRepository( \PerfLocale\Plugin::get_instance()->get( 'cache' ) ) )->get_active();
-		$fallbacks = $this->settings->get_language_fallbacks();
-
-		// At most 4 fallbacks, and never more than the other active languages.
-		$max_fb = min( 4, max( 1, count( $all_langs ) - 1 ) );
-
-		// Build a quick slug→lang map for pretty labels on prefilled chips.
-		$lang_by_slug = [];
-		foreach ( $all_langs as $l ) {
-			$lang_by_slug[ $l->slug ] = $l;
-		}
-
-		if ( count( $all_langs ) > 1 ) :
-			?>
-		<tr>
-			<th scope="row"><?php echo esc_html__( 'Language Fallbacks', 'perflocale' ); ?></th>
-			<td>
-				<p class="description" style="margin-bottom:10px;">
-					<?php echo esc_html__( 'When a translation is missing, fall back to these languages in order. The first one that has a published translation wins - a single redirect is issued, never a chain of hops. If every slot is empty or unresolved, the "Missing Translation Action" above applies.', 'perflocale' ); ?>
-					<a href="https://perflocale.com/docs/language-fallbacks/#seo" target="_blank" rel="noopener" style="margin-left:4px;"><?php echo esc_html__( 'Fallback chain docs', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
-				</p>
-
-<div class="pl-fb-editor" data-max="<?php echo esc_attr( (string) $max_fb ); ?>">
-					<?php
-					foreach ( $all_langs as $lang ) :
-						// Chips are for active targets only, so only those count
-						// toward the cap. A stored target that is not active stays
-						// stored (keep_unrendered_fallback_targets()).
-						$flag        = \PerfLocale\Helper::get_flag_emoji( $lang );
-						$current_row = array_values( array_filter( (array) ( $fallbacks[ $lang->slug ] ?? [] ), static fn( $s ) => $s !== '' && $s !== $lang->slug && isset( $lang_by_slug[ $s ] ) ) );
-						$current_row = array_slice( $current_row, 0, $max_fb );
-						?>
-						<div class="pl-fb-row" data-slug="<?php echo esc_attr( $lang->slug ); ?>">
-							<div class="pl-fb-row__label">
-								<span class="pl-fb-flag"><?php echo esc_html( $flag ); ?></span>
-								<span class="pl-fb-row__name"><?php echo esc_html( $lang->native_name ?: $lang->name ); ?></span>
-							</div>
-
-							<div class="pl-fb-row__body <?php echo count( $current_row ) >= $max_fb ? 'pl-fb-row__body--full' : ''; ?>"
-								role="group"
-								aria-label="<?php echo esc_attr( sprintf( /* translators: %s: language name */ __( 'Fallback chain for %s', 'perflocale' ), $lang->native_name ?: $lang->name ) ); ?>">
-
-								<span class="pl-fb-empty"><?php echo esc_html__( 'No fallbacks - uses Missing Translation Action.', 'perflocale' ); ?></span>
-
-								<?php
-								foreach ( $current_row as $idx => $fb_slug ) :
-									$fb_lang = $lang_by_slug[ $fb_slug ] ?? null;
-									if ( ! $fb_lang ) {
-										continue; }
-									$fb_flag = \PerfLocale\Helper::get_flag_emoji( $fb_lang );
-									$fb_name = $fb_lang->native_name ?: $fb_lang->name;
-									?>
-									<div class="pl-fb-chip" data-slug="<?php echo esc_attr( $fb_slug ); ?>"
-										draggable="true"
-										tabindex="0"
-										aria-roledescription="<?php echo esc_attr__( 'Draggable fallback', 'perflocale' ); ?>"
-										aria-label="<?php echo esc_attr( sprintf( /* translators: 1: ordinal position, 2: language name or redirect method name */ __( 'Position %1$d: %2$s', 'perflocale' ), $idx + 1, $fb_name ) ); ?>">
-										<span class="pl-fb-chip__grip" aria-hidden="true">⋮⋮</span>
-										<span class="pl-fb-chip__move" aria-hidden="false"><button type="button" class="pl-fb-chip__up" aria-label="<?php echo esc_attr__( 'Move earlier', 'perflocale' ); ?>" title="<?php echo esc_attr__( 'Move earlier', 'perflocale' ); ?>">&#9650;</button><button type="button" class="pl-fb-chip__down" aria-label="<?php echo esc_attr__( 'Move later', 'perflocale' ); ?>" title="<?php echo esc_attr__( 'Move later', 'perflocale' ); ?>">&#9660;</button></span>
-										<span class="pl-fb-chip__pos"><?php echo esc_html( (string) ( $idx + 1 ) ); ?></span>
-										<span class="pl-fb-chip__name"><?php echo esc_html( $fb_flag . ' ' . $fb_name ); ?></span>
-										<button type="button" class="pl-fb-chip__remove" aria-label="<?php echo esc_attr( sprintf( /* translators: %s: language name */ __( 'Remove %s fallback', 'perflocale' ), $fb_name ) ); ?>" title="<?php echo esc_attr__( 'Remove fallback', 'perflocale' ); ?>">&times;</button>
-										<input type="hidden" name="language_fallbacks[<?php echo esc_attr( $lang->slug ); ?>][]" value="<?php echo esc_attr( $fb_slug ); ?>">
-									</div>
-								<?php endforeach; ?>
-
-								<select class="pl-fb-row__picker" aria-label="<?php echo esc_attr__( 'Add fallback language', 'perflocale' ); ?>">
-									<option value="">&#43; <?php echo esc_html__( 'Add fallback', 'perflocale' ); ?></option>
-									<?php
-									foreach ( $all_langs as $opt_lang ) :
-										if ( $opt_lang->slug === $lang->slug ) {
-											continue; }
-										$opt_flag = \PerfLocale\Helper::get_flag_emoji( $opt_lang );
-										$opt_name = $opt_lang->native_name ?: $opt_lang->name;
-										$already  = in_array( $opt_lang->slug, $current_row, true );
-										?>
-										<option
-											value="<?php echo esc_attr( $opt_lang->slug ); ?>"
-											data-flag="<?php echo esc_attr( $opt_flag ); ?>"
-											data-name="<?php echo esc_attr( $opt_name ); ?>"
-											<?php echo $already ? 'disabled hidden' : ''; ?>
-										>
-											<?php echo esc_html( $opt_flag . ' ' . $opt_name ); ?>
-										</option>
-									<?php endforeach; ?>
-								</select>
-							</div>
-						</div>
-					<?php endforeach; ?>
-				</div>
-
-			</td>
-		</tr>
-		<?php endif; ?>
-		<tr>
-			<th scope="row">
 				<label for="perflocale-cookie-lifetime"><?php echo esc_html__( 'Cookie Lifetime', 'perflocale' ); ?></label>
 			</th>
 			<td>
@@ -1817,15 +2125,6 @@ final class SettingsPage {
 					<?php echo esc_html__( 'Cookieless mode - never set the language-preference cookie (perflocale_lang).', 'perflocale' ); ?>
 				</label>
 				<p class="description"><?php echo esc_html__( 'For strict GDPR / cookie-consent setups. Language routing keeps working (it is URL-based); you lose "remember my language" on non-prefixed URLs, and the automatic first-visit redirects (browser language, GeoIP, edge hint) do not run, because without the cookie they would redirect the visitor again on every page. A consent plugin can also gate the cookie via the perflocale/privacy/consent_given filter.', 'perflocale' ); ?></p>
-			</td>
-		</tr>
-		<tr>
-			<th scope="row">
-				<label for="perflocale-excluded-paths"><?php echo esc_html__( 'Excluded Paths', 'perflocale' ); ?></label>
-			</th>
-			<td>
-				<textarea id="perflocale-excluded-paths" name="excluded_paths" rows="5" class="large-text code"><?php echo esc_textarea( implode( "\n", $excluded_paths ) ); ?></textarea>
-				<p class="description"><?php echo esc_html__( 'One path per line. These URL paths will bypass language routing.', 'perflocale' ); ?></p>
 			</td>
 		</tr>
 		<?php
@@ -1872,6 +2171,33 @@ final class SettingsPage {
 	}
 
 	/**
+	 * Whole-number fields the last settings save refused (stored value kept).
+	 *
+	 * @return array<int, string>
+	 */
+	public static function last_refused_numbers(): array {
+		return self::$refused_numbers;
+	}
+
+	/**
+	 * Screen labels of the refused whole-number fields named in the redirect; unknown keys are dropped.
+	 *
+	 * @param string $keys Comma-separated field keys.
+	 * @return array<int, string>
+	 */
+	private static function refused_number_labels( string $keys ): array {
+		$labels = [
+			'cookie_lifetime'       => __( 'Cookie Lifetime', 'perflocale' ),
+			'geo_cache_hours'       => __( 'Cache Duration', 'perflocale' ),
+			'mt_monthly_char_limit' => __( 'Monthly Character Limit', 'perflocale' ),
+			'mt_context_neighbours' => __( 'Neighbouring parts', 'perflocale' ),
+			'mt_context_max_chars'  => __( 'Maximum context characters per piece', 'perflocale' ),
+		];
+
+		return array_values( array_intersect_key( $labels, array_flip( explode( ',', $keys ) ) ) );
+	}
+
+	/**
 	 * Whether the last settings save refused a new agency URL that is not https.
 	 *
 	 * @since 1.0.7.5
@@ -1900,6 +2226,41 @@ final class SettingsPage {
 		}
 
 		return array_values( array_unique( $types ) );
+	}
+
+	/**
+	 * The Content ReSync machine translation context choice, as the Translation tab shows it.
+	 *
+	 * @return string
+	 */
+	private function mt_context_label(): string {
+		return match ( \PerfLocale\MachineTranslation\ContextSettings::mode( $this->settings ) ) {
+			'neighbours' => sprintf(
+				/* translators: %d: number of parts before and after each part */
+				_n( 'Neighbouring parts: %d before and after each part.', 'Neighbouring parts: %d before and after each part.', \PerfLocale\MachineTranslation\ContextSettings::neighbours( $this->settings ), 'perflocale' ),
+				\PerfLocale\MachineTranslation\ContextSettings::neighbours( $this->settings )
+			),
+			'section'    => __( 'Whole section.', 'perflocale' ),
+			default      => __( 'Off: each part is sent on its own.', 'perflocale' ),
+		};
+	}
+
+	/**
+	 * The Content ReSync "Include" checkboxes: registered translatable post types by label, then custom fields.
+	 *
+	 * @return array<string, string> Entry => label.
+	 */
+	private function resync_include_entries(): array {
+		$entries = [];
+
+		foreach ( $this->settings->get_site_translate_post_types() as $type ) {
+			$object           = get_post_type_object( $type );
+			$entries[ $type ] = $object instanceof \WP_Post_Type ? \PerfLocale\Util\Scalar::str( $object->labels->name ?? $type ) : $type;
+		}
+
+		$entries[ \PerfLocale\Resync\Scope::CUSTOM_FIELDS ] = __( 'Custom fields', 'perflocale' );
+
+		return $entries;
 	}
 
 	/**
@@ -1944,11 +2305,118 @@ final class SettingsPage {
 	}
 
 	/**
-	 * Render the Translation tab fields.
+	 * The "What it does" text of a content type row: core's own, else the registered description, else a fallback.
+	 *
+	 * @param string $post_type   Post type name.
+	 * @param mixed  $description Its registered description.
+	 * @return string Plain text.
+	 */
+	private static function content_type_description( string $post_type, mixed $description ): string {
+		$core    = [
+			'post' => __( 'Blog posts and news articles.', 'perflocale' ),
+			'page' => __( 'Pages such as Home, About and Contact.', 'perflocale' ),
+		];
+		$own     = is_string( $description ) ? trim( wp_strip_all_tags( $description ) ) : '';
+		$default = $core[ $post_type ] ?? ( '' !== $own ? wp_trim_words( $own, 16, '…' ) : __( 'Content added by a plugin or your theme.', 'perflocale' ) );
+
+		/**
+		 * Filters the "What it does" text of a content type in the Content to translate table at Settings > Translation.
+		 *
+		 * @hook perflocale/settings/content_type_description
+		 * @since 1.0.8
+		 * @api
+		 *
+		 * @param string $text      Plain text, escaped on output. Default: PerfLocale's text, the type's description or a general line.
+		 * @param string $post_type Post type name.
+		 * @return string Plain text; a non-string or empty return keeps the default.
+		 */
+		return self::filtered_text( 'perflocale/settings/content_type_description', apply_filters( 'perflocale/settings/content_type_description', $default, $post_type ), $default );
+	}
+
+	/**
+	 * Load the row texts of booted bundled add-ons (addons/<id>/content-types.php) for this table only.
 	 *
 	 * @return void
 	 */
-	private function render_translation_tab(): void {
+	private static function load_addon_content_types(): void {
+		$plugin = \PerfLocale\Plugin::get_instance();
+
+		if ( ! $plugin->has( \PerfLocale\Plugin::SERVICE_ADDONS ) ) {
+			return;
+		}
+
+		$registry = $plugin->addon_registry();
+
+		foreach ( array_keys( $registry->get_loaded_addons() ) as $id ) {
+			$file = dirname( __DIR__, 3 ) . '/addons/' . $id . '/content-types.php';
+
+			if ( $registry->is_bundled( $id ) && $registry->is_booted( $id ) && is_readable( $file ) ) {
+				require_once $file;
+			}
+		}
+	}
+
+	/**
+	 * A text filter's result: a non-string is reported; it or an empty text gives the default.
+	 *
+	 * @param string $hook     Hook name.
+	 * @param mixed  $text     What the callbacks returned.
+	 * @param string $fallback Unfiltered text.
+	 * @return string
+	 */
+	private static function filtered_text( string $hook, mixed $text, string $fallback ): string {
+		if ( ! is_string( $text ) ) {
+			return \PerfLocale\Util\FilterReturn::rejected( $hook, $text, $fallback );
+		}
+
+		$text = trim( $text );
+
+		return '' === $text ? $fallback : $text;
+	}
+
+	/**
+	 * One Content to translate row; the Item cell is the checkbox's label.
+	 *
+	 * @param string             $value   Checkbox value.
+	 * @param string             $label   Item name.
+	 * @param array<int, string> $types   Post type names for the Type column.
+	 * @param string             $note    What it does.
+	 * @param bool               $checked Ticked.
+	 * @return void
+	 */
+	private function content_to_translate_row( string $value, string $label, array $types, string $note, bool $checked ): void {
+		$id = 'perflocale-ctt-' . sanitize_html_class( $value );
+		?>
+		<tr>
+			<td class="perflocale-ctt-check"><input type="checkbox" id="<?php echo esc_attr( $id ); ?>" name="translatable_post_types[]" value="<?php echo esc_attr( $value ); ?>" <?php checked( $checked ); ?>></td>
+			<td><label for="<?php echo esc_attr( $id ); ?>"><?php echo esc_html( $label ); ?></label></td>
+			<td class="perflocale-ctt-types">
+				<?php foreach ( $types as $type ) : ?>
+					<code><?php echo esc_html( $type ); ?></code>
+				<?php endforeach; ?>
+			</td>
+			<td class="perflocale-ctt-note"><?php echo esc_html( $note ); ?></td>
+		</tr>
+		<?php
+	}
+
+	/**
+	 * Render a Translation subtab's fields.
+	 *
+	 * @param string $subtab 'general', 'content-resync' or 'bulk'.
+	 * @return void
+	 */
+	private function render_translation_tab( string $subtab = 'general' ): void {
+		if ( 'content-resync' === $subtab ) {
+			$this->render_content_resync_tab();
+			return;
+		}
+
+		if ( 'bulk' === $subtab ) {
+			$this->render_bulk_translation_tab();
+			return;
+		}
+
 		$translatable_pts  = $this->settings->get_translatable_post_types();
 		$translatable_taxs = $this->settings->get_translatable_taxonomies();
 		$default_status    = (string) $this->settings->get( 'default_translation_status' );
@@ -1973,80 +2441,54 @@ final class SettingsPage {
 		$builtin_keys     = array_keys( $available_sync_fields );
 		$custom_sync_meta = array_filter( $sync_fields, fn( $f ) => ! in_array( $f, $builtin_keys, true ) );
 
-		// The bulk tools below run from admin-settings.js on perflocaleBulkFetch (admin-bulk-fetch.js);
-		// this tab loads the helper and gives them their data.
-		\PerfLocale\Admin\Assets::enqueue_script( 'perflocale-admin-bulk-fetch', 'admin-bulk-fetch.js' );
-		\PerfLocale\Admin\Assets::add_dependency( 'perflocale-admin-settings', 'perflocale-admin-bulk-fetch' );
-
-		wp_localize_script(
-			'perflocale-admin-settings',
-			'perflocaleTranslationData',
-			[
-				'taxNonce'         => wp_create_nonce( 'perflocale_create_taxonomy_translations' ),
-				'postLangNonce'    => wp_create_nonce( 'perflocale_assign_post_languages' ),
-				'genTrNonce'       => wp_create_nonce( 'perflocale_generate_missing_translations' ),
-				'i18nCreating'     => __( 'Creating taxonomy translations...', 'perflocale' ),
-				'i18nAssigning'    => __( 'Assigning default language to unlinked posts...', 'perflocale' ),
-				'i18nFailed'       => __( 'Failed', 'perflocale' ),
-				'i18nFailedDot'    => __( 'Failed.', 'perflocale' ),
-				'i18nDone'         => __( 'Done', 'perflocale' ),
-				'i18nTaxonomy'     => __( 'Taxonomy', 'perflocale' ),
-				'i18nPostType'     => __( 'Post type', 'perflocale' ),
-				'i18nCreated'      => __( 'Created', 'perflocale' ),
-				'i18nExisted'      => __( 'Existed', 'perflocale' ),
-				'i18nAssigned'     => __( 'Assigned', 'perflocale' ),
-				'i18nNetworkError' => __( 'Network error', 'perflocale' ),
-			]
-		);
+		// Templates and template parts share one box (pair_block_template_types()).
+		$site_building = array_filter( $non_public_types, static fn( $t ) => ! \PerfLocale\Translation\BlockTemplateSupport::is_template_type( $t->name ) );
+		$has_templates = count( $site_building ) < count( $non_public_types );
+		$part_labels   = [
+			'wp_block'      => __( 'Synced patterns', 'perflocale' ),
+			'wp_navigation' => __( 'Navigation menus', 'perflocale' ),
+		];
+		$item_notes    = [
+			'wp_block'      => __( 'Each language gets its own copy; pages show the right one.', 'perflocale' ),
+			'wp_navigation' => __( 'Translates the menu labels of block themes. Links follow the language anyway.', 'perflocale' ),
+		];
+		self::load_addon_content_types();
 
 		?>
 		<tr>
-			<th scope="row"><?php echo esc_html__( 'Translatable Post Types', 'perflocale' ); ?></th>
+			<th scope="row"><?php echo esc_html__( 'Content to translate', 'perflocale' ); ?></th>
 			<td>
-				<fieldset>
-					<?php foreach ( $all_post_types as $pt ) : ?>
-						<label>
-							<input type="checkbox" name="translatable_post_types[]" value="<?php echo esc_attr( $pt->name ); ?>" <?php checked( in_array( $pt->name, $translatable_pts, true ) ); ?>>
-							<?php echo esc_html( $pt->labels->name ); ?> <code>(<?php echo esc_html( $pt->name ); ?>)</code>
-						</label><br>
-					<?php endforeach; ?>
-				</fieldset>
-				<?php if ( $non_public_types ) : ?>
-					<?php
-					// A separate collapsed group: patterns and posts are not comparable choices.
-					?>
-					<details class="perflocale-settings__advanced-types">
-						<summary><?php echo esc_html__( 'Advanced content types', 'perflocale' ); ?></summary>
-						<p class="description">
-							<?php echo esc_html__( 'Content types that are not part of your site\'s public pages, but can still hold text your visitors read.', 'perflocale' ); ?>
-						</p>
-						<fieldset>
-							<?php
-							foreach ( $non_public_types as $npt ) :
-								// The two block-template types share ONE control below -
-								// see pair_block_template_types().
-								if ( \PerfLocale\Translation\BlockTemplateSupport::is_template_type( $npt->name ) ) {
-									continue;
-								}
-								?>
-								<label>
-									<input type="checkbox" name="translatable_post_types[]" value="<?php echo esc_attr( $npt->name ); ?>" <?php checked( in_array( $npt->name, $translatable_pts, true ) ); ?>>
-									<?php echo esc_html( $npt->labels->name ); ?> <code>(<?php echo esc_html( $npt->name ); ?>)</code>
-								</label>
-								<?php if ( 'wp_block' === $npt->name ) : ?>
-									<span class="description">
-										- <?php echo esc_html__( 'synced patterns; each language gets its own copy, and pages using the pattern show the right one automatically.', 'perflocale' ); ?>
-									</span>
-								<?php elseif ( 'wp_navigation' === $npt->name ) : ?>
-									<span class="description">
-										- <?php echo esc_html__( 'menus in block themes. Link addresses are already translated without this; switch it on to translate the menu labels too.', 'perflocale' ); ?>
-									</span>
-								<?php endif; ?>
-								<br>
+				<p class="description perflocale-ctt-hint"><?php echo esc_html__( 'Tick what each language should have its own version of. Unticked items stay in one language.', 'perflocale' ); ?></p>
+				<div class="perflocale-table-responsive perflocale-ub-table-wrap perflocale-ctt-wrap">
+				<table class="widefat perflocale-ctt-table">
+					<caption class="screen-reader-text"><?php echo esc_html__( 'Content to translate', 'perflocale' ); ?></caption>
+					<thead>
+						<tr>
+							<th scope="col" class="perflocale-ctt-check"><?php echo esc_html__( 'Translate', 'perflocale' ); ?></th>
+							<th scope="col"><?php echo esc_html__( 'Item', 'perflocale' ); ?></th>
+							<th scope="col"><?php echo esc_html__( 'Type', 'perflocale' ); ?></th>
+							<th scope="col"><?php echo esc_html__( 'What it does', 'perflocale' ); ?></th>
+						</tr>
+					</thead>
+					<tbody class="perflocale-ctt-content">
+						<tr class="perflocale-ctt-group"><th scope="rowgroup" colspan="4"><?php echo esc_html__( 'Your content', 'perflocale' ); ?></th></tr>
+						<?php foreach ( $all_post_types as $pt ) : ?>
+							<?php $this->content_to_translate_row( $pt->name, \PerfLocale\Util\Scalar::str( $pt->labels->name ?? $pt->name ), [ $pt->name ], self::content_type_description( $pt->name, $pt->description ), in_array( $pt->name, $translatable_pts, true ) ); ?>
+						<?php endforeach; ?>
+					</tbody>
+					<?php if ( $non_public_types ) : ?>
+						<tbody class="perflocale-ctt-site-parts">
+							<tr class="perflocale-ctt-group"><th scope="rowgroup" colspan="4"><?php echo esc_html__( 'Site parts', 'perflocale' ); ?></th></tr>
+							<?php foreach ( $site_building as $npt ) : ?>
+								<?php $this->content_to_translate_row( $npt->name, $part_labels[ $npt->name ] ?? \PerfLocale\Util\Scalar::str( $npt->labels->name ?? $npt->name ), [ $npt->name ], $item_notes[ $npt->name ] ?? self::content_type_description( $npt->name, $npt->description ), in_array( $npt->name, $translatable_pts, true ) ); ?>
 							<?php endforeach; ?>
-						</fieldset>
-					</details>
-				<?php endif; ?>
+							<?php if ( $has_templates ) : ?>
+								<?php $this->content_to_translate_row( 'wp_template', __( 'Templates and template parts', 'perflocale' ), [ 'wp_template', 'wp_template_part' ], __( 'Text you typed into the header, footer, 404 page and other templates. Both switch on together. Templates you never changed already follow the theme\'s translations.', 'perflocale' ), array_intersect( [ 'wp_template', 'wp_template_part' ], $translatable_pts ) !== [] ); ?>
+							<?php endif; ?>
+						</tbody>
+					<?php endif; ?>
+				</table>
+				</div>
 			</td>
 		</tr>
 		<tr>
@@ -2062,34 +2504,6 @@ final class SettingsPage {
 				</fieldset>
 			</td>
 		</tr>
-		<?php
-		// Full site editing gets its own row: on a block theme it holds the header, footer and layouts.
-		$fse_types   = array_filter(
-			$non_public_types,
-			static fn( $t ) => \PerfLocale\Translation\BlockTemplateSupport::is_template_type( $t->name )
-		);
-		$fse_enabled = array_intersect( [ 'wp_template', 'wp_template_part' ], $translatable_pts ) !== [];
-
-		if ( $fse_types ) :
-			?>
-		<tr>
-			<th scope="row"><?php echo esc_html__( 'Full Site Editing', 'perflocale' ); ?></th>
-			<td>
-				<fieldset>
-					<label>
-						<input type="checkbox" name="translatable_post_types[]" value="wp_template" <?php checked( $fse_enabled ); ?>>
-						<?php echo esc_html__( 'Translate block theme templates and template parts', 'perflocale' ); ?>
-					</label>
-					<p class="description">
-						<?php echo esc_html__( 'Text you typed directly into a block theme\'s templates and template parts - a header, footer, or 404 page. Both are switched on together: translating a page layout without its header leaves a half-translated page.', 'perflocale' ); ?>
-					</p>
-					<p class="description">
-						<?php echo esc_html__( 'Templates you have not customised are unaffected - their text already follows the theme\'s own translations. The Site Editor always shows and saves the original.', 'perflocale' ); ?>
-					</p>
-				</fieldset>
-			</td>
-		</tr>
-		<?php endif; ?>
 		<tr>
 			<th scope="row">
 				<label for="perflocale-default-status"><?php echo esc_html__( 'Default Translation Status', 'perflocale' ); ?></label>
@@ -2153,10 +2567,203 @@ final class SettingsPage {
 				</p>
 			</td>
 		</tr>
+		<?php
+	}
 
+	/**
+	 * Render the Translation > Content ReSync fields; while it is off, only its switch.
+	 *
+	 * @return void
+	 */
+	private function render_content_resync_tab(): void {
+		$resync_on       = \PerfLocale\Util\ResyncSwitch::on();
+		$resync_stored   = (bool) $this->settings->get( 'resync_enabled' );
+		$resync_excluded = array_values( array_filter( (array) $this->settings->get( 'resync_excluded', [] ), 'is_string' ) );
+		$resync_mt_on    = $this->settings->mt_enabled();
+
+		// The other ReSync fields are not printed while it is off, so its classes stay unloaded.
+		$resync_person    = '';
+		$resync_changed   = '';
+		$resync_threshold = 100;
+		$resync_keep      = true;
+
+		if ( $resync_on ) {
+			$resync_person    = \PerfLocale\Resync\ResyncSettings::person_blocks( $this->settings );
+			$resync_changed   = \PerfLocale\Resync\ResyncSettings::changed_parts( $this->settings );
+			$resync_threshold = \PerfLocale\Resync\ResyncSettings::match_threshold( $this->settings );
+			$resync_keep      = \PerfLocale\Resync\ResyncSettings::keep_exceptions( $this->settings );
+		}
+
+		?>
 		<tr>
-			<td colspan="2"><h3 style="margin:16px 0 4px;"><?php echo esc_html__( 'Bulk Translation', 'perflocale' ); ?></h3></td>
+			<th scope="row"><?php echo esc_html__( 'Content ReSync', 'perflocale' ); ?></th>
+			<td>
+				<label>
+					<input type="checkbox" name="resync_enabled" value="1" <?php checked( $resync_stored ); ?>>
+					<?php echo esc_html__( 'Turn on Content ReSync', 'perflocale' ); ?>
+				</label>
+				<p class="description"><?php echo esc_html__( 'Updates translations after you change the original, with an estimate first and a review screen.', 'perflocale' ); ?></p>
+				<p class="description"><?php echo esc_html__( 'While it is off, it adds nothing to your site: no screens, buttons, background jobs or notices. Its records are kept, and the first run after you turn it back on reads every source again.', 'perflocale' ); ?></p>
+				<?php if ( $resync_on !== $resync_stored ) : ?>
+					<p class="description"><strong><?php echo esc_html( $resync_on ? __( 'A filter on this site keeps Content ReSync on, whatever this setting says.', 'perflocale' ) : __( 'A filter on this site keeps Content ReSync off, whatever this setting says.', 'perflocale' ) ); ?></strong></p>
+				<?php endif; ?>
+			</td>
 		</tr>
+		<?php if ( $resync_on ) : ?>
+			<?php if ( \PerfLocale\Resync\Store::legacy_sqlite() ) : ?>
+		<tr>
+			<td colspan="2"><div class="notice notice-warning inline"><p><?php echo esc_html( \PerfLocale\Resync\Store::unavailable_text() ); ?></p></div></td>
+		</tr>
+			<?php endif; ?>
+		<tr>
+			<th scope="row"><?php echo esc_html__( 'Content to update', 'perflocale' ); ?></th>
+			<td>
+				<fieldset>
+					<legend class="screen-reader-text"><?php echo esc_html__( 'Content ReSync: content to update', 'perflocale' ); ?></legend>
+					<?php foreach ( $this->resync_include_entries() as $resync_entry => $resync_label ) : ?>
+						<label>
+							<input type="checkbox" name="resync_included[]" value="<?php echo esc_attr( $resync_entry ); ?>" <?php checked( ! in_array( $resync_entry, $resync_excluded, true ) ); ?>>
+							<?php echo esc_html( $resync_label ); ?>
+						</label><br>
+					<?php endforeach; ?>
+				</fieldset>
+				<p class="description"><?php echo esc_html__( 'Update translations and Resync from source cover the ticked content types. An unticked type is never resynced. A post type the site starts to translate later is included.', 'perflocale' ); ?></p>
+			</td>
+		</tr>
+		<tr>
+			<th scope="row"><?php echo esc_html__( 'Changed and new parts', 'perflocale' ); ?></th>
+			<td>
+				<?php // A radio only where there is a choice: machine translation on, or a stored machine choice to switch back from. ?>
+				<?php if ( $resync_mt_on || 'machine' === $resync_changed ) : ?>
+					<fieldset>
+						<legend class="screen-reader-text"><?php echo esc_html__( 'Content ReSync: changed and new parts', 'perflocale' ); ?></legend>
+						<label>
+							<input type="radio" name="resync_changed_parts" value="source" <?php checked( $resync_changed, 'source' ); ?>>
+							<?php echo esc_html__( 'Leave them in the source language for a translator', 'perflocale' ); ?>
+						</label>
+						<?php if ( $resync_mt_on ) : ?>
+							<br>
+							<label>
+								<input type="radio" name="resync_changed_parts" value="machine" <?php checked( $resync_changed, 'machine' ); ?>>
+								<?php echo esc_html__( 'Machine translate them', 'perflocale' ); ?>
+							</label>
+						<?php endif; ?>
+					</fieldset>
+					<?php if ( ! $resync_mt_on && 'machine' === $resync_changed ) : ?>
+						<p class="description"><?php echo esc_html__( 'Set to machine translate them, but machine translation is off: nothing runs until machine translation is switched on, or until you choose to leave them for a translator.', 'perflocale' ); ?></p>
+					<?php endif; ?>
+					<p class="description"><?php echo esc_html__( 'The parts of a translation whose source text changed or is new. Machine translated parts are sent to your machine translation provider, with the context set in the machine translation settings, and the estimate shows the characters before anything runs. When the person who runs it may not use machine translation, or no provider is ready, nothing runs and the estimate says why. This choice applies to changes from then on: parts an earlier update left in the source language stay as they are until a person translates them or their source text changes.', 'perflocale' ); ?></p>
+					<?php if ( ! $resync_mt_on ) : ?>
+						<p class="description">
+							<?php echo esc_html__( 'Machine translated parts can be chosen when machine translation is on.', 'perflocale' ); ?>
+							<a href="<?php echo esc_url( admin_url( 'admin.php?page=perflocale-settings&tab=addons&subtab=machine-translation' ) ); ?>"><?php echo esc_html__( 'Machine translation settings', 'perflocale' ); ?></a>
+						</p>
+					<?php endif; ?>
+				<?php else : ?>
+					<p class="description">
+						<?php echo esc_html__( 'Changed and new parts stay in the source language for a translator. To machine translate them, turn on machine translation.', 'perflocale' ); ?>
+						<a href="<?php echo esc_url( admin_url( 'admin.php?page=perflocale-settings&tab=addons&subtab=machine-translation' ) ); ?>"><?php echo esc_html__( 'Machine translation settings', 'perflocale' ); ?></a>
+					</p>
+				<?php endif; ?>
+			</td>
+		</tr>
+		<tr>
+			<th scope="row"><label for="perflocale-resync-match-threshold"><?php echo esc_html__( 'Near matches', 'perflocale' ); ?></label></th>
+			<td>
+				<select id="perflocale-resync-match-threshold" name="resync_match_threshold" aria-describedby="perflocale-resync-match-threshold-description">
+					<?php foreach ( \PerfLocale\Resync\RunOptions::THRESHOLDS as $resync_value ) : ?>
+						<option value="<?php echo esc_attr( (string) $resync_value ); ?>" <?php selected( $resync_threshold, $resync_value ); ?>>
+							<?php
+							echo esc_html(
+								100 === $resync_value
+									? __( 'Off: update every changed part', 'perflocale' )
+									/* translators: %d: how similar the changed source text is, in percent. */
+									: sprintf( __( 'Keep the old translation when the text is at least %d%% the same', 'perflocale' ), $resync_value )
+							);
+							?>
+						</option>
+					<?php endforeach; ?>
+				</select>
+				<p class="description" id="perflocale-resync-match-threshold-description"><?php echo esc_html__( 'A part whose source text changed only a little keeps its old translation instead of being updated. The update lists it as a near match, and the translation stays Outdated until a person checks it.', 'perflocale' ); ?></p>
+			</td>
+		</tr>
+		<tr>
+			<th scope="row"><?php echo esc_html__( 'Keep per-language blocks and media', 'perflocale' ); ?></th>
+			<td>
+				<label>
+					<input type="checkbox" name="resync_keep_exceptions" value="1" <?php checked( $resync_keep ); ?>>
+					<?php echo esc_html__( 'Keep blocks that exist only in a translation, and images and links changed for its language', 'perflocale' ); ?>
+				</label>
+				<p class="description"><?php echo esc_html__( 'When this is off, an update makes the translation follow the source: blocks that exist only in the translation are removed, blocks removed from it come back, and the source\'s images and links replace its own. Such an update always waits for review.', 'perflocale' ); ?></p>
+			</td>
+		</tr>
+		<tr>
+			<th scope="row"><?php echo esc_html__( 'Blocks changed outside ReSync in a translation', 'perflocale' ); ?></th>
+			<td>
+				<fieldset>
+					<legend class="screen-reader-text"><?php echo esc_html__( 'Content ReSync: blocks changed outside ReSync in a translation', 'perflocale' ); ?></legend>
+					<label>
+						<input type="radio" name="resync_person_blocks" value="<?php echo esc_attr( \PerfLocale\Resync\ResyncSettings::PERSON_BLOCKS_ALWAYS ); ?>" <?php checked( $resync_person, \PerfLocale\Resync\ResyncSettings::PERSON_BLOCKS_ALWAYS ); ?>>
+						<?php echo esc_html__( 'Always hold changes to them for review (recommended)', 'perflocale' ); ?>
+					</label><br>
+					<label>
+						<input type="radio" name="resync_person_blocks" value="<?php echo esc_attr( \PerfLocale\Resync\ResyncSettings::PERSON_BLOCKS_ONCE ); ?>" <?php checked( $resync_person, \PerfLocale\Resync\ResyncSettings::PERSON_BLOCKS_ONCE ); ?>>
+						<?php echo esc_html__( 'Hold once, then follow the source', 'perflocale' ); ?>
+					</label>
+				</fieldset>
+				<p class="description"><?php echo esc_html__( 'With the first choice, every update that changes or removes a block that was written or changed outside ReSync in a translation waits for review, also for a draft. With the second, only the first update after a change outside ReSync waits; later updates follow the source. Text outside blocks (classic content) is held only for the first update after a change outside ReSync.', 'perflocale' ); ?></p>
+			</td>
+		</tr>
+			<?php if ( $resync_mt_on ) : ?>
+			<tr>
+				<th scope="row"><?php echo esc_html__( 'Machine translation context', 'perflocale' ); ?></th>
+				<td>
+					<p>
+						<?php echo esc_html( $this->mt_context_label() ); ?>
+						<a href="<?php echo esc_url( admin_url( 'admin.php?page=perflocale-settings&tab=addons&subtab=machine-translation' ) ); ?>"><?php echo esc_html__( 'Change it in the machine translation settings', 'perflocale' ); ?></a>
+					</p>
+				</td>
+			</tr>
+		<?php endif; ?>
+		<?php endif; ?>
+		<?php
+	}
+
+	/**
+	 * Render the Translation > Bulk Translation tools (buttons, no settings).
+	 *
+	 * @return void
+	 */
+	private function render_bulk_translation_tab(): void {
+		$resync_on = \PerfLocale\Util\ResyncSwitch::on();
+
+		// The bulk tools below run from admin-settings.js on perflocaleBulkFetch (admin-bulk-fetch.js);
+		// this tab loads the helper and gives them their data.
+		\PerfLocale\Admin\Assets::enqueue_script( 'perflocale-admin-bulk-fetch', 'admin-bulk-fetch.js' );
+		\PerfLocale\Admin\Assets::add_dependency( 'perflocale-admin-settings', 'perflocale-admin-bulk-fetch' );
+
+		wp_localize_script(
+			'perflocale-admin-settings',
+			'perflocaleTranslationData',
+			[
+				'taxNonce'         => wp_create_nonce( 'perflocale_create_taxonomy_translations' ),
+				'postLangNonce'    => wp_create_nonce( 'perflocale_assign_post_languages' ),
+				'genTrNonce'       => wp_create_nonce( 'perflocale_generate_missing_translations' ),
+				'i18nCreating'     => __( 'Creating taxonomy translations...', 'perflocale' ),
+				'i18nAssigning'    => __( 'Assigning default language to unlinked posts...', 'perflocale' ),
+				'i18nFailed'       => __( 'Failed', 'perflocale' ),
+				'i18nFailedDot'    => __( 'Failed.', 'perflocale' ),
+				'i18nDone'         => __( 'Done', 'perflocale' ),
+				'i18nTaxonomy'     => __( 'Taxonomy', 'perflocale' ),
+				'i18nPostType'     => __( 'Post type', 'perflocale' ),
+				'i18nCreated'      => __( 'Created', 'perflocale' ),
+				'i18nExisted'      => __( 'Existed', 'perflocale' ),
+				'i18nAssigned'     => __( 'Assigned', 'perflocale' ),
+				'i18nNetworkError' => __( 'Network error', 'perflocale' ),
+			]
+		);
+
+		?>
 		<?php $unimported = \PerfLocale\Migration\MigrationState::unimported_sources(); ?>
 		<?php if ( $unimported !== [] ) : ?>
 			<tr>
@@ -2214,7 +2821,7 @@ final class SettingsPage {
 			<th scope="row"><?php echo esc_html__( 'Assign Default Language', 'perflocale' ); ?></th>
 			<td>
 				<p class="description" style="margin:0 0 8px;">
-					<?php echo esc_html__( 'Give every item that has no language yet the site\'s default language. This covers everything ticked above - posts, pages, products, and the types your addons add, such as forms and patterns. Anything that already has a language is left alone. Run it once after installing PerfLocale on an existing site, so language-aware pickers (nav menus, category checklists) stop offering unmanaged content in every language. Large sites are processed in batches and the button keeps going until it is finished.', 'perflocale' ); ?>
+					<?php echo esc_html__( 'Give every item that has no language yet the site\'s default language. This covers every content type ticked under Translation > General - posts, pages, products, and the types your addons add, such as forms and patterns. Anything that already has a language is left alone. Run it once after installing PerfLocale on an existing site, so language-aware pickers (nav menus, category checklists) stop offering unmanaged content in every language. Large sites are processed in batches and the button keeps going until it is finished.', 'perflocale' ); ?>
 				</p>
 				<p class="description" style="margin:0 0 8px;">
 					<strong><?php echo esc_html__( 'This is step 1 of 2.', 'perflocale' ); ?></strong>
@@ -2250,10 +2857,39 @@ final class SettingsPage {
 				<p class="description" style="margin:0 0 8px;">
 					<?php echo esc_html__( 'Drafts only, with no content copied and no machine translation - nothing becomes visible to visitors, and nothing is sent to a provider. Existing translations are never touched, so running it twice creates nothing the second time. It tells you how many it will create before it starts.', 'perflocale' ); ?>
 				</p>
+				<?php
+				// The Translations page's "Update translations" dialog: shown to a user who can open the page and the dialog.
+				$can_open_dialog = $resync_on && current_user_can( 'perflocale_manage_translations' ) && current_user_can( 'perflocale_translate' );
+				?>
+				<?php if ( $can_open_dialog ) : ?>
+					<p class="description perflocale-generate-dialog">
+						<?php
+						// Machine translated drafts only when machine translation is on and the user may use it.
+						if ( \PerfLocale\Admin\ResyncLinks::machine_fill_allowed() ) {
+							echo esc_html__( '"Update translations" on the Translations page creates the missing translations of published content, as empty drafts or machine translated, and updates outdated translations, for the content types Content ReSync includes.', 'perflocale' );
+						} else {
+							echo esc_html__( '"Update translations" on the Translations page creates the missing translations of published content as empty drafts, and updates outdated translations, for the content types Content ReSync includes.', 'perflocale' );
+						}
+						echo ' ' . esc_html__( 'This button covers more: content that is published, scheduled, draft, pending review or private, of every translatable type, always as empty drafts.', 'perflocale' );
+						?>
+					</p>
+				<?php endif; ?>
 				<div style="display:flex;align-items:center;gap:8px;">
 					<button type="button" class="button" id="perflocale-generate-translations">
 						<?php echo esc_html__( 'Generate Missing Translations', 'perflocale' ); ?>
 					</button>
+					<?php
+					if ( $can_open_dialog ) :
+						$dialog_url = add_query_arg(
+							[
+								'page'              => 'perflocale-translations',
+								'perflocale_update' => 'missing',
+							],
+							admin_url( 'admin.php' )
+						) . '#perflocale-update-translations';
+						?>
+						<a class="button perflocale-generate-dialog-link" href="<?php echo esc_url( $dialog_url ); ?>"><?php echo esc_html__( 'Update translations', 'perflocale' ); ?></a>
+					<?php endif; ?>
 				</div>
 				<div id="perflocale-gentr-progress" style="display:none;margin-top:10px;max-width:420px;">
 					<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
@@ -2308,6 +2944,7 @@ final class SettingsPage {
 		$agency_url      = (string) $this->settings->get( 'mt_agency_url' );
 		$agency_key      = (string) $this->settings->get( 'mt_agency_api_key' );
 		$agency_batch    = (bool) $this->settings->get( 'mt_agency_batch', false );
+		$agency_max      = ExternalAgencyProvider::max_chars_value( $this->settings->get( 'mt_agency_max_chars', 0 ) );
 		?>
 		<tr>
 			<th scope="row">
@@ -2413,6 +3050,32 @@ final class SettingsPage {
 			</td>
 		</tr>
 		<tr>
+			<th scope="row"><?php echo esc_html__( 'SEO Fields', 'perflocale' ); ?></th>
+			<td>
+				<?php $mt_meta_seo = (bool) $this->settings->get( 'mt_meta_seo', true ); ?>
+				<label>
+					<input type="checkbox" name="mt_meta_seo" value="1" <?php checked( $mt_meta_seo ); ?>>
+					<?php echo esc_html__( 'Machine-translate SEO titles, descriptions and social texts from the SEO add-ons.', 'perflocale' ); ?>
+				</label>
+				<p class="description">
+					<?php echo esc_html__( 'On by default. Applies when machine translation includes fields: Translate on create, the REST and Abilities translate calls, and bulk or WP-CLI runs with fields on. Auto-translate on publish leaves SEO fields out.', 'perflocale' ); ?>
+				</p>
+			</td>
+		</tr>
+		<tr>
+			<th scope="row"><?php echo esc_html__( 'SEO Focus Keywords', 'perflocale' ); ?></th>
+			<td>
+				<?php $mt_meta_seo_keywords = (bool) $this->settings->get( 'mt_meta_seo_keywords', false ); ?>
+				<label>
+					<input type="checkbox" name="mt_meta_seo_keywords" value="1" <?php checked( $mt_meta_seo_keywords ); ?>>
+					<?php echo esc_html__( 'Translate SEO focus keywords', 'perflocale' ); ?>
+				</label>
+				<p class="description">
+					<?php echo esc_html__( 'Also machine-translates the Rank Math and Yoast SEO focus keywords when SEO Fields is on. This sends more text to your translation provider.', 'perflocale' ); ?>
+				</p>
+			</td>
+		</tr>
+		<tr>
 			<th scope="row"><?php echo esc_html__( 'Custom Fields', 'perflocale' ); ?></th>
 			<td>
 				<?php $mt_meta_custom_fields = (bool) $this->settings->get( 'mt_meta_custom_fields', false ); ?>
@@ -2436,6 +3099,52 @@ final class SettingsPage {
 					<?php echo esc_html__( 'This is the only ceiling on what your translation provider can bill you in a month - 0 means unlimited, which with auto-translate on publish leaves the spend uncapped.', 'perflocale' ); ?>
 					<a href="https://perflocale.com/docs/machine-translation/#char-limit" target="_blank" rel="noopener"><?php echo esc_html__( 'What happens when the cap is reached', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
 				</p>
+			</td>
+		</tr>
+		<?php
+		$context_mode       = \PerfLocale\MachineTranslation\ContextSettings::mode( $this->settings );
+		$context_neighbours = \PerfLocale\MachineTranslation\ContextSettings::neighbours( $this->settings );
+		$context_previous   = \PerfLocale\MachineTranslation\ContextSettings::previous( $this->settings );
+		$context_max_chars  = \PerfLocale\MachineTranslation\ContextSettings::max_chars( $this->settings );
+		?>
+		<tr>
+			<th scope="row">
+				<label for="perflocale-mt-context-mode"><?php echo esc_html__( 'Context sent with each piece', 'perflocale' ); ?></label>
+			</th>
+			<td>
+				<select id="perflocale-mt-context-mode" name="mt_context_mode" aria-describedby="perflocale-mt-context-mode-description">
+					<option value="off" <?php selected( $context_mode, 'off' ); ?>><?php echo esc_html__( 'Off', 'perflocale' ); ?></option>
+					<option value="neighbours" <?php selected( $context_mode, 'neighbours' ); ?>><?php echo esc_html__( 'Neighbouring parts', 'perflocale' ); ?></option>
+					<option value="section" <?php selected( $context_mode, 'section' ); ?>><?php echo esc_html__( 'Whole section', 'perflocale' ); ?></option>
+				</select>
+				<p class="description" id="perflocale-mt-context-mode-description"><?php echo esc_html__( 'Used by Content ReSync when it machine translates new or changed parts of a translation ("Changed and new parts" under Settings, Translation, Content ReSync set to machine translate them), and by "Translate outdated and missing strings" for outdated strings (their current translation is sent with them). Text around each part (the parts before and after it, or the group, column or other container it sits in) is sent with it, so the provider can choose the right words. Sent only to providers that accept context: DeepL and the WordPress AI Client. The context is text of the same post; blocks marked not to translate are never part of it. When a post would need too many requests with context, less context or none is sent. DeepL does not bill context; with the WordPress AI Client it counts toward the Monthly Character Limit, up to the maximum context characters for each part sent. Off sends each part on its own.', 'perflocale' ); ?></p>
+			</td>
+		</tr>
+		<tr>
+			<th scope="row">
+				<label for="perflocale-mt-context-neighbours"><?php echo esc_html__( 'Neighbouring parts', 'perflocale' ); ?></label>
+			</th>
+			<td>
+				<input type="number" id="perflocale-mt-context-neighbours" name="mt_context_neighbours" value="<?php echo absint( $context_neighbours ); ?>" class="small-text" min="<?php echo absint( \PerfLocale\MachineTranslation\ContextSettings::NEIGHBOURS_MIN ); ?>" max="<?php echo absint( \PerfLocale\MachineTranslation\ContextSettings::NEIGHBOURS_MAX ); ?>" step="1" aria-describedby="perflocale-mt-context-neighbours-description">
+				<p class="description" id="perflocale-mt-context-neighbours-description"><?php echo esc_html__( 'With Neighbouring parts: how many parts before and after each part are sent.', 'perflocale' ); ?></p>
+			</td>
+		</tr>
+		<tr>
+			<th scope="row"><?php echo esc_html__( 'Previous translation', 'perflocale' ); ?></th>
+			<td>
+				<label>
+					<input type="checkbox" name="mt_context_previous" value="1" <?php checked( $context_previous ); ?>>
+					<?php echo esc_html__( 'Include the previous translation of a changed part', 'perflocale' ); ?>
+				</label>
+			</td>
+		</tr>
+		<tr>
+			<th scope="row">
+				<label for="perflocale-mt-context-max-chars"><?php echo esc_html__( 'Maximum context characters per piece', 'perflocale' ); ?></label>
+			</th>
+			<td>
+				<input type="number" id="perflocale-mt-context-max-chars" name="mt_context_max_chars" value="<?php echo absint( $context_max_chars ); ?>" class="small-text" min="<?php echo absint( \PerfLocale\MachineTranslation\ContextSettings::MAX_CHARS_MIN ); ?>" max="<?php echo absint( \PerfLocale\MachineTranslation\ContextSettings::MAX_CHARS_MAX ); ?>" step="1" aria-describedby="perflocale-mt-context-max-chars-description">
+				<p class="description" id="perflocale-mt-context-max-chars-description"><?php echo esc_html__( 'Context longer than this is shortened: the previous translation is kept first, then the nearest parts, then the section.', 'perflocale' ); ?></p>
 			</td>
 		</tr>
 
@@ -2566,6 +3275,24 @@ final class SettingsPage {
 					<?php echo esc_html__( 'My endpoint accepts batches', 'perflocale' ); ?>
 				</label>
 				<p class="description"><?php echo esc_html__( 'Sends several texts per request as {"texts": [...]} and expects {"translations": [...]}: one string per text, in the same order. Leave it off for an endpoint that takes one text per request.', 'perflocale' ); ?></p>
+			</td>
+		</tr>
+		<tr>
+			<th scope="row">
+				<label for="perflocale-agency-max-chars"><?php echo esc_html__( 'Maximum characters per request', 'perflocale' ); ?></label>
+			</th>
+			<td>
+				<input type="number" id="perflocale-agency-max-chars" name="mt_agency_max_chars" value="<?php echo $agency_max > 0 ? absint( $agency_max ) : ''; ?>" class="small-text" min="<?php echo absint( ExternalAgencyProvider::MAX_CHARS_MIN ); ?>" max="<?php echo absint( ExternalAgencyProvider::MAX_CHARS_MAX ); ?>" step="1">
+				<p class="description">
+					<?php
+					printf(
+						/* translators: 1: smallest value, 2: largest value */
+						esc_html__( 'Optional, %1$s to %2$s. Long post content goes in parts of at most this many characters, and with batches on, one batch request holds at most this many. Empty: content goes whole in one text per request, and a batch holds up to 20,000 characters.', 'perflocale' ),
+						esc_html( number_format_i18n( ExternalAgencyProvider::MAX_CHARS_MIN ) ),
+						esc_html( number_format_i18n( ExternalAgencyProvider::MAX_CHARS_MAX ) )
+					);
+					?>
+				</p>
 			</td>
 		</tr>
 		<?php
@@ -2838,7 +3565,7 @@ final class SettingsPage {
 				</p>
 			</td>
 		</tr>
-		<tr class="perflocale-row-dropdown-only" data-perflocale-show-when-display="dropdown"<?php echo $switcher_display !== 'dropdown' ? ' style="display:none;"' : ''; ?>>
+		<tr class="perflocale-row-dropdown-only" data-perflocale-show-when-display="dropdown"<?php echo 'dropdown' !== $switcher_display ? ' hidden' : ''; ?>>
 			<th scope="row">
 				<label for="perflocale-arrow-style"><?php echo esc_html__( 'Dropdown Arrow', 'perflocale' ); ?></label>
 			</th>
@@ -2851,7 +3578,7 @@ final class SettingsPage {
 				<p class="description"><?php echo wp_kses( __( 'Icon shown next to the language label on the dropdown trigger. Themes can override the markup entirely via the <code>perflocale/switcher/arrow_html</code> filter.', 'perflocale' ), [ 'code' => [] ] ); ?></p>
 			</td>
 		</tr>
-		<tr class="perflocale-row-dropdown-only" data-perflocale-show-when-display="dropdown"<?php echo $switcher_display !== 'dropdown' ? ' style="display:none;"' : ''; ?>>
+		<tr class="perflocale-row-dropdown-only" data-perflocale-show-when-display="dropdown"<?php echo 'dropdown' !== $switcher_display ? ' hidden' : ''; ?>>
 			<th scope="row">
 				<label for="perflocale-trigger-format"><?php echo esc_html__( 'Trigger Label Format', 'perflocale' ); ?></label>
 			</th>
@@ -3179,6 +3906,7 @@ final class SettingsPage {
 			'site_translate'           => static fn() => new \PerfLocale\Background\Jobs\SiteTranslateJob(),
 			'wc_stock_check'           => static fn() => new \PerfLocale\WooCommerce\StockCheckJob(),
 			'wc_stock_align'           => static fn() => new \PerfLocale\WooCommerce\StockAlignJob(),
+			'content_resync'           => static fn() => new \PerfLocale\Background\Jobs\ContentResyncJob(),
 		];
 		?>
 		<tr>
@@ -3294,7 +4022,7 @@ final class SettingsPage {
 					<?php echo esc_html__( 'Publish /perflocale/v1/config endpoint and honour X-PerfLocale-Lang hints', 'perflocale' ); ?>
 				</label>
 				<p class="description" style="margin-top:6px;">
-					<?php echo esc_html__( 'Exposes a cache-friendly public REST endpoint that a Cloudflare Worker, Vercel Edge function, or Netlify Edge function can read to pre-route visitors to the correct language before the request reaches PHP. Also adds an Edge Hint Redirect method, which you switch on under URL &amp; Routing; with two or more redirect methods enabled you can set the order they run in.', 'perflocale' ); ?>
+					<?php echo esc_html__( 'Exposes a cache-friendly public REST endpoint that a Cloudflare Worker, Vercel Edge function, or Netlify Edge function can read to pre-route visitors to the correct language before the request reaches PHP. Also adds an Edge Hint Redirect method, which you switch on under URL &amp; Routing > Visitor Redirects; with two or more redirect methods enabled you can set the order they run in.', 'perflocale' ); ?>
 					<a href="https://perflocale.com/docs/edge-integration/#restricting-access" target="_blank" rel="noopener"><?php echo esc_html__( 'Restricting access to the endpoint', 'perflocale' ); ?> <span class="dashicons dashicons-external" style="font-size:11px;width:11px;height:11px;vertical-align:text-bottom;"></span></a>
 				</p>
 				<?php if ( $edge_enabled ) : ?>
@@ -3341,7 +4069,7 @@ final class SettingsPage {
 					<input type="checkbox" name="delete_data_on_uninstall" value="1" <?php checked( (bool) $this->settings->get( 'delete_data_on_uninstall' ) ); ?>>
 					<?php echo esc_html__( 'Delete all plugin data when uninstalling', 'perflocale' ); ?>
 				</label>
-				<p class="description"><?php echo wp_kses( __( 'When enabled, deleting the plugin will remove all translation data, languages, settings, and database tables. When disabled, your data is preserved for reinstallation. This is a one-shot teardown setting - toggle it before deleting the plugin from <em>Plugins → Installed Plugins</em>.', 'perflocale' ), [ 'em' => [] ] ); ?></p>
+				<p class="description"><?php echo wp_kses( __( 'When enabled, deleting the plugin removes all PerfLocale data from this site: languages, translation links, string translations, settings and every PerfLocale database table, including the versions of post text that Content ReSync stores (source versions, updates waiting for review, and the text an applied update replaced, kept for Undo). Translated posts and pages stay as ordinary content. When disabled, all of it stays in the database for a reinstall. The Translator role, PerfLocale\'s capabilities and its scheduled tasks are removed either way. Turn this on before you delete the plugin from <em>Plugins → Installed Plugins</em>.', 'perflocale' ), [ 'em' => [] ] ); ?> <?php echo esc_html__( 'On an object cache that cannot clear groups, PerfLocale\'s cached copies expire on their own within a day, or within the GeoIP cache time you set.', 'perflocale' ); ?></p>
 			</td>
 		</tr>
 		<?php
@@ -3419,6 +4147,7 @@ final class SettingsPage {
 			'site_translate'           => __( 'Site-wide MT translation (chunked)', 'perflocale' ),
 			'wc_stock_check'           => __( 'WooCommerce stock check', 'perflocale' ),
 			'wc_stock_align'           => __( 'WooCommerce stock alignment', 'perflocale' ),
+			'content_resync'           => __( 'Content ReSync (Update translations)', 'perflocale' ),
 		];
 	}
 
@@ -3437,11 +4166,12 @@ final class SettingsPage {
 			&& $settings instanceof \PerfLocale\Settings
 			&& (bool) $settings->get( 'wc_sync_stock', true );
 
-		// Aligning stock is off in this version (Api::align_off()).
-		unset( $types['wc_stock_align'] );
-
 		if ( ! $stock ) {
-			unset( $types['wc_stock_check'] );
+			unset( $types['wc_stock_check'], $types['wc_stock_align'] );
+		}
+
+		if ( ! \PerfLocale\Util\ResyncSwitch::on() ) {
+			unset( $types['content_resync'] );
 		}
 
 		return $types;
@@ -3592,6 +4322,59 @@ final class SettingsPage {
 	}
 
 	/**
+	 * The size of the automation history a Replace import deletes in its transaction, with a warning when that can be slow.
+	 *
+	 * @param int $rows  History rows.
+	 * @param int $bytes Their data size on the server, 0 when unknown (SQLite).
+	 * @return void
+	 */
+	public static function render_replace_history( int $rows, int $bytes ): void {
+		if ( $rows <= 0 ) {
+			return;
+		}
+
+		$size = $bytes > 0
+			/* translators: 1: number of rows, 2: data size, e.g. "120 MB". */
+			? sprintf( _n( '%1$s row, about %2$s', '%1$s rows, about %2$s', $rows, 'perflocale' ), number_format_i18n( $rows ), \PerfLocale\Admin\AdminController::format_bytes( $bytes ) )
+			/* translators: %s: number of rows. */
+			: sprintf( _n( '%s row', '%s rows', $rows, 'perflocale' ), number_format_i18n( $rows ) );
+		$slow = $rows >= self::REPLACE_SLOW_ROWS || $bytes >= self::REPLACE_SLOW_BYTES;
+
+		echo '<div class="' . ( $slow ? 'notice notice-warning inline' : 'perflocale-replace-history' ) . '" data-perflocale-replace-history><p class="description">';
+		/* translators: %s: the history's size, e.g. "250,000 rows, about 2 GB". "Automation Changes" is the export section's name. */
+		echo esc_html( sprintf( __( 'A Replace with a file that holds Automation Changes first deletes this site\'s automation history: %s.', 'perflocale' ), $size ) );
+
+		if ( $slow ) {
+			echo ' ' . esc_html__( 'That runs in one database transaction and can take minutes, longer than many servers allow one request; the import then rolls back and changes nothing. WP-CLI (wp perflocale import) has no such time limit.', 'perflocale' );
+		}
+
+		if ( $bytes >= self::REPLACE_HUGE_BYTES ) {
+			echo ' ' . esc_html__( 'Some database clusters refuse a transaction this large.', 'perflocale' );
+		}
+
+		echo '</p></div>';
+	}
+
+	/**
+	 * A table's data size from the server's table statistics (no scan); 0 on SQLite or when unknown.
+	 *
+	 * @param string $table_name Table name without prefix.
+	 * @return int Bytes.
+	 */
+	private static function table_data_bytes( string $table_name ): int {
+		if ( defined( 'DB_ENGINE' ) && 'sqlite' === DB_ENGINE ) {
+			return 0;
+		}
+
+		$wpdb = \PerfLocale\Admin\Typed::wpdb();
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$bytes = $wpdb->get_var( $wpdb->prepare( 'SELECT DATA_LENGTH FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s', \PerfLocale\Database\Schema::table( $table_name ) ) );
+
+		return is_numeric( $bytes ) ? max( 0, (int) $bytes ) : 0;
+	}
+
+	/**
 	 * Render the Export & Import tab.
 	 *
 	 * @return void
@@ -3624,7 +4407,10 @@ final class SettingsPage {
 		);
 
 		// Warn when a full export exceeds the import ceiling; two queries per table, on this tab only.
-		$export_estimate = ( new \PerfLocale\Admin\DataExporter() )->estimate_bytes();
+		$exporter        = new \PerfLocale\Admin\DataExporter();
+		$export_estimate = $exporter->estimate_bytes();
+		$history_rows    = $exporter->counted_rows( 'pending_changes' );
+		$history_bytes   = $history_rows > 0 ? self::table_data_bytes( 'pending_changes' ) : 0;
 
 		?>
 
@@ -3743,6 +4529,7 @@ final class SettingsPage {
 							<input type="radio" name="perflocale_import_mode" value="replace">
 							<strong><?php echo esc_html__( 'Replace', 'perflocale' ); ?></strong> - <?php echo esc_html__( 'clear this site\'s rows for the sections in the file, then load the file', 'perflocale' ); ?>
 						</label>
+						<?php self::render_replace_history( $history_rows, $history_bytes ); ?>
 					</fieldset>
 
 					<p class="description" style="margin-top:0;">

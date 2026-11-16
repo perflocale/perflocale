@@ -12,6 +12,7 @@ namespace PerfLocale\MachineTranslation\Provider;
 use PerfLocale\MachineTranslation\AbstractProvider;
 use PerfLocale\MachineTranslation\CallDeadline;
 use PerfLocale\MachineTranslation\DeadlineReachedException;
+use PerfLocale\MachineTranslation\ContextAwareProviderInterface;
 
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
@@ -23,7 +24,17 @@ if ( ! defined( 'ABSPATH' ) ) {
  * Without wp_ai_client_prompt() (WP 6.x), or when wp_supports_ai() is false, is_configured() is false and the
  * provider is not offered; `perflocale/mt/wp_ai_client_resolver` installs a custom resolver.
  */
-final class WpAiClientProvider extends AbstractProvider {
+final class WpAiClientProvider extends AbstractProvider implements ContextAwareProviderInterface {
+
+	/**
+	 * Characters of the current translate call's send (text and context).
+	 */
+	private int $call_chars = 0;
+
+	/**
+	 * Client calls of the current translate call so far.
+	 */
+	private int $tries = 0;
 
 	/**
 	 * Default model preference for core: small models of OpenAI, Anthropic and Google; the first one offered wins.
@@ -52,6 +63,13 @@ final class WpAiClientProvider extends AbstractProvider {
 	 * Exception code of this class's own fixed messages, which are shown as they are (upstream text never is).
 	 */
 	private const OWN_MESSAGE = -1;
+
+	/**
+	 * Timeout of the last client call after the deadline clamp, named when it timed out.
+	 *
+	 * @var float
+	 */
+	private static float $last_timeout = 0.0;
 
 	/**
 	 * Routes (route_key()) whose model refused the temperature in this request.
@@ -149,6 +167,74 @@ final class WpAiClientProvider extends AbstractProvider {
 	}
 
 	/**
+	 * Characters per piece of long content for the AI provider core will use: the largest size whose answers came back
+	 * within 7 s at p90 on the real models (OpenAI 2,500; Anthropic and any other 1,000). No request is made.
+	 *
+	 * @since 1.0.8
+	 * @return int
+	 */
+	public function default_piece_chars(): int {
+		return 'openai' === $this->text_provider() ? 2500 : 1000;
+	}
+
+	/**
+	 * The AI provider core routes a call to: the `provider` arg, else the first model preference whose provider is
+	 * registered with a key (env var, constant or Connectors setting); '' when unknown (a custom resolver).
+	 *
+	 * @return string
+	 */
+	private function text_provider(): string {
+		if ( null !== $this->custom_resolver() ) {
+			return '';
+		}
+
+		$args = $this->client_args( false );
+
+		if ( is_string( $args['provider'] ?? null ) && '' !== trim( $args['provider'] ) ) {
+			return strtolower( trim( $args['provider'] ) );
+		}
+
+		$keyed = [];
+
+		foreach ( self::connector_keys() as $id => $keys ) {
+			if ( [] !== array_filter( $keys, static fn( $key ): bool => is_string( $key ) && '' !== trim( $key ) ) ) {
+				$keyed[ strtolower( (string) $id ) ] = true;
+			}
+		}
+
+		foreach ( is_array( $args['model'] ?? null ) ? $args['model'] : [] as $entry ) {
+			$id = match ( true ) {
+				is_array( $entry ) && is_string( $entry[0] ?? null ) => strtolower( $entry[0] ),
+				is_string( $entry ) => self::provider_of_model( $entry ),
+				default => '',
+			};
+
+			if ( isset( $keyed[ $id ] ) ) {
+				return $id;
+			}
+		}
+
+		return '';
+	}
+
+	/**
+	 * The provider id of a model id by its family name; '' when unknown.
+	 *
+	 * @param string $model Model id.
+	 * @return string
+	 */
+	private static function provider_of_model( string $model ): string {
+		$model = strtolower( $model );
+
+		return match ( true ) {
+			str_starts_with( $model, 'gpt-' ) || 1 === preg_match( '/^o\d/', $model ) => 'openai',
+			str_starts_with( $model, 'claude-' ) => 'anthropic',
+			str_starts_with( $model, 'gemini-' ) => 'google',
+			default => '',
+		};
+	}
+
+	/**
 	 * Fingerprint of what decides readiness: the registered providers, each one's API key wherever core reads it
 	 * (`<ID>_API_KEY` env var or constant, option `connectors_ai_<id>_api_key`; hashed), and the `provider` arg.
 	 *
@@ -202,7 +288,76 @@ final class WpAiClientProvider extends AbstractProvider {
 	 * @throws DeadlineReachedException When the call does not fit before a background slice's deadline.
 	 */
 	public function translate( string $text, string $source_lang, string $target_lang, bool $fast_fail = false, string $format = 'html' ): string {
+		return $this->translate_one( $text, $source_lang, $target_lang, $fast_fail, $format, '' );
+	}
+
+	/**
+	 * Translate texts, each with its context: one prompt per text, as translate_batch() sends them; the context goes
+	 * into the prompt as reference material (build_prompt()).
+	 *
+	 * @since 1.0.8
+	 *
+	 * @param array<int, string> $texts       Texts to translate.
+	 * @param array<int, string> $contexts    Context per text, parallel to `$texts`; '' for none.
+	 * @param string             $source_lang Source language code.
+	 * @param string             $target_lang Target language code.
+	 * @param bool               $fast_fail   Cap retries and timeout.
+	 * @param string             $format      'html' or 'text'.
+	 * @return array<int, string> Translated texts, in the order of `$texts`.
+	 *
+	 * @throws \RuntimeException When the AI Client API is unavailable or the underlying client call fails.
+	 */
+	public function translate_batch_with_context( array $texts, array $contexts, string $source_lang, string $target_lang, bool $fast_fail = false, string $format = 'html' ): array {
+		$contexts = array_values( $contexts );
+		$results  = [];
+
+		foreach ( array_values( $texts ) as $i => $text ) {
+			$context   = $contexts[ $i ] ?? '';
+			$results[] = $this->translate_one( (string) $text, $source_lang, $target_lang, $fast_fail, $format, $context );
+		}
+
+		return $results;
+	}
+
+	/**
+	 * Whether the context is billed: it is part of the prompt, which the AI provider bills.
+	 *
+	 * @since 1.0.8
+	 *
+	 * @return bool
+	 */
+	public function context_billed(): bool {
+		return true;
+	}
+
+	/**
+	 * Translate one text, with its context when there is one. A reply holding the context's boundary token repeats the
+	 * context: it comes back '' for the caller's quality check to reject. A `text_before_send` or `result` filter that
+	 * answers with no string fails the text.
+	 *
+	 * @param string $text        Text to translate.
+	 * @param string $source_lang Source language slug.
+	 * @param string $target_lang Target language slug.
+	 * @param bool   $fast_fail   Cap the timeout.
+	 * @param string $format      'html' or 'text'.
+	 * @param string $context     Context, '' for none.
+	 * @return string
+	 *
+	 * @throws \RuntimeException When the AI Client API is unavailable or the underlying client call fails.
+	 */
+	private function translate_one( string $text, string $source_lang, string $target_lang, bool $fast_fail, string $format, string $context ): string {
 		$text = apply_filters( 'perflocale/machine_translation/text_before_send', $text, $this->get_id(), $target_lang );
+
+		if ( ! is_string( $text ) ) {
+			throw new \RuntimeException( esc_html__( 'A filter on the text before it is sent returned no text; nothing was sent.', 'perflocale' ) );
+		}
+
+		if ( '' !== $context ) {
+			/** This filter is documented in DeepLProvider::translate(). */
+			$context = \PerfLocale\Util\Scalar::str( apply_filters( 'perflocale/machine_translation/text_before_send', $context, $this->get_id(), $target_lang ) );
+		}
+
+		$this->guard_send( \PerfLocale\Util\Utf8::length( $text ) + \PerfLocale\Util\Utf8::length( $context ) );
 
 		$client = $this->resolve_client_callback();
 
@@ -231,9 +386,15 @@ final class WpAiClientProvider extends AbstractProvider {
 			);
 		}
 
-		$prompt = $this->build_prompt( $text, $source_lang, $target_lang, $format );
-		$args   = $this->client_args( $fast_fail );
-		$route  = self::route_key( $args );
+		// The send guard_send() admitted, for each client call below.
+		$this->call_chars = $this->sending;
+		$this->sending    = 0;
+		$this->tries      = 0;
+
+		$boundary = '' === $context ? '' : self::boundary();
+		$prompt   = $this->build_prompt( $text, $source_lang, $target_lang, $format, $context, $boundary );
+		$args     = $this->client_args( $fast_fail );
+		$route    = self::route_key( $args );
 
 		// This route's model refused the temperature in this request: send none straight away.
 		if ( isset( self::$temperature_rejected[ $route ] ) ) {
@@ -241,25 +402,25 @@ final class WpAiClientProvider extends AbstractProvider {
 		}
 
 		try {
-			$result = self::call_client( $client, $prompt, $args );
+			$result = $this->paced_call( $client, $prompt, $args, $breaker_key, $fast_fail );
 		} catch ( DeadlineReachedException $e ) {
 			throw $e;
 		} catch ( \Throwable $e ) {
 			// A model refusing the temperature (HTTP 400, not billed), or core finding no model with it, is no provider
 			// fault: retry once without it; only the retry's outcome counts on the breaker.
 			if ( ! isset( $args['temperature'] ) || ! ( self::is_temperature_rejection( $e ) || self::is_no_model_error( $e ) ) ) {
-				$this->fail( $e, $breaker_key );
+				$this->fail( $e, $breaker_key, self::$last_timeout );
 			}
 
 			self::$temperature_rejected[ $route ] = true;
 			unset( $args['temperature'] );
 
 			try {
-				$result = self::call_client( $client, $prompt, $args );
+				$result = $this->paced_call( $client, $prompt, $args, $breaker_key, $fast_fail );
 			} catch ( DeadlineReachedException $retry_error ) {
 				throw $retry_error;
 			} catch ( \Throwable $retry_error ) {
-				$this->fail( $retry_error, $breaker_key );
+				$this->fail( $retry_error, $breaker_key, self::$last_timeout );
 			}
 		}
 
@@ -274,9 +435,32 @@ final class WpAiClientProvider extends AbstractProvider {
 
 		\PerfLocale\Concurrency\Breaker::record_success( $breaker_key );
 
-		$this->track_usage( $text );
+		if ( '' === $context ) {
+			$this->track_usage( $text );
+		} else {
+			$this->track_usage_chars( \PerfLocale\Util\Utf8::length( $text ) + \PerfLocale\Util\Utf8::length( $context ) );
 
-		return apply_filters( 'perflocale/machine_translation/result', $translated, $text, $this->get_id() );
+			if ( str_contains( $translated, $boundary ) ) {
+				return '';
+			}
+		}
+
+		$result = apply_filters( 'perflocale/machine_translation/result', $translated, $text, $this->get_id() );
+
+		if ( ! is_string( $result ) ) {
+			throw new \RuntimeException( esc_html__( 'A filter on the translation returned no text.', 'perflocale' ) );
+		}
+
+		return $result;
+	}
+
+	/**
+	 * A random token that marks where the context of a prompt starts and ends.
+	 *
+	 * @return string
+	 */
+	private static function boundary(): string {
+		return 'PFLCTX' . strtoupper( bin2hex( random_bytes( 8 ) ) );
 	}
 
 	/**
@@ -284,11 +468,12 @@ final class WpAiClientProvider extends AbstractProvider {
 	 *
 	 * @param \Throwable $e           What the client threw.
 	 * @param string     $breaker_key Breaker key for this provider.
+	 * @param float      $timeout     The call's timeout in seconds, named when it timed out.
 	 * @return never
 	 *
-	 * @throws \RuntimeException Always.
+	 * @throws \RuntimeException Always; its code is the HTTP status when known (504: timed out, 401: refused key).
 	 */
-	private function fail( \Throwable $e, string $breaker_key ): never {
+	private function fail( \Throwable $e, string $breaker_key, float $timeout = 0.0 ): never {
 		// Recorded before the throw, so the next caller meets the open breaker; an auth error opens it on the first
 		// hit, as no retry fixes a bad key.
 		$reason             = self::classify_error( $e );
@@ -307,6 +492,9 @@ final class WpAiClientProvider extends AbstractProvider {
 			$safe_message = __( 'No AI provider is connected. Connect one under Settings → Connectors.', 'perflocale' );
 		} elseif ( self::OWN_MESSAGE === $e->getCode() && __FILE__ === $e->getFile() ) {
 			$safe_message = $e->getMessage();
+		} elseif ( $timeout > 0 && self::timed_out( $e ) ) {
+			$this->log_error( 'timeout', $reason );
+			$safe_message = self::timeout_error( $timeout );
 		} else {
 			$code = $e->getCode();
 			$this->log_error( is_int( $code ) && $code >= 400 && $code < 600 ? 'error HTTP ' . $code : 'error', $reason );
@@ -321,8 +509,111 @@ final class WpAiClientProvider extends AbstractProvider {
 					$reason,
 					$safe_message
 				)
-			)
+			),
+			self::status_of( $e, $reason, $timeout ) // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- An int.
 		);
+	}
+
+	/**
+	 * The HTTP status a failed call stands for: 504 when it timed out, 401 for a refused key, else core's status (0: none).
+	 *
+	 * @param \Throwable $e       What the client threw.
+	 * @param string     $reason  classify_error() category.
+	 * @param float      $timeout The call's timeout.
+	 * @return int
+	 */
+	private static function status_of( \Throwable $e, string $reason, float $timeout ): int {
+		$code = $e->getCode();
+
+		return match ( true ) {
+			$timeout > 0 && self::timed_out( $e ) => 504,
+			is_int( $code ) && $code >= 400 && $code < 600 && 503 !== $code => $code,
+			'auth' === $reason => 401,
+			is_int( $code ) && 503 === $code => 503,
+			default => 0,
+		};
+	}
+
+	/**
+	 * Whether a failed call timed out (cURL error 28 in core's network error).
+	 *
+	 * @param \Throwable $e What the client threw.
+	 * @return bool
+	 */
+	private static function timed_out( \Throwable $e ): bool {
+		return 1 === preg_match( '/cURL error 28\b|timed out/i', html_entity_decode( $e->getMessage(), ENT_QUOTES | ENT_HTML5, 'UTF-8' ) );
+	}
+
+	/**
+	 * call_client() honouring a provider's Retry-After on a 429 or 503 (read from core's HTTP response): one retry after
+	 * a wait slept when it fits, else a paced stop; neither is a failure or a breaker record.
+	 *
+	 * @param callable             $client      Resolver closure.
+	 * @param string               $prompt      Prompt.
+	 * @param array<string, mixed> $args        Client args.
+	 * @param string               $breaker_key Breaker key.
+	 * @param bool                 $fast_fail   No retry.
+	 * @return mixed
+	 * @throws DeadlineReachedException Paced, or when the call does not fit.
+	 * @throws \Throwable What the client threw otherwise.
+	 */
+	private function paced_call( callable $client, string $prompt, array $args, string $breaker_key, bool $fast_fail ): mixed {
+		$wait = null;
+
+		try {
+			return $this->invoke( $client, $prompt, $args, $wait );
+		} catch ( DeadlineReachedException $e ) {
+			throw $e;
+		} catch ( \Throwable $e ) {
+			if ( null === $wait ) {
+				throw $e;
+			}
+		}
+
+		$asked = $wait;
+		$wait  = min( $wait, self::retry_after_max() );
+
+		if ( CallDeadline::pause( $wait, ! $fast_fail ) ) {
+			$again = null;
+
+			try {
+				return $this->invoke( $client, $prompt, $args, $again );
+			} catch ( DeadlineReachedException $e ) {
+				throw $e;
+			} catch ( \Throwable $e ) {
+				if ( null === $again ) {
+					throw $e;
+				}
+
+				$asked = $again;
+				$wait  = min( $again, self::retry_after_max() );
+			}
+		}
+
+		\PerfLocale\Concurrency\Breaker::record_paced( $breaker_key );
+
+		throw new DeadlineReachedException( time() + $wait, true, '', $asked ); // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- Ints; the message is escaped in the class.
+	}
+
+	/**
+	 * One client call: a retry is reserved again (or not sent), and every invoked call counts as used whatever its
+	 * outcome (a success's own count clears it).
+	 *
+	 * @param callable             $client Client callback.
+	 * @param string               $prompt Prompt.
+	 * @param array<string, mixed> $args   Client arguments.
+	 * @param int|null             $paced  Set to the provider's wait for a paced 429/503.
+	 * @return mixed
+	 */
+	private function invoke( callable $client, string $prompt, array $args, ?int &$paced ): mixed {
+		if ( $this->tries++ > 0 && $this->call_chars > 0 ) {
+			self::reserve_send( $this->call_chars );
+		}
+
+		// Counted before the call: a resolver may bill upstream and still throw any error.
+		self::bill_attempt( $this->call_chars );
+
+		return self::call_client( $client, $prompt, $args, $paced );
 	}
 
 	/**
@@ -346,23 +637,40 @@ final class WpAiClientProvider extends AbstractProvider {
 	}
 
 	/**
-	 * Call the client with its timeout cut to a slice's deadline ({@see CallDeadline}); a call that failed after
-	 * using up a short window stops the slice instead of counting as a provider failure.
+	 * Call the client with its timeout cut to the room ({@see CallDeadline}); a call that failed after using up a short
+	 * window stops the slice, and one cut by an interactive request's clamp hands the post off, instead of counting as a
+	 * provider failure. $paced is set to the usable Retry-After seconds of the last 429 or 503 core received in the call.
 	 *
 	 * @param callable             $client Resolver closure.
 	 * @param string               $prompt Prompt.
 	 * @param array<string, mixed> $args   Client args, after the wp_ai_client_args filter.
+	 * @param int|null             $paced  Set to the Retry-After seconds (at least 1), else null.
 	 * @return mixed
 	 * @throws DeadlineReachedException When the call does not fit or the deadline cut it.
 	 * @throws \Throwable What the client threw otherwise.
 	 */
-	private static function call_client( callable $client, string $prompt, array $args ): mixed {
+	private static function call_client( callable $client, string $prompt, array $args, ?int &$paced = null ): mixed {
 		$requested = is_numeric( $args['timeout'] ?? null ) && (float) $args['timeout'] > 0 ? (float) $args['timeout'] : 60.0;
 		$timeout   = CallDeadline::timeout( $requested );
+		$paced     = null;
+
+		self::$last_timeout = $timeout;
 
 		if ( $timeout < $requested ) {
 			$args['timeout'] = $timeout;
 		}
+
+		// Core's client hides the response headers in its exception: the last 429 or 503 response of this call is read here.
+		$listen = static function ( $response ) use ( &$paced ): void {
+			if ( ! is_array( $response ) || ! in_array( (int) wp_remote_retrieve_response_code( $response ), [ 429, 503 ], true ) ) {
+				return;
+			}
+
+			$seconds = self::retry_after( wp_remote_retrieve_header( $response, 'retry-after' ), wp_remote_retrieve_header( $response, 'date' ) );
+			$paced   = null !== $seconds && $seconds >= 1 ? $seconds : null;
+		};
+
+		add_action( 'http_api_debug', $listen, 10, 1 );
 
 		try {
 			return $client( $prompt, $args );
@@ -373,7 +681,13 @@ final class WpAiClientProvider extends AbstractProvider {
 				throw new DeadlineReachedException();
 			}
 
+			if ( null === $paced && $timeout < $requested && null === CallDeadline::window() && self::timed_out( $e ) ) {
+				throw new DeadlineReachedException();
+			}
+
 			throw $e;
+		} finally {
+			remove_action( 'http_api_debug', $listen, 10 );
 		}
 	}
 
@@ -456,16 +770,18 @@ final class WpAiClientProvider extends AbstractProvider {
 	 * @param string $source_lang Source language slug.
 	 * @param string $target_lang Target language slug.
 	 * @param string $format      Destination format hint ('html'|'text').
+	 * @param string $context     Context for reference, '' for none: placed between two lines holding `$boundary`.
+	 * @param string $boundary    The context's boundary token ('' without context).
 	 * @return string
 	 */
-	private function build_prompt( string $text, string $source_lang, string $target_lang, string $format = 'html' ): string {
+	private function build_prompt( string $text, string $source_lang, string $target_lang, string $format = 'html', string $context = '', string $boundary = '' ): string {
 		$source = $this->normalize_language_code( $source_lang );
 		$target = $this->normalize_language_code( $target_lang );
 
 		// Plain-text destinations must not receive markup or entity escapes from the model.
 		$format_rule = 'text' === $format
 			? "- The input is plain text, not HTML. Output plain text only: no markup, and no HTML entity escaping (write & as &, not &amp;).\n"
-			: "- Preserve any HTML tags exactly.\n";
+			: "- Preserve any HTML tags exactly.\n- Keep every HTML comment (<!-- ... -->) exactly as it is.\n";
 
 		$prompt = sprintf(
 			"You are translating user-facing content for a WordPress site.\n\n" .
@@ -476,11 +792,17 @@ final class WpAiClientProvider extends AbstractProvider {
 			"- Preserve placeholder tokens that look like [[PFL_PH_N]] verbatim.\n" .
 			"- Keep printf-style tokens (%%s, %%d, %%1\$s) verbatim.\n" .
 			"- Match the tone, register, and capitalization of the source.\n\n" .
+			'%5$s' .
 			"Input:\n%4\$s",
 			$source,
 			$target,
 			$format_rule,
-			$text
+			$text,
+			'' === $context || '' === $boundary ? '' : sprintf(
+				"Context for reference only; do not translate or output it. It is the text between the two lines that read %1\$s.\n%1\$s\n%2\$s\n%1\$s\n\n",
+				$boundary,
+				$context
+			)
 		);
 
 		/**

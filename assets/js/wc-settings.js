@@ -59,8 +59,11 @@
 			currencyToggle && currencyToggle.checked
 		);
 
+		// A row ticked Manual stays editable: its rate is never synced.
 		document.querySelectorAll( '.perflocale-rate-input' ).forEach( function ( input ) {
-			input.readOnly = !! readonly;
+			var cell   = input.closest( 'td' );
+			var manual = cell ? cell.querySelector( 'input[name$="[manual_rate]"]' ) : null;
+			input.readOnly = !! readonly && ! ( manual && manual.checked );
 		} );
 	}
 
@@ -123,7 +126,7 @@
 							var rate = resp.data.rates[ code ];
 							if ( typeof rate !== 'number' || ! isFinite( rate ) || rate <= 0 ) { return; }
 
-							input.value = rate.toFixed( 6 );
+							input.value = String( rate );
 						} );
 					}
 				} )
@@ -238,6 +241,9 @@
 		var currencyToggle = document.getElementById( 'perflocale-wc-currency-toggle' );
 		if ( autoSyncToggle ) autoSyncToggle.addEventListener( 'change', applyRateReadonly );
 		if ( currencyToggle ) currencyToggle.addEventListener( 'change', applyRateReadonly );
+		document.querySelectorAll( 'input[name$="[manual_rate]"]' ).forEach( function ( box ) {
+			box.addEventListener( 'change', applyRateReadonly );
+		} );
 
 		bindSyncNow();
 		bindCreatePages();

@@ -30,7 +30,7 @@ final class LanguageRouter {
 	 *
 	 * @var array<string, true>
 	 */
-	private const STATIC_EXTENSIONS = [
+	public const STATIC_EXTENSIONS = [
 		'ico'         => true,
 		'png'         => true,
 		'jpg'         => true,
@@ -91,7 +91,7 @@ final class LanguageRouter {
 	 * The current request rebuilt as an absolute URL on this site.
 	 *
 	 * Strips the home path off REQUEST_URI because home_url() adds it back. The path comes from the raw `home`
-	 * option: home_url() may carry the default prefix, and HTTP_HOST would make allow_redirect_host() an open
+	 * option: home_url() may carry the default prefix, and HTTP_HOST would make a redirect target an open
 	 * redirect. See docs-ai/11-code-rationale.md, "LanguageRouter: current request URL".
 	 *
 	 * @return string Absolute URL of the current request.
@@ -138,6 +138,13 @@ final class LanguageRouter {
 	 * @var bool
 	 */
 	private static bool $detection_finalized = false;
+
+	/**
+	 * How detect_language() chose the language: url, default, cookie, browser or edge_hint.
+	 *
+	 * @var string
+	 */
+	private static string $detection = '';
 
 	/**
 	 * Prefix → slug lookup cached inside detect_from_path().
@@ -220,9 +227,11 @@ final class LanguageRouter {
 			add_action( 'template_redirect', [ $this, 'maybe_redirect_edge_hint' ], $priority );
 		}
 
-		// Strip the `perflocale_redirected` sentinel with a 301. Priority 1: before the browser and geo
-		// redirects, so they never re-fire on the cleaned URL.
-		add_action( 'template_redirect', [ $this, 'clean_redirect_sentinel' ], 1 );
+		// A redirect-marker landing serves as is (optional cleanup hop, clean pagination links: cold MarkerHop).
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
+		if ( ! empty( $_GET['perflocale_redirected'] ) || ! empty( $_GET['perflocale_fb'] ) ) {
+			add_action( 'template_redirect', [ MarkerHop::class, 'run' ], 1 );
+		}
 
 		// Default prefix shown: 301 the bare `/` to `/{default_slug}/` (one canonical home).
 		if (
@@ -355,45 +364,7 @@ final class LanguageRouter {
 		$home_base = rtrim( (string) get_option( 'home' ), '/' );
 		$target    = $home_base . '/' . $correct . $rest . $query;
 
-		wp_safe_redirect( $target, 301 );
-		exit;
-	}
-
-	/**
-	 * Remove the `perflocale_redirected` sentinel with a 301 after a language redirect.
-	 *
-	 * Only once the language cookie is set: with cookies blocked the sentinel stays, as the loop fuse.
-	 *
-	 * @return void
-	 */
-	public function clean_redirect_sentinel(): void {
-		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
-		if ( empty( $_GET['perflocale_redirected'] ) ) {
-			return;
-		}
-
-		if ( is_admin() || wp_doing_ajax() || wp_doing_cron() ) {
-			return;
-		}
-
-		if ( defined( 'REST_REQUEST' ) || defined( 'XMLRPC_REQUEST' ) || defined( 'WP_CLI' ) ) {
-			return;
-		}
-
-		// Only strip when a cookie is present. Without this, a user whose
-		// browser drops cookies would bounce between clean/sentinel URLs.
-		if ( empty( $_COOKIE['perflocale_lang'] ) ) {
-			return;
-		}
-
-		$clean = remove_query_arg( 'perflocale_redirected' );
-
-		if ( $clean === '' ) {
-			return;
-		}
-
-		wp_safe_redirect( $clean, 301 );
-		exit;
+		Redirect\Sender::to( $target, 301, 'prefix_form' );
 	}
 
 	/**
@@ -522,8 +493,7 @@ final class LanguageRouter {
 
 		$target = $home_base . '/' . $prefix . $relative . $query;
 
-		wp_safe_redirect( $target, 301 );
-		exit;
+		Redirect\Sender::to( $target, 301, 'default_to_prefix' );
 	}
 
 	/**
@@ -613,8 +583,7 @@ final class LanguageRouter {
 		$home_base = rtrim( (string) get_option( 'home' ), '/' );
 		$target    = ( $home_base === '' ? '' : $home_base ) . '/' . $query;
 
-		wp_safe_redirect( $target, 301 );
-		exit;
+		Redirect\Sender::to( $target, 301, 'prefix_to_default' );
 	}
 
 	/**
@@ -665,6 +634,7 @@ final class LanguageRouter {
 		// If language was already resolved by detect_locale_early(),
 		// just set the cookie and fire the action.
 		if ( $already_detected ) {
+			self::$detection = $detection_method;
 			$this->set_language_cookie( self::$current_language->slug );
 
 			/** @hook perflocale/language/detected Fires after the current language is detected. */
@@ -722,15 +692,16 @@ final class LanguageRouter {
 
 		if ( $detected_slug !== null && isset( $slug_map[ $detected_slug ] ) ) {
 			self::$current_language = $slug_map[ $detected_slug ];
+			self::$detection        = $detection_method;
 
-				// A visitor-specific source (cookie, Accept-Language, edge hint) varies the body at a shared
-				// URL, so a URL-keyed page cache must not store it. URL-detected requests stay cacheable.
+			// A visitor-specific source (cookie, Accept-Language, edge hint) varies the body at a shared URL, so a
+			// URL-keyed page cache must not store it. URL-detected requests stay cacheable.
 			if (
 				in_array( $detection_method, [ 'cookie', 'browser', 'edge_hint' ], true )
 				&& ! is_admin()
 				&& ! headers_sent()
 			) {
-				nocache_headers();
+				Redirect\CacheHeaders::require_no_store();
 			}
 
 			$this->set_language_cookie( $detected_slug );
@@ -745,7 +716,7 @@ final class LanguageRouter {
 	 *
 	 * Same site-relative path and Helper::path_matches_excluded() as routing, the canonical redirect and
 	 * the CDN tags; the edge worker (assets/js/edge-helper.js) keeps its own prefix match. URL-derived,
-	 * so callers may bail on it before nocache_headers() and keep excluded pages cacheable.
+	 * so callers may bail on it before the no-store point and keep excluded pages cacheable.
 	 *
 	 * @return bool
 	 */
@@ -786,7 +757,7 @@ final class LanguageRouter {
 	 *
 	 * True in cookieless mode while nothing hooks `perflocale/language_cookie/enabled` (set_language_cookie()'s
 	 * test). The first-visit redirects then stay off: without the cookie they would redirect the same visitor
-	 * on every default-language page. Config-derived, so callers ask it above nocache_headers().
+	 * on every default-language page. Config-derived, so callers ask it above the no-store point.
 	 *
 	 * @return bool
 	 */
@@ -821,7 +792,7 @@ final class LanguageRouter {
 		}
 
 		// Never hijack feeds, robots.txt, favicon or trackbacks: cookieless feed pollers would flip a feed's
-		// language. URL-derived, so it stays above nocache_headers() to keep them cacheable.
+		// language. URL-derived, so it stays above the no-store point to keep them cacheable.
 		if ( is_feed() || is_trackback() || is_robots() || is_favicon() ) {
 			return;
 		}
@@ -831,20 +802,21 @@ final class LanguageRouter {
 		}
 
 		// No redirect when the cookie can never be written: it would repeat on every default-language page.
-		// Config-derived, so it stays above nocache_headers().
+		// Config-derived, so it stays above the no-store point.
 		if ( $this->language_cookie_never_written() ) {
 			return;
 		}
 
-		// Excluded paths are not redirected either. URL-derived, so it stays above nocache_headers().
+		// Excluded paths are not redirected either. URL-derived, so it stays above the no-store point.
 		if ( $this->is_excluded_request_path() ) {
 			return;
 		}
 
-		// From here the 302-or-200 depends on the visitor, so the entry response must be uncacheable or a
-		// cached 200 starves the redirect for later visitors. Only URL-derived checks above (as GeoRedirect).
-		if ( $this->is_default_language() && ! headers_sent() ) {
-			nocache_headers();
+		// First-time, non-bot visitor on a default-language page, no earlier verdict; that answer is made no-store.
+		require_once __DIR__ . '/Redirect/FirstVisit.php';
+
+		if ( ! Redirect\FirstVisit::steerable( $this ) ) {
+			return;
 		}
 
 		/**
@@ -857,11 +829,6 @@ final class LanguageRouter {
 			return;
 		}
 
-		// Only first-time visitors (no cookie yet).
-		if ( isset( $_COOKIE['perflocale_lang'] ) ) {
-			return;
-		}
-
 		// Redirect fuse: `?perflocale_redirected=1` stops a second redirect when the browser drops the
 		// cookie (privacy browsers), so it cannot loop.
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
@@ -869,23 +836,15 @@ final class LanguageRouter {
 			return;
 		}
 
-		// Only when URL resolved to the default language.
-		if ( ! $this->is_default_language() ) {
-			return;
-		}
-
-		// Bots see the default content (self::is_bot_ua()).
-		$ua = sanitize_text_field( wp_unslash( $_SERVER['HTTP_USER_AGENT'] ?? '' ) );
-
-		if ( self::is_bot_ua( $ua ) ) {
-			return;
-		}
-
-		// Check what the browser prefers.
+		// Check what the browser prefers; a matched tag is this request's verdict, no match leaves it to the next rule.
 		$slug_map     = $this->get_language_slug_map();
 		$browser_slug = $this->detect_from_browser( $slug_map );
 
 		$default_slug = self::$default_language ? self::$default_language->slug : '';
+
+		if ( $browser_slug !== null ) {
+			Redirect\FirstVisit::decide();
+		}
 
 		if ( $browser_slug === null || $browser_slug === $default_slug ) {
 			// Browser prefers the default language or no match - set cookie and stay.
@@ -908,7 +867,7 @@ final class LanguageRouter {
 		// Home-path-aware: a bare home_url( add_query_arg( [] ) ) doubles the
 		// prefix of a subfolder install. See current_request_url().
 		$current_url  = self::current_request_url();
-		$redirect_url = $converter->convert( $current_url, $browser_slug );
+		$redirect_url = $converter->convert( Redirect\FirstVisit::unpaged( $current_url ), $browser_slug );
 
 		if ( $redirect_url === '' || $redirect_url === $current_url ) {
 			return;
@@ -920,18 +879,11 @@ final class LanguageRouter {
 			return;
 		}
 
-		// Set cookie before redirect so the visitor is not redirected again.
-		$this->set_language_cookie( $browser_slug );
-
-		// Sentinel so a cookie-blocked browser is not redirected again on its next request.
+		// Sentinel so a cookie-blocked browser is not redirected again on its next request. The sender sets the
+		// cookie after a successful send.
 		$redirect_url = add_query_arg( 'perflocale_redirected', '1', $redirect_url );
 
-		// Per-visitor redirect on a shared URL: uncacheable, so a cache that stores 3xx cannot pin it on
-		// others. Allow the (possibly cross-host) target, or wp_safe_redirect() falls back to /wp-admin/.
-		$this->allow_redirect_host( $redirect_url );
-		nocache_headers();
-		wp_safe_redirect( $redirect_url, 302 );
-		exit;
+		Redirect\Sender::to( $redirect_url, 302, 'browser', [ 'cookie' => $browser_slug ] );
 	}
 
 	/**
@@ -983,13 +935,15 @@ final class LanguageRouter {
 			return;
 		}
 
-		// Same consent gate as maybe_redirect_browser().
-		if ( ! (bool) apply_filters( 'perflocale/privacy/consent_given', true ) ) {
+		// Same gate as maybe_redirect_browser(), so the steerable entry answer is no-store here too.
+		require_once __DIR__ . '/Redirect/FirstVisit.php';
+
+		if ( ! Redirect\FirstVisit::steerable( $this ) ) {
 			return;
 		}
 
-		// Only first-time visitors.
-		if ( isset( $_COOKIE['perflocale_lang'] ) ) {
+		// Same consent gate as maybe_redirect_browser().
+		if ( ! (bool) apply_filters( 'perflocale/privacy/consent_given', true ) ) {
 			return;
 		}
 
@@ -999,23 +953,15 @@ final class LanguageRouter {
 			return;
 		}
 
-		// Only when URL resolved to default language.
-		if ( ! $this->is_default_language() ) {
-			return;
-		}
-
-		// Bots see the default content (self::is_bot_ua()).
-		$ua = sanitize_text_field( wp_unslash( $_SERVER['HTTP_USER_AGENT'] ?? '' ) );
-
-		if ( self::is_bot_ua( $ua ) ) {
-			return;
-		}
-
 		// Reuse detect_from_edge_hint() so header/cookie names and filters match the detection flow.
 		$slug_map  = $this->get_language_slug_map();
 		$edge_slug = $this->detect_from_edge_hint( $slug_map );
 
 		$default_slug = self::$default_language ? self::$default_language->slug : '';
+
+		if ( $edge_slug !== null ) {
+			Redirect\FirstVisit::decide();
+		}
 
 		if ( $edge_slug === null || $edge_slug === $default_slug ) {
 			// Edge has nothing for us, or chose the default - set cookie and stay.
@@ -1038,7 +984,7 @@ final class LanguageRouter {
 		// Home-path-aware: a bare home_url( add_query_arg( [] ) ) doubles the
 		// prefix of a subfolder install. See current_request_url().
 		$current_url  = self::current_request_url();
-		$redirect_url = $converter->convert( $current_url, $edge_slug );
+		$redirect_url = $converter->convert( Redirect\FirstVisit::unpaged( $current_url ), $edge_slug );
 
 		if ( $redirect_url === '' || $redirect_url === $current_url ) {
 			return;
@@ -1051,16 +997,10 @@ final class LanguageRouter {
 			return;
 		}
 
-		// Cookie + sentinel before redirect (prevents re-fire on cookie-blocked browsers).
-		$this->set_language_cookie( $edge_slug );
+		// Sentinel against a re-fire on cookie-blocked browsers; the sender sets the cookie after the send.
 		$redirect_url = add_query_arg( 'perflocale_redirected', '1', $redirect_url );
 
-		// Per-visitor redirect on a shared URL: uncacheable, so a cache that stores 3xx cannot pin it on
-		// others. Allow the (possibly cross-host) target, or wp_safe_redirect() falls back to /wp-admin/.
-		$this->allow_redirect_host( $redirect_url );
-		nocache_headers();
-		wp_safe_redirect( $redirect_url, 302 );
-		exit;
+		Redirect\Sender::to( $redirect_url, 302, 'edge_hint', [ 'cookie' => $edge_slug ] );
 	}
 
 	/**
@@ -1151,31 +1091,6 @@ final class LanguageRouter {
 		}
 
 		return array_values( array_unique( array_merge( $hosts, array_filter( $add ) ) ) );
-	}
-
-	/**
-	 * Whitelist a redirect target's host for one wp_safe_redirect() call.
-	 *
-	 * Cross-host targets (domain/subdomain mode) are otherwise rejected, falling back to /wp-admin/.
-	 *
-	 * @param string $url Redirect target URL.
-	 * @return void
-	 */
-	private function allow_redirect_host( string $url ): void {
-		$host = wp_parse_url( $url, PHP_URL_HOST );
-
-		if ( ! is_string( $host ) || $host === '' ) {
-			return;
-		}
-
-		add_filter(
-			'allowed_redirect_hosts',
-			static function ( array $hosts ) use ( $host ): array {
-				$hosts[] = $host;
-
-				return $hosts;
-			}
-		);
 	}
 
 	/**
@@ -1619,8 +1534,7 @@ final class LanguageRouter {
 		$request_uri = esc_url_raw( wp_unslash( (string) ( $_SERVER['REQUEST_URI'] ?? '/' ) ) );
 		$target      = add_query_arg( $query_var, rawurlencode( $canonical ), remove_query_arg( $query_var, $request_uri ) );
 
-		wp_safe_redirect( $target, 301 );
-		exit;
+		Redirect\Sender::to( $target, 301, 'renamed_query_slug' );
 	}
 
 	/**
@@ -1931,62 +1845,10 @@ final class LanguageRouter {
 			return null;
 		}
 
-		// Parse Accept-Language and match against available slugs.
-		$preferred = $this->parse_accept_language( $accept );
+		$this->load_default_language();
+		require_once __DIR__ . '/AcceptLanguageMatcher.php';
 
-		foreach ( $preferred as $lang_code ) {
-			// Try exact match first (e.g., 'fr').
-			if ( isset( $slug_map[ $lang_code ] ) ) {
-				return $lang_code;
-			}
-
-			// Try base language (e.g., 'pt-br' → 'pt'). Split on the subtag
-			// separator rather than truncating to 2 chars - a 3-letter code
-			// like 'fil' must not be cut to 'fi' and false-match Finnish.
-			$base = explode( '-', $lang_code )[0];
-
-			if ( isset( $slug_map[ $base ] ) ) {
-				return $base;
-			}
-		}
-
-		return null;
-	}
-
-	/**
-	 * Parse Accept-Language header into sorted language codes.
-	 *
-	 * @param string $header Accept-Language header value.
-	 * @return array<int, string> Language codes sorted by quality.
-	 */
-	private function parse_accept_language( string $header ): array {
-		$languages = [];
-
-		/**
-		 * Filter the maximum number of Accept-Language entries parsed.
-		 *
-		 * The limit defends against crafted headers.
-		 *
-		 * @hook perflocale/accept_language_limit
-		 * @param int $limit Default 20.
-		 */
-		$limit = (int) apply_filters( 'perflocale/accept_language_limit', 20 );
-		$limit = max( 1, $limit );
-
-		foreach ( array_slice( explode( ',', $header ), 0, $limit ) as $part ) {
-			$part = trim( $part );
-
-			if ( preg_match( '/^([a-zA-Z\-]+)(?:;q=([0-9.]+))?$/', $part, $matches ) ) {
-				$code    = strtolower( $matches[1] );
-				$quality = isset( $matches[2] ) ? (float) $matches[2] : 1.0;
-
-				$languages[ $code ] = $quality;
-			}
-		}
-
-		arsort( $languages );
-
-		return array_keys( $languages );
+		return AcceptLanguageMatcher::match( $accept, $slug_map, self::$default_language );
 	}
 
 	/**
@@ -2094,6 +1956,11 @@ final class LanguageRouter {
 				'samesite' => 'Lax',
 			]
 		);
+
+		// Core's canonical hop (priority 10) can answer before geo or edge decides: it must not end the first visit.
+		if ( self::COOKIE_CONSUMER_REDIRECT === $consumer && ! isset( $_COOKIE['perflocale_lang'] ) && $this->slug_is_default( $slug ) ) {
+			add_filter( 'wp_redirect', [ Redirect\Sender::class, 'first_visit_hop' ], PHP_INT_MAX );
+		}
 	}
 
 	/** No active code path can read the language cookie. */
@@ -2112,8 +1979,8 @@ final class LanguageRouter {
 	 * Which active code path can READ the language cookie.
 	 *
 	 * Returns the reason, because set_language_cookie() narrows only the WooCommerce one. WooCommerce is
-	 * checked LAST, or a store would hide the detection reader. clean_redirect_sentinel() also reads the
-	 * cookie but needs no write of its own (only the redirects append its sentinel).
+	 * checked LAST, or a store would hide the detection reader. MarkerHop's optional cleanup hop also reads
+	 * the cookie but needs no write of its own (only the redirects append its marker).
 	 *
 	 * @param bool|null $unrouted_resolves_to_default Out-parameter the caller's narrowing reuses; null
 	 *                    when the redirect branch answers first.
@@ -2274,9 +2141,11 @@ final class LanguageRouter {
 	 * @return void
 	 */
 	public function maybe_flush_rules(): void {
-		// Claim the flag before flushing (a flush is slow): delete_option() is true for exactly one
-		// concurrent claimer, so a busy site does not flush in a herd.
-		if ( get_option( 'perflocale_flush_rules' ) && delete_option( 'perflocale_flush_rules' ) ) {
+		// The row stays, autoloaded, as '0' (a missing row is a query per request). The claim is a compare-and-set,
+		// true for exactly one concurrent claimer, so a busy site does not flush in a herd.
+		$due = get_option( 'perflocale_flush_rules' );
+
+		if ( $due && is_scalar( $due ) && true === \PerfLocale\Database\OptionWriter::compare_and_set( 'perflocale_flush_rules', 0, $due, (string) $due, true ) ) {
 			flush_rewrite_rules();
 		}
 	}
@@ -2319,6 +2188,15 @@ final class LanguageRouter {
 	 */
 	public function get_current_slug(): string {
 		return self::$current_language?->slug ?? '';
+	}
+
+	/**
+	 * How the current language was detected ('' before detection).
+	 *
+	 * @return string
+	 */
+	public static function detection(): string {
+		return self::$detection;
 	}
 
 	/**
@@ -2422,6 +2300,13 @@ final class LanguageRouter {
 	private static array $blog_state_stack = [];
 
 	/**
+	 * The transition handled last at each depth of core's stack ('s' or 'r', new blog, previous blog).
+	 *
+	 * @var array<int, string>
+	 */
+	private static array $handled = [];
+
+	/**
 	 * Maximum frames kept in $blog_state_stack (legitimate nesting stays far below it).
 	 */
 	private const MAX_STACK_DEPTH = 32;
@@ -2452,6 +2337,12 @@ final class LanguageRouter {
 		if ( $new === $prev || $new < 1 || $prev < 1 ) {
 			return;
 		}
+
+		// A switch is kept at the depth it opens, a restore at the depth it closes (StockDriftFlag replays by it).
+		$stack = $GLOBALS['_wp_switched_stack'] ?? null;
+		$depth = is_array( $stack ) ? count( $stack ) : 0;
+
+		self::$handled[ 'restore' === $context ? $depth + 1 : $depth ] = ( 'restore' === $context ? 'r' : 's' ) . $new . ':' . $prev;
 
 		if ( 'restore' === $context ) {
 			$leaving_slug = self::$current_language?->slug ?? '';
@@ -2530,6 +2421,16 @@ final class LanguageRouter {
 		// Always drop the path-prefix lookup: it's derived from the prior
 		// blog's slug_map and has no mapping back to a per-blog frame.
 		self::$path_prefix_map = null;
+	}
+
+	/**
+	 * The transition handled last at this depth of core's stack ('s' or 'r', new blog, previous blog), or ''.
+	 *
+	 * @param int $depth Stack depth a switch opens or a restore closes.
+	 * @return string
+	 */
+	public static function handled( int $depth ): string {
+		return self::$handled[ $depth ] ?? '';
 	}
 
 	/**

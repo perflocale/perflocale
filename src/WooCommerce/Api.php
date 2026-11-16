@@ -121,8 +121,6 @@ final class Api {
 	 *         'dry_run' => false,
 	 *     ] );
 	 *
-	 * In this version it always returns a WP_Error (`perflocale_stock_align_off`): aligning is off.
-	 *
 	 * Returns `planned` (dry run) or `changed` copy rows plus `skipped` / `failed` groups. A group whose
 	 * stock changed while aligned is in `changed` and also in `skipped` (`changed_while_aligning`).
 	 *
@@ -137,16 +135,16 @@ final class Api {
 	 * @return array{changed: list<StockCopyRow>, skipped: list<StockLeftRow>, failed: list<StockLeftRow>}|array{planned: list<StockCopyRow>, skipped: list<StockLeftRow>, failed: list<StockLeftRow>}|\WP_Error
 	 */
 	public function align_stock( array $args = [] ): array|\WP_Error {
-		$off = self::align_off();
-
-		if ( null !== $off ) {
-			return $off;
-		}
-
 		$sync = self::ready();
 
 		if ( $sync instanceof \WP_Error ) {
 			return $sync;
+		}
+
+		$no_locks = self::lock_unavailable();
+
+		if ( null !== $no_locks ) {
+			return $no_locks;
 		}
 
 		try {
@@ -210,14 +208,16 @@ final class Api {
 	}
 
 	/**
-	 * Aligning stock is off in this version (the check stays): the error every align path returns.
+	 * Every align path refuses on a database without named locks (SQLite, MySQL < 5.7.5); the drift check still runs.
 	 *
 	 * @internal
 	 *
 	 * @return \WP_Error|null
 	 */
-	public static function align_off(): ?\WP_Error {
-		return new \WP_Error( 'perflocale_stock_align_off', __( 'Aligning stock is not available in this version.', 'perflocale' ) );
+	public static function lock_unavailable(): ?\WP_Error {
+		require_once __DIR__ . '/StockChangeLock.php';
+
+		return StockChangeLock::available() ? null : new \WP_Error( 'perflocale_stock_lock_unavailable', __( 'Aligning stock needs MySQL 5.7.5 or MariaDB 10.0.2 or newer. Stock differences are still listed; set the stock of each copy by hand.', 'perflocale' ), [ 'status' => 409 ] );
 	}
 
 	/**

@@ -34,7 +34,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * after a kill. Args: `post_id`. Runs as the publishing user; a publish without one is a system job (user 0). When a run
  * ends, the next queued one starts.
  *
- * @phpstan-type Checkpoint array{languages: array<int, string>|null, next: int, translated: int, skipped: int, failed: int, first_error: string, failures: array<int, array<string, mixed>>, recipient: int}
+ * @phpstan-type Checkpoint array{languages: array<int, string>|null, next: int, translated: int, skipped: int, failed: int, first_error: string, failures: array<int, array<string, mixed>>, recipient: int, paced: int}
  */
 final class AutoTranslateJob extends AbstractJob {
 
@@ -54,6 +54,11 @@ final class AutoTranslateJob extends AbstractJob {
 	private const LEGACY_RETRIES = 3;
 
 	/**
+	 * Provider waits in a row (Retry-After, no answer between) after which the remaining languages fail named.
+	 */
+	private const PACED_STOPS = 10;
+
+	/**
 	 * Posts published in this request, queued once their save is complete: blog id => post id => true.
 	 *
 	 * @var array<int, array<int, bool>>
@@ -70,7 +75,7 @@ final class AutoTranslateJob extends AbstractJob {
 	/**
 	 * A job; $translate replaces the provider call (tests).
 	 *
-	 * @param callable|null $translate `function( int $post_id, string $slug ): array`.
+	 * @param callable|null $translate `function( int $post_id, string $slug, bool $include_meta ): array`.
 	 */
 	public function __construct( ?callable $translate = null ) {
 		$this->translate = $translate;
@@ -112,6 +117,15 @@ final class AutoTranslateJob extends AbstractJob {
 
 	/** {@inheritDoc} */
 	public function runs_without_user(): bool {
+		return true;
+	}
+
+	/**
+	 * {@inheritDoc}
+	 *
+	 * Another user's queued translation of the post is the work the saving author asked for.
+	 */
+	public function joins_hidden_twin(): bool {
 		return true;
 	}
 
@@ -295,11 +309,42 @@ final class AutoTranslateJob extends AbstractJob {
 	private static function queue( int $post_id ): ?string {
 		$queued = Dispatcher::enqueue( new self(), [ 'post_id' => $post_id ] );
 
+		if ( ! empty( $queued['elsewhere'] ) ) {
+			self::queued_elsewhere( $post_id );
+			return null;
+		}
+
 		if ( is_string( $queued['job_id'] ?? null ) && '' !== $queued['job_id'] ) {
 			return null;
 		}
 
 		return is_string( $queued['error'] ?? null ) ? $queued['error'] : '';
+	}
+
+	/**
+	 * Show on the post that another user's identical job will translate it (naming nothing of that job).
+	 *
+	 * @param int $post_id Post.
+	 * @return void
+	 */
+	private static function queued_elsewhere( int $post_id ): void {
+		$post = get_post( $post_id );
+
+		if ( ! $post instanceof \WP_Post ) {
+			return;
+		}
+
+		MtCreateNotice::remember_publish(
+			self::recipient( get_current_user_id(), $post, true ),
+			$post_id,
+			[
+				[
+					'reason'   => __( 'A translation of this post is already queued.', 'perflocale' ),
+					'warning'  => true,
+					'language' => '',
+				],
+			]
+		);
 	}
 
 	/**
@@ -411,6 +456,9 @@ final class AutoTranslateJob extends AbstractJob {
 		$service      = null;
 		$previous     = null !== $deadline ? CallDeadline::set( $deadline ) : null;
 
+		// The latency rule starts from this run's own calls, not another job's in the same request.
+		CallDeadline::times( [] );
+
 		try {
 			for ( $i = $first; $i < $total; $i++ ) {
 				// A slice always runs its first unit.
@@ -479,18 +527,41 @@ final class AutoTranslateJob extends AbstractJob {
 
 				try {
 					$service ??= new TranslationService( $settings, $cache );
-					$done      = null !== $this->translate ? ( $this->translate )( $post_id, $slug ) : $service->translate_post( $post_id, $slug );
+					// Unattended and billed: no meta by default.
+					$meta      = TranslationService::include_meta( false, 'publish', $post_id, $slug );
+					$done      = null !== $this->translate ? ( $this->translate )( $post_id, $slug, $meta ) : $service->translate_post( $post_id, $slug, '', false, $meta );
 
 					++$state['translated'];
+					$state['paced']    = 0;
 					$state['failures'] = array_merge( $state['failures'], MtCreateNotice::publish_warnings( is_array( $done ) ? JobResume::keyed( $done ) : [], $lang ) );
 				} catch ( DeadlineReachedException $e ) {
 					if ( null === $slice ) {
 						throw $e;
 					}
 
-					// A provider's own wait (Retry-After) is not counted; other stops count with the language's kills.
-					$stops = $e->paced() ? 0 : 1 + self::stops_at( $slice, $i );
-					$limit = JobResume::max_stops();
+					// A provider's own wait (Retry-After) is not counted as a stop, but 10 in a row end the run; other stops
+					// count with the language's kills.
+					$stops          = $e->paced() ? 0 : 1 + self::stops_at( $slice, $i );
+					$limit          = JobResume::max_stops();
+					$state['paced'] = $e->paced() ? $state['paced'] + 1 : 0;
+
+					if ( $state['paced'] >= self::PACED_STOPS ) {
+						$waited = new \RuntimeException(
+							sprintf(
+								/* translators: 1: number of waits, 2: seconds of the last wait */
+								__( 'The provider asked to wait %1$d times in a row (rate limit; last wait %2$d seconds), so the remaining languages were not translated. Translate them again later.', 'perflocale' ),
+								self::PACED_STOPS,
+								$e->wait()
+							)
+						);
+
+						for ( $rest = $i; $rest < $total; $rest++ ) {
+							self::failed( $state, $waited, $active[ $languages[ $rest ] ] ?? $lang );
+						}
+
+						$state['paced'] = 0;
+						break;
+					}
 
 					if ( $stops < $limit ) {
 						$continue_at = $e->retry_at();
@@ -511,6 +582,7 @@ final class AutoTranslateJob extends AbstractJob {
 						$lang
 					);
 				} catch ( \Throwable $e ) {
+					$state['paced'] = 0;
 					self::failed( $state, $e, $lang );
 				}
 
@@ -664,6 +736,7 @@ final class AutoTranslateJob extends AbstractJob {
 			'first_error' => is_string( $resume['first_error'] ?? null ) ? $resume['first_error'] : '',
 			'failures'    => $failures,
 			'recipient'   => $count( $resume['recipient'] ?? 0 ),
+			'paced'       => $count( $resume['paced'] ?? 0 ),
 		];
 	}
 

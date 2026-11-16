@@ -185,7 +185,7 @@ final class RewriteManager {
 		}
 
 		// Language rules are missing - schedule a flush.
-		update_option( 'perflocale_flush_rules', 1, false );
+		update_option( 'perflocale_flush_rules', 1, true );
 	}
 
 	/**

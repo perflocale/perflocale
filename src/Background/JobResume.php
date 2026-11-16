@@ -39,6 +39,11 @@ final class JobResume {
 	public const MAX_KILLS = 3;
 
 	/**
+	 * Key of a checkpoint's count of parts finished inside its unit: a stop after which it grew is progress, not counted.
+	 */
+	public const PARTIAL_KEY = '__perflocale_partial';
+
+	/**
 	 * The string keys of an array (a stored result is a JSON object).
 	 *
 	 * @param array<mixed> $values Array.
@@ -145,16 +150,17 @@ final class JobResume {
 		$killed = ! empty( $meta['open'] );
 
 		if ( $killed ) {
-			$kills = $at === $position ? $kills + 1 : 1;
+			$kills = self::moved( $resume, $meta, $position ) ? 0 : ( $at === $position ? $kills + 1 : 1 );
 			$at    = $position;
 		}
 
 		// A slice that was not killed names no unit until its first checkpoint: a setup kill names its position.
 		$meta = [
-			'open'  => true,
-			'kills' => $kills,
-			'at'    => $at,
-			'unit'  => $killed && is_string( $meta['unit'] ?? null ) ? $meta['unit'] : '',
+			'open'    => true,
+			'kills'   => $kills,
+			'at'      => $at,
+			'unit'    => $killed && is_string( $meta['unit'] ?? null ) ? $meta['unit'] : '',
+			'partial' => [ $position, self::partial( $resume ) ],
 		];
 
 		if ( $killed && $kills >= self::max_stops() ) {
@@ -216,7 +222,35 @@ final class JobResume {
 	}
 
 	/**
-	 * Count a slice's stop at the provider deadline like a kill at $position; null when the job failed on it.
+	 * Parts a checkpoint says its unit has finished (PARTIAL_KEY).
+	 *
+	 * @param array<mixed> $checkpoint Checkpoint.
+	 * @return int
+	 */
+	private static function partial( array $checkpoint ): int {
+		$parts = $checkpoint[ self::PARTIAL_KEY ] ?? null;
+
+		return is_int( $parts ) ? max( 0, $parts ) : 0;
+	}
+
+	/**
+	 * Whether a slice stopped at $position finished parts of its unit: more than it opened with there.
+	 *
+	 * @param array<mixed> $checkpoint The checkpoint the slice left.
+	 * @param array<mixed> $meta       The slice's resume state (open()).
+	 * @param int          $position   The unit's position.
+	 * @return bool
+	 */
+	private static function moved( array $checkpoint, array $meta, int $position ): bool {
+		$opened = $meta['partial'] ?? null;
+		$before = is_array( $opened ) && ( $opened[0] ?? null ) === $position && is_int( $opened[1] ?? null ) ? $opened[1] : 0;
+
+		return self::partial( $checkpoint ) > $before;
+	}
+
+	/**
+	 * Count a slice's stop at the provider deadline like a kill at $position, unless it finished parts of the unit;
+	 * null when the job failed on it.
 	 *
 	 * @param string               $job_id     Job id.
 	 * @param string               $type       Job type.
@@ -225,10 +259,11 @@ final class JobResume {
 	 * @param int                  $position   The unit's position.
 	 * @param string               $unit       The unit, as shown to the user ('' when unknown).
 	 * @param int                  $generation The attempts read with the claim (-1: any).
+	 * @param string               $note       Failure message naming what to change ('': the general one).
 	 * @return array<string, mixed>|null
 	 */
-	public static function count_stop( string $job_id, string $type, array $checkpoint, array $meta, int $position, string $unit, int $generation ): ?array {
-		$kills         = is_int( $meta['kills'] ?? null ) && ( $meta['at'] ?? null ) === $position ? $meta['kills'] + 1 : 1;
+	public static function count_stop( string $job_id, string $type, array $checkpoint, array $meta, int $position, string $unit, int $generation, string $note = '' ): ?array {
+		$kills         = self::moved( $checkpoint, $meta, $position ) ? 0 : ( is_int( $meta['kills'] ?? null ) && ( $meta['at'] ?? null ) === $position ? $meta['kills'] + 1 : 1 );
 		$meta['kills'] = $kills;
 		$meta['at']    = $position;
 
@@ -237,7 +272,7 @@ final class JobResume {
 		}
 
 		/* translators: %d: position of the item in the job, from 1. */
-		self::fail_killed( $job_id, $type, $checkpoint, $meta, $kills, '' !== $unit ? $unit : sprintf( __( 'item %d', 'perflocale' ), $position + 1 ), $generation );
+		self::fail_killed( $job_id, $type, $checkpoint, $meta, $kills, '' !== $unit ? $unit : sprintf( __( 'item %d', 'perflocale' ), $position + 1 ), $generation, $note );
 
 		return null;
 	}
@@ -252,10 +287,11 @@ final class JobResume {
 	 * @param int                  $kills  Kills at the item.
 	 * @param string               $unit   The item.
 	 * @param int                  $generation The attempts read with the claim (-1: any).
+	 * @param string               $note   Message naming what to change ('': the general one).
 	 * @return void
 	 */
-	private static function fail_killed( string $job_id, string $type, array $resume, array $meta, int $kills, string $unit, int $generation ): void {
-		$message = sprintf(
+	private static function fail_killed( string $job_id, string $type, array $resume, array $meta, int $kills, string $unit, int $generation, string $note = '' ): void {
+		$message = '' !== $note ? $note : sprintf(
 			/* translators: 1: number of stops, 2: the item, e.g. "post 12 into de". */
 			__( 'The background worker stopped %1$d times at the same item (%2$s), so the job was stopped. Check that item, then retry the job.', 'perflocale' ),
 			$kills,

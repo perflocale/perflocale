@@ -68,6 +68,13 @@ final class StockDriftAlign {
 	private $pages;
 
 	/**
+	 * Whether the group being applied sent a stock write (reset at its settle): a write whose reply was lost may have landed.
+	 *
+	 * @var bool
+	 */
+	private bool $tried = false;
+
+	/**
 	 * Constructor.
 	 *
 	 * @param StockAlignBackend                                $backend The store.
@@ -162,7 +169,15 @@ final class StockDriftAlign {
 			return $rows;
 		}
 
-		return $this->apply( $group, $plan, $expected );
+		$rows = $this->apply( $group, $plan, $expected );
+
+		// Every copy written: the group's ids leave the Site Health flag (StockDriftFlag).
+		if ( [] === array_filter( $rows, static fn( array $row ): bool => 'changed' !== $row['status'] ) ) {
+			require_once __DIR__ . '/StockDriftFlag.php';
+			StockDriftFlag::clear( array_map( static fn( array $member ): int => (int) $member['product_id'], $group['members'] ) );
+		}
+
+		return $rows;
 	}
 
 	/**
@@ -286,9 +301,12 @@ final class StockDriftAlign {
 
 		$written = [];
 		$outcome = null;
+		$settled = false;
+		$read    = null;
 
 		try {
 			$now  = $this->backend->read( $ids );
+			$read = self::numbers( $now );
 			$code = self::recheck( $group['members'], $now, $plan['reference'], $expected );
 
 			if ( '' !== $code ) {
@@ -317,6 +335,8 @@ final class StockDriftAlign {
 			if ( null === $outcome || false === $outcome ) {
 				$outcome = $this->finish( $group, $ids, $written );
 			}
+
+			$settled = true;
 		} catch ( \RuntimeException $e ) {
 			// A later read failed: the copies written so far stay reported; the group is not known aligned.
 			if ( $e instanceof StockWriteFailed ) {
@@ -325,6 +345,12 @@ final class StockDriftAlign {
 
 			$outcome = [ 'skipped', 'changed_while_aligning', '' ];
 		} finally {
+			// The reference only when every member was set to its stock as read under the locks.
+			$reference = $plan['reference'];
+			$reference = $reference > 0 && null !== $read && isset( $read[ $reference ] ) && self::same( $read[ $reference ], $plan['value'] ) ? $reference : 0;
+			$tried       = $this->tried;
+			$this->tried = false;
+			$this->backend->settle( $reference, $settled && null === $outcome ? 'all' : ( $tried ? 'part' : 'none' ), $ids );
 			$this->backend->release( $ids );
 		}
 
@@ -435,8 +461,9 @@ final class StockDriftAlign {
 				return 'lost';
 			}
 
-			$old = $stock[ $id ];
-			$new = $this->backend->write( $id, $delta, $old );
+			$old         = $stock[ $id ];
+			$this->tried = true;
+			$new         = $this->backend->write( $id, $delta, $old );
 
 			if ( null !== $new ) {
 				$stock[ $id ] = $new;
@@ -662,6 +689,11 @@ final class StockDriftAlign {
 					return false;
 				}
 			}
+		}
+
+		// A read past the deadline or a lost session proves nothing: the markers stay for the next run.
+		if ( ! $this->backend->renew( $ids ) ) {
+			return false;
 		}
 
 		foreach ( $marks as $id => [ , $raw ] ) {

@@ -12,6 +12,7 @@ namespace PerfLocale\Database\Repository;
 use PerfLocale\Database\ConnectionGuard;
 use PerfLocale\Database\Schema;
 use PerfLocale\Enum\ObjectType;
+use PerfLocale\Util\Scalar;
 
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
@@ -33,9 +34,10 @@ final class StringGroupAssigner {
 	 * @param int                  $string_id      Row in the `strings` table.
 	 * @param bool                 $in_transaction Inside the caller's transaction: nothing follows a failed statement, no reclaim.
 	 * @param ConnectionGuard|null $guard          The caller's open unit: every write carries its marker.
+	 * @param int|null             $from           The group the caller read: the string moves only while it names it.
 	 * @return int The new group id, or 0 when the string could not be moved.
 	 */
-	public static function assign( \wpdb $wpdb, int $string_id, bool $in_transaction, ?ConnectionGuard $guard = null ): int {
+	public static function assign( \wpdb $wpdb, int $string_id, bool $in_transaction, ?ConnectionGuard $guard = null, ?int $from = null ): int {
 		$groups = Schema::table( 'translation_groups' );
 		$cond   = null === $guard ? '' : $guard->condition();
 
@@ -101,9 +103,13 @@ final class StringGroupAssigner {
 		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders, PluginCheck.Security.DirectDB.UnescapedDBParameter
 
 		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Self-heal write, keyed on the primary key; the guard's condition is built by the guard.
+		$where   = null === $from ? [ 'id' => $string_id ] : [
+			'id'       => $string_id,
+			'group_id' => $from,
+		];
 		$updated = '' === $cond
-			? $wpdb->update( Schema::table( 'strings' ), [ 'group_id' => $group_id ], [ 'id' => $string_id ], [ '%d' ], [ '%d' ] )
-			: $wpdb->query( $wpdb->prepare( 'UPDATE %i SET group_id = %d WHERE id = %d', Schema::table( 'strings' ), $group_id, $string_id ) . ' AND ' . $cond );
+			? $wpdb->update( Schema::table( 'strings' ), [ 'group_id' => $group_id ], $where, [ '%d' ], array_fill( 0, count( $where ), '%d' ) )
+			: $wpdb->query( $wpdb->prepare( 'UPDATE %i SET group_id = %d WHERE id = %d', Schema::table( 'strings' ), $group_id, $string_id ) . ( null === $from ? '' : (string) $wpdb->prepare( ' AND group_id = %d', $from ) ) . ' AND ' . $cond );
 		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
 
 		if ( ! is_int( $updated ) || $updated < 1 ) {
@@ -117,6 +123,49 @@ final class StringGroupAssigner {
 		TranslationGroupRepository::remember_string_group( $group_id );
 
 		return $group_id;
+	}
+
+	/**
+	 * Point a string at a group just minted for it, only while it still names the group its caller read. When another
+	 * writer repaired it first, the minted group goes while no link uses it and the winner's string group is returned.
+	 *
+	 * @param \wpdb $wpdb      Database.
+	 * @param int   $string_id Row in the `strings` table.
+	 * @param int   $from      The group the caller read.
+	 * @param int   $to        The minted group.
+	 * @return int $to, the winner's string group, or 0 (failed, or the string holds no string group now).
+	 */
+	public static function repoint( \wpdb $wpdb, int $string_id, int $from, int $to ): int {
+		$strings = Schema::table( 'strings' );
+		$groups  = Schema::table( 'translation_groups' );
+
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Self-heal writes keyed on the primary key; identifiers bound with %i.
+		$updated = $wpdb->update(
+			$strings,
+			[ 'group_id' => $to ],
+			[
+				'id'       => $string_id,
+				'group_id' => $from,
+			],
+			[ '%d' ],
+			[ '%d', '%d' ]
+		);
+
+		if ( is_int( $updated ) && $updated > 0 ) {
+			return $to;
+		}
+
+		if ( false === $updated ) {
+			return 0;
+		}
+
+		$sql = $wpdb->prepare( 'DELETE FROM %i WHERE id = %d AND NOT EXISTS ( SELECT 1 FROM %i WHERE group_id = %d )', $groups, $to, Schema::table( 'translation_links' ), $to );
+		$wpdb->query( (string) $sql );
+
+		$now = $wpdb->get_row( $wpdb->prepare( 'SELECT s.group_id, g.type FROM %i s LEFT JOIN %i g ON g.id = s.group_id WHERE s.id = %d', $strings, $groups, $string_id ), ARRAY_A );
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+		return is_array( $now ) && ObjectType::String->value === ( $now['type'] ?? null ) && Scalar::int( $now['group_id'] ) !== $to ? Scalar::int( $now['group_id'] ) : 0;
 	}
 
 	/**

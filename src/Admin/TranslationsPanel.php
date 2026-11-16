@@ -11,6 +11,7 @@ namespace PerfLocale\Admin;
 
 use PerfLocale\Cache\CacheManager;
 use PerfLocale\Translation\PostTranslationManager;
+use PerfLocale\Util\Scalar;
 
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
@@ -134,7 +135,20 @@ final class TranslationsPanel {
 		// renderer, not put in the rows, which a `perflocale/panel/rows` listener can rewrite.
 		$can_create = current_user_can( 'perflocale_translate' ) && \PerfLocale\Helper::user_can_create_like( $post_id );
 
-		$html = '<ul class="perflocale-mb-list">';
+		$html = '';
+
+		// This post's own waiting update: the line and link above the list.
+		foreach ( $rows as $row ) {
+			$review_url = self::row_text( $row, 'review_url' );
+
+			if ( ! empty( $row['is_current'] ) && '' !== $review_url ) {
+				$html .= '<p class="perflocale-mb-update">' . esc_html__( 'An update from the source is waiting for review.', 'perflocale' )
+					. ' <a href="' . esc_url( $review_url ) . '">' . esc_html__( 'Review update', 'perflocale' ) . '</a></p>';
+				break;
+			}
+		}
+
+		$html .= '<ul class="perflocale-mb-list">';
 
 		foreach ( $rows as $row ) {
 			$html .= $this->render_row( $row, $can_create );
@@ -189,7 +203,19 @@ final class TranslationsPanel {
 			_prime_post_caches( $prime_ids, true, true );
 		}
 
-		$rows = [];
+		// The "update waiting" read: one indexed query for this post and its translations; none while ReSync is off.
+		$resync  = \PerfLocale\Util\ResyncSwitch::on();
+		$pending = array_merge( [ $post_id ], $prime_ids );
+		$waiting = $resync ? \PerfLocale\Util\ResyncSwitch::waiting_updates( $pending ) : [];
+		$updates = [] !== $waiting ? ReviewUpdate::links( $waiting ) : [];
+		$rows    = [];
+
+		// "Resync from source": on the source, each row with a translation the user can open; on a translation, its own
+		// row. Only for a user and type the handler accepts and a readable source (the handler checks every pair again).
+		// A lone post has no row to resync: its classes stay unloaded.
+		$source     = $resync && count( $translations ) > 1 && ResyncLinks::allowed_for_type( $post->post_type ) ? ResyncLinks::source_of( $post, $translations ) : null;
+		$can_resync = null !== $source;
+		$is_source  = null !== $source && $source->ID === $post_id;
 
 		foreach ( $languages as $lang ) {
 			$has_translation = isset( $translations[ $lang->slug ] );
@@ -201,28 +227,38 @@ final class TranslationsPanel {
 				$translated_id   = null;
 			}
 
-			// A sibling the user may not view: its language only, no ID or link (rows filter included).
-			$hidden = $has_translation && $translated_id && (int) $translated_id !== $post_id && ! \PerfLocale\Helper::user_can_view_object( (int) $translated_id );
+			// A sibling the user may not view: the row of a missing translation, also for the rows filter.
+			if ( $has_translation && $translated_id && (int) $translated_id !== $post_id && ! \PerfLocale\Helper::user_can_view_object( (int) $translated_id ) ) {
+				$has_translation = false;
+				$translated_id   = null;
+			}
 
-			if ( $hidden ) {
-				$translated_id = null;
+			$is_current = ( $post_lang && $post_lang->slug === $lang->slug );
+			$update_of  = $is_current ? $post_id : ( $has_translation && $translated_id ? (int) $translated_id : 0 );
+			$edit_url   = ( $has_translation && $translated_id ) ? ObjectLinks::edit_url( (int) $translated_id ) : '';
+			$resync_url = '';
+
+			if ( $can_resync && ( $is_source ? ( ! $is_current && '' !== $edit_url ) : $is_current ) ) {
+				$resync_url = ResyncLinks::resync_url( $post_id, Scalar::str( Scalar::prop( $lang, 'slug' ) ), 'referer' );
 			}
 
 			$rows[] = [
+				'review_url'      => $update_of > 0 && isset( $updates[ $update_of ] ) ? $updates[ $update_of ]['url'] : '',
 				'slug'            => (string) $lang->slug,
 				'badge'           => \PerfLocale\Helper::format_locale_as_bcp47( (string) $lang->slug ),
 				'native_name'     => (string) ( $lang->native_name ?: $lang->name ),
-				'is_current'      => ( $post_lang && $post_lang->slug === $lang->slug ),
+				'is_current'      => $is_current,
 				'has_translation' => $has_translation,
-				'hidden'          => $hidden,
+				// Kept for `perflocale/panel/rows` listeners; always false: a hidden sibling's row is a missing one.
+				'hidden'          => false,
 				'translated_id'   => $translated_id !== null ? (int) $translated_id : null,
 				'source_id'       => $post_id,
 				'source_status'   => (string) $post->post_status,
 				// In the row so `perflocale/panel/rows` can retarget it per mount context; the edit link filter
 				// knows only the post type.
-				'edit_url'        => ( $has_translation && $translated_id )
-					? ObjectLinks::edit_url( (int) $translated_id )
-					: '',
+				'edit_url'        => $edit_url,
+				// The row's "Resync from source" link, '' when none; in the row for the same reason.
+				'resync_url'      => $resync_url,
 			];
 		}
 
@@ -238,6 +274,19 @@ final class TranslationsPanel {
 		 * @return array<int, array<string, mixed>>
 		 */
 		return (array) apply_filters( 'perflocale/panel/rows', $rows, $post_id, $args );
+	}
+
+	/**
+	 * A row field as text ('' when not scalar): as Scalar::str(), without loading it on an edit screen with no ReSync control.
+	 *
+	 * @param array<string, mixed> $row Row data.
+	 * @param string               $key Field.
+	 * @return string
+	 */
+	private static function row_text( array $row, string $key ): string {
+		$value = $row[ $key ] ?? '';
+
+		return is_scalar( $value ) ? (string) $value : '';
 	}
 
 	/**
@@ -262,16 +311,31 @@ final class TranslationsPanel {
 		$html .= '<span class="perflocale-mb-native">' . esc_html( (string) ( $row['native_name'] ?? '' ) ) . '</span>';
 		$html .= '</span>';
 
+		$resync_url = self::row_text( $row, 'resync_url' );
+
 		if ( $is_current ) {
 			$html .= '<span class="perflocale-mb-pill perflocale-mb-pill--current">' . esc_html__( 'Current', 'perflocale' ) . '</span>';
-		} elseif ( $has_translation && ! empty( $row['hidden'] ) ) {
-			$html .= '<span class="perflocale-mb-pill perflocale-mb-pill--disabled">' . esc_html__( 'Translated', 'perflocale' ) . '</span>';
+
+			if ( '' !== $resync_url ) {
+				$html .= '<a href="' . esc_url( $resync_url ) . '" class="perflocale-mb-pill perflocale-mb-pill--resync"' . ResyncLinks::post_link_attributes( $resync_url ) . '>' . esc_html__( 'Resync from source', 'perflocale' ) . '</a>';
+			}
 		} elseif ( $has_translation && $translated_id > 0 ) {
 			// From the row, so a `perflocale/panel/rows` listener can replace it.
 			$edit_url = (string) ( $row['edit_url'] ?? '' );
 
 			if ( $edit_url !== '' ) {
 				$html .= '<a href="' . esc_url( $edit_url ) . '" class="perflocale-mb-pill perflocale-mb-pill--edit">' . esc_html__( 'Edit', 'perflocale' ) . '</a>';
+
+				// The translation's waiting update, for a user who may decide it.
+				$review_url = self::row_text( $row, 'review_url' );
+
+				if ( '' !== $review_url ) {
+					$html .= '<a href="' . esc_url( $review_url ) . '" class="perflocale-mb-pill perflocale-mb-pill--update">' . esc_html__( 'Update waiting', 'perflocale' ) . '</a>';
+				}
+
+				if ( '' !== $resync_url ) {
+					$html .= '<a href="' . esc_url( $resync_url ) . '" class="perflocale-mb-pill perflocale-mb-pill--resync"' . ResyncLinks::post_link_attributes( $resync_url ) . '>' . esc_html__( 'Resync', 'perflocale' ) . '</a>';
+				}
 			} else {
 				// Translated but no editor to open: a pill, so the row does not look untranslated and offer Create.
 				$html .= '<span class="perflocale-mb-pill perflocale-mb-pill--disabled" title="' . esc_attr__( 'Translated. This content type has no editor that can be opened from here.', 'perflocale' ) . '">' . esc_html__( 'Translated', 'perflocale' ) . '</span>';

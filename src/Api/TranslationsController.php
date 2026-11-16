@@ -53,13 +53,19 @@ final class TranslationsController extends RestController {
 					// target_lang is not `required`: the handler returns its own 'missing_lang' error. copy_content is undeclared:
 					// the handler's (bool) cast differs from REST boolean coercion ('0').
 					'args'                => [
-						'target_lang'  => [
+						'target_lang'         => [
 							'type'              => 'string',
 							'description'       => __( 'Target language slug for the new translation.', 'perflocale' ),
 							'sanitize_callback' => 'sanitize_key',
 						],
-						'copy_content' => [
+						'copy_content'        => [
 							'description' => __( 'Whether to copy the source content into the new translation.', 'perflocale' ),
+						],
+						'translate_on_create' => [
+							'type'              => 'boolean',
+							'description'       => __( 'Machine-translate a new copied translation when the "Translate on create" setting allows it.', 'perflocale' ),
+							// Runs before core's boolean coercion, which reads "1" and "true" as true: only a JSON true opts in.
+							'validate_callback' => static fn( $value ): bool|\WP_Error => is_bool( $value ) ? true : new \WP_Error( 'rest_invalid_param', __( 'translate_on_create must be true or false (a JSON boolean).', 'perflocale' ), [ 'status' => 400 ] ),
 						],
 					],
 				],
@@ -179,13 +185,16 @@ final class TranslationsController extends RestController {
 	}
 
 	/**
-	 * The posts of $post_ids the current user may edit (host-aware), primed 200 at a time.
+	 * The posts of $post_ids the current user may edit (host-aware), primed 200 at a time, read up to the post that
+	 * fills $room with posts the user may view: posts it may not view take no room, so they change no answer.
 	 *
-	 * @param int[] $post_ids Post IDs.
-	 * @return int[]
+	 * @param int[] $post_ids Post IDs, ascending.
+	 * @param int   $room     Viewable posts still to read.
+	 * @return array{0: int[], 1: int, 2: int} Editable ids, viewable posts read, and the id that filled $room (0: none).
 	 */
-	private function editable_posts( array $post_ids ): array {
-		$out = [];
+	private function editable_posts( array $post_ids, int $room ): array {
+		$out  = [];
+		$seen = 0;
 
 		foreach ( array_chunk( $post_ids, 200 ) as $chunk ) {
 			_prime_post_caches( $chunk, false, false );
@@ -193,13 +202,21 @@ final class TranslationsController extends RestController {
 			foreach ( $chunk as $id ) {
 				if ( \PerfLocale\Helper::user_can_edit_object( $id ) ) {
 					$out[] = $id;
+				} elseif ( ! \PerfLocale\Helper::user_can_view_object( $id ) ) {
+					continue;
+				}
+
+				if ( ++$seen >= $room ) {
+					\PerfLocale\Cache\CacheManager::release_runtime_posts( $chunk );
+
+					return [ $out, $seen, $id ];
 				}
 			}
 
 			\PerfLocale\Cache\CacheManager::release_runtime_posts( $chunk );
 		}
 
-		return $out;
+		return [ $out, $seen, 0 ];
 	}
 
 	/**
@@ -277,8 +294,9 @@ final class TranslationsController extends RestController {
 					}
 
 					$tph        = implode( ',', array_fill( 0, count( $post_types ), '%s' ) );
-				// At most 5 pages after `after_id` per request, added to the client's running `totals`; `next_after_id` (0 when
-				// done) continues. Only posts the caller may edit are counted, as the job does.
+				// 10,000 posts the caller may view per request (pages of 2,000 ids), added to the client's running `totals`;
+				// `next_after_id` (0 when done) continues. Only posts the caller may edit are counted, as the job does. A post it
+				// may not view takes no room, so the answers equal those of a site without it.
 				$after  = $request->get_param( 'after_id' );
 				$after  = is_numeric( $after ) ? max( 0, (int) $after ) : 0;
 				$carry  = (array) $request->get_param( 'totals' );
@@ -292,7 +310,8 @@ final class TranslationsController extends RestController {
 					$totals[ $key ] = $value;
 				}
 				$next = 0;
-				for ( $pages = 0; $pages < 5; $pages++ ) {
+				$room = 10000;
+				while ( true ) {
 					// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter
 					$page = array_map( 'intval', (array) $wpdb->get_col( $wpdb->prepare( "SELECT ID FROM {$wpdb->posts} WHERE post_type IN ({$tph}) AND post_status = 'publish' AND ID > %d ORDER BY ID ASC LIMIT 2000", array_merge( $post_types, [ $after ] ) ) ) );
 					// phpcs:enable
@@ -301,10 +320,14 @@ final class TranslationsController extends RestController {
 						break;
 					}
 					$after = (int) end( $page );
-					$next  = count( $page ) < 2000 ? 0 : $after;
-					$est   = $estimator->estimate_posts( $this->editable_posts( $page ), $lang_ids, $include_meta );
+
+					[ $editable, $seen, $filled ] = $this->editable_posts( $page, $room );
+
+					$room -= $seen;
+					$next  = $filled;
+					$est   = $estimator->estimate_posts( $editable, $lang_ids, $include_meta, true );
 					$add   = [
-						'checked'          => count( $page ),
+						'checked'          => count( $editable ),
 						'chars'            => (int) $est['chars'],
 						'items'            => (int) $est['items'],
 						'skipped_existing' => (int) $est['skipped_existing'],
@@ -316,7 +339,7 @@ final class TranslationsController extends RestController {
 						}
 						$totals[ $key ] += $n;
 					}
-					if ( 0 === $next ) {
+					if ( $filled > 0 || count( $page ) < 2000 ) {
 						break;
 					}
 				}
@@ -337,7 +360,7 @@ final class TranslationsController extends RestController {
 				return $this->error( 'rest_forbidden', __( 'You cannot access one of the requested posts.', 'perflocale' ), 403 );
 			}
 
-			return $this->success( $estimator->estimate_posts( $post_ids, $lang_ids, $include_meta ) );
+			return $this->success( $estimator->estimate_posts( $post_ids, $lang_ids, $include_meta, true ) );
 		}
 
 		if ( $site_wide ) {
@@ -373,11 +396,13 @@ final class TranslationsController extends RestController {
 		}
 
 		$status = 202;
-		if ( ( $outcome['mode'] ?? '' ) === 'denied' ) {
+		if ( 'denied' === $outcome['mode'] ) {
 			$status = 403;
-		} elseif ( ( $outcome['mode'] ?? '' ) === 'error' ) {
+		} elseif ( ! empty( $outcome['busy'] ) ) {
+			$status = 409;
+		} elseif ( 'error' === $outcome['mode'] ) {
 			$status = 500;
-		} elseif ( ( $outcome['mode'] ?? '' ) === 'sync' ) {
+		} elseif ( 'sync' === $outcome['mode'] ) {
 			$status = 200;
 		}
 
@@ -432,7 +457,7 @@ final class TranslationsController extends RestController {
 
 	/**
 	 * Every language of an object with whether it has a translation. A sibling the user may neither read nor edit
-	 * (Helper::user_can_view_object()) shows language and existence only: post_id, statuses and edit_url are null.
+	 * (Helper::user_can_view_object()) is listed exactly as a missing translation, so its existence is not disclosed.
 	 *
 	 * @param \WP_REST_Request $request Request.
 	 * @return \WP_REST_Response
@@ -529,8 +554,9 @@ final class TranslationsController extends RestController {
 			// Precomputed above.
 			$status_obj = $status_cache[ $lang->slug ] ?? null;
 
-			// A sibling the user may not see: language and existence only.
+			// A sibling the user may not see: the row of a missing translation.
 			if ( $translated_post && (int) $translated_id !== $id && ! \PerfLocale\Helper::user_can_view_object( (int) $translated_id ) ) {
+				$has_translation = false;
 				$translated_id   = null;
 				$translated_post = null;
 				$status_obj      = null;
@@ -601,12 +627,19 @@ final class TranslationsController extends RestController {
 
 		$manager = $this->get_manager();
 
-		// The copy comes from the group's default-language member, not necessarily $id: without access to it the create
+		// A translation the user may not open is listed as missing; Create says why nothing can be created, naming no post.
+		$existing = $manager->get_translation_id( $id, $target_lang );
+
+		if ( self::hidden_translation( $id, $existing ) ) {
+			return self::unavailable( $target_lang );
+		}
+
+		// The copy comes from the group's default-language member, maybe $id itself: edit and read on it, or the create
 		// is refused, so a translation's starting content never depends on who clicked.
 		$copy_from = $manager->get_copy_source_id( $id, $target_lang );
 
-		if ( $copy_from > 0 && $copy_from !== $id && ! \PerfLocale\Helper::user_can_copy_translation_source( $copy_from ) ) {
-			return $this->error( 'source_forbidden', __( 'You cannot edit the original this translation is copied from.', 'perflocale' ), 403 );
+		if ( $copy_from > 0 && ! \PerfLocale\Helper::user_can_copy_translation_source( $copy_from ) ) {
+			return self::source_refusal( $copy_from, $target_lang );
 		}
 
 		// wp_insert_post() checks no capability: the copy source type's own create gate.
@@ -615,13 +648,144 @@ final class TranslationsController extends RestController {
 		}
 
 		$created = false;
-		$new_id  = $manager->create_translation( $id, $target_lang, $copy, \PerfLocale\Enum\SourceType::Manual, $created );
+		$new_id  = false;
+		$mt      = null;
+
+		// The block sidebar asks for the classic panel's "translate on create" of the post copied; a failure gives the copy
+		// with the reason.
+		if ( $copy && $copy_from > 0 && null === $existing && true === $request->get_param( 'translate_on_create' ) ) {
+			$plugin = \PerfLocale\Plugin::get_instance();
+			$plain  = static function () use ( $manager, $id, $target_lang ): array {
+				$made = false;
+				$new  = $manager->create_translation( $id, $target_lang, true, \PerfLocale\Enum\SourceType::Manual, $made );
+
+				return [ $new, true === $made ];
+			};
+			$mt     = \PerfLocale\MachineTranslation\MtOnCreate::run( $plugin->settings(), $plugin->cache(), $copy_from, $target_lang, $plain );
+
+			// Another Create of the pair is paying the provider: a copy now would take the slot it fills.
+			if ( $mt['busy'] ) {
+				return $this->error( 'translation_in_progress', $mt['reason'], 409 );
+			}
+
+			// No answer on the pair's jobs: retryable, nothing made.
+			if ( $mt['unread'] ) {
+				return $this->error( 'translation_check_failed', $mt['warning'], 503 );
+			}
+
+			if ( $mt['queued'] ) {
+				\PerfLocale\Admin\MtCreateNotice::remember_warning( $id, $mt['warning'] );
+
+				return $this->success(
+					[
+						'post_id'   => null,
+						'edit_url'  => null,
+						'queued'    => true,
+						'mt_notice' => $mt['warning'],
+					],
+					202
+				);
+			}
+
+			if ( $mt['id'] > 0 ) {
+				$new_id  = $mt['id'];
+				$created = $mt['inserted'];
+			}
+		}
+
+		if ( false === $new_id ) {
+			$new_id = $manager->create_translation( $id, $target_lang, $copy, \PerfLocale\Enum\SourceType::Manual, $created );
+		}
 
 		if ( $new_id === false ) {
+			// A failed read of the existing translation is transient: busy, not broken.
+			if ( \PerfLocale\Translation\PostTranslationWrites::create_was_unread() ) {
+				return $this->error( 'translation_unreadable', __( 'The translation was not created: its existing translation could not be checked. Try again in a moment.', 'perflocale' ), 503 );
+			}
+
 			return $this->error( 'create_failed', __( 'Failed to create translation.', 'perflocale' ), 500 );
 		}
 
-		return $this->success( self::created_response( (int) $new_id, true === $created ), 201 );
+		$body = self::created_response( (int) $new_id, true === $created );
+
+		// Also on the translation's own screen, as after the classic panel's Create.
+		if ( null !== $mt && '' !== $mt['reason'] ) {
+			\PerfLocale\Admin\MtCreateNotice::remember( (int) $new_id, $mt['reason'], $mt['own'] );
+			$body['mt_notice'] = $mt['reason'];
+		} elseif ( null !== $mt && '' !== $mt['warning'] ) {
+			\PerfLocale\Admin\MtCreateNotice::remember_warning( (int) $new_id, $mt['warning'] );
+			$body['mt_notice'] = $mt['warning'];
+		}
+
+		return $this->success( $body, 201 );
+	}
+
+	/**
+	 * Whether $existing, the source's translation in a language, is one the current user may not view: every read
+	 * lists it as missing, so a write over it answers unavailable().
+	 *
+	 * @param int      $source_id Source.
+	 * @param int|null $existing  Linked translation, or null.
+	 * @return bool
+	 */
+	public static function hidden_translation( int $source_id, ?int $existing ): bool {
+		return null !== $existing && $existing > 0 && $existing !== $source_id && get_post( $existing ) instanceof \WP_Post && ! \PerfLocale\Helper::user_can_view_object( $existing );
+	}
+
+	/**
+	 * The refusal of a write whose copy source or sent post the user may not use: one the user may not view gets
+	 * source_unavailable(), naming none.
+	 *
+	 * @param int    $copy_from Copy source post.
+	 * @param string $lang      Target language slug.
+	 * @return \WP_Error 403.
+	 */
+	public static function source_refusal( int $copy_from, string $lang ): \WP_Error {
+		return \PerfLocale\Helper::user_can_view_object( $copy_from )
+			? new \WP_Error( 'source_forbidden', __( 'You need read and edit rights on the original this translation is copied from.', 'perflocale' ), [ 'status' => 403 ] )
+			: self::source_unavailable( $lang );
+	}
+
+	/**
+	 * The refusal of a write whose original (the post or term sent or copied) the user may not view: names none.
+	 *
+	 * @param string $lang Language slug.
+	 * @return \WP_Error 403.
+	 */
+	public static function source_unavailable( string $lang ): \WP_Error {
+		return new \WP_Error( 'translation_unavailable', self::source_unavailable_message( $lang ), [ 'status' => 403 ] );
+	}
+
+	/**
+	 * The text of source_refusal() for an original the user may not view: names no post.
+	 *
+	 * @param string $lang Language slug.
+	 * @return string
+	 */
+	public static function source_unavailable_message( string $lang ): string {
+		/* translators: %s: language code, for example DE */
+		return sprintf( __( 'The %s translation cannot be created or updated: you cannot open its original. Ask an editor who can open it.', 'perflocale' ), strtoupper( \PerfLocale\Helper::format_locale_as_bcp47( $lang ) ) );
+	}
+
+	/**
+	 * The one refusal of a write over a translation the user may not view (REST, Abilities, machine translation, jobs).
+	 *
+	 * @param string $lang Language slug.
+	 * @return \WP_Error 403, naming no object.
+	 */
+	public static function unavailable( string $lang ): \WP_Error {
+		return new \WP_Error( 'translation_unavailable', self::unavailable_message( $lang ), [ 'status' => 403 ] );
+	}
+
+	/**
+	 * The text of unavailable().
+	 *
+	 * @param string $lang Language slug.
+	 * @return string
+	 */
+	public static function unavailable_message( string $lang ): string {
+		/* translators: %s: language code, for example DE */
+		return sprintf( __( 'The %s translation cannot be created: this content has a translation you cannot open. Ask an editor who can open it.', 'perflocale' ), strtoupper( \PerfLocale\Helper::format_locale_as_bcp47( $lang ) ) );
 	}
 
 	/**
@@ -711,14 +875,26 @@ final class TranslationsController extends RestController {
 					return $this->error( 'already_assigned', __( 'This post already has a language assigned.', 'perflocale' ), 409 );
 				}
 
+				// A published post's URL before and after, for the editor's moved-URL notice.
+				$before = 'publish' === get_post_status( $id ) ? (string) get_permalink( $id ) : '';
+
 				if ( ! $manager->set_post_language( $id, $slug ) ) {
 					return $this->error( 'assign_failed', __( 'Failed to assign language.', 'perflocale' ), 500 );
 				}
+
+				// The link memos still hold the language from before the change.
+				\PerfLocale\Router\UrlConverter::reset_static_caches();
+
+				$after = '' !== $before ? (string) get_permalink( $id ) : '';
 
 				return $this->success(
 					[
 						'post_id' => $id,
 						'slug'    => $slug,
+						'moved'   => '' !== $after && $after !== $before ? [
+							'from' => $before,
+							'to'   => $after,
+						] : null,
 					],
 					200
 				);
@@ -754,7 +930,8 @@ final class TranslationsController extends RestController {
 		$manager       = $this->get_manager();
 		$translated_id = $manager->get_translation_id( $id, $lang );
 
-		if ( ! $translated_id ) {
+		// One the user may not open answers exactly as a missing one, as the map lists it.
+		if ( ! $translated_id || self::hidden_translation( $id, (int) $translated_id ) ) {
 			return $this->error( 'not_found', __( 'Translation not found.', 'perflocale' ), 404 );
 		}
 
@@ -764,6 +941,7 @@ final class TranslationsController extends RestController {
 		}
 
 		$update_data = [];
+		$status_obj  = null;
 
 		if ( $request->has_param( 'title' ) ) {
 			$update_data['post_title'] = \PerfLocale\Helper::sanitize_plain_text_field( $request->get_param( 'title' ) );
@@ -785,49 +963,10 @@ final class TranslationsController extends RestController {
 			// An unregistered status is ignored, not refused, and the other fields still apply (documented contract).
 			// is_object(), not instanceof stdClass, so a future WP_Post_Status class keeps the gates below.
 			if ( is_object( $status_obj ) ) {
-				// A status change is not an edit: publishing and trashing need their own capabilities, as on wp/v2/posts, mapped
-				// from the target's own post type (WP_REST_Posts_Controller::handle_status_param()). For the default language the
-				// target can be the source post itself.
-				$target_type = get_post_type_object( (string) get_post_type( $translated_id ) );
+				$refused = $this->status_refusal( (int) $translated_id, $requested_status, $status_obj );
 
-				if ( ! $target_type instanceof \WP_Post_Type ) {
-					return $this->error(
-						'invalid_status',
-						__( 'Unknown post type for this translation.', 'perflocale' ),
-						400
-					);
-				}
-
-				// Trash is a deletion: the gate of delete_translation().
-				if ( 'trash' === $requested_status && ! \PerfLocale\Helper::user_can_delete_object( (int) $translated_id ) ) {
-					return $this->error(
-						'rest_forbidden',
-						__( 'You cannot trash this translation.', 'perflocale' ),
-						403
-					);
-				}
-
-				// Editorial statuses only: never one core registers as `internal` (auto-draft is deleted by core's cleanup,
-				// inherit takes a parent's status). Trash is internal too but gated above.
-				if ( ! empty( $status_obj->internal ) && 'trash' !== $requested_status ) {
-					return $this->error(
-						'rest_forbidden',
-						__( 'That status cannot be set through this endpoint.', 'perflocale' ),
-						403
-					);
-				}
-
-				// Public, private or scheduled is a publish (`public` covers other plugins' statuses); draft and pending are not.
-				$is_publish_transition = ! empty( $status_obj->public )
-					|| ! empty( $status_obj->private )
-					|| 'future' === $requested_status;
-
-				if ( $is_publish_transition && ! current_user_can( $target_type->cap->publish_posts ) ) {
-					return $this->error(
-						'rest_forbidden',
-						__( 'You are not allowed to publish this translation.', 'perflocale' ),
-						403
-					);
+				if ( null !== $refused ) {
+					return $refused;
 				}
 
 				$update_data['post_status'] = $requested_status;
@@ -838,8 +977,43 @@ final class TranslationsController extends RestController {
 			$update_data['ID'] = $translated_id;
 			// An empty page_template keeps the stored one: a template the theme lacks would stop the save before its hooks.
 			$update_data['page_template'] = '';
-			// wp_update_post() unslashes and REST params arrive unslashed: without wp_slash every backslash is lost.
-			$result            = wp_update_post( wp_slash( $update_data ), true );
+			require_once __DIR__ . '/../MachineTranslation/SlugPin.php';
+
+			$rights = function () use ( $id, $translated_id, $update_data, $status_obj ): ?\WP_Error {
+				if ( self::hidden_translation( $id, (int) $translated_id ) ) {
+					return $this->error( 'not_found', __( 'Translation not found.', 'perflocale' ), 404 );
+				}
+
+				if ( ! \PerfLocale\Helper::user_can_edit_object( (int) $translated_id ) ) {
+					return $this->error( 'rest_forbidden', __( 'You cannot edit this translation.', 'perflocale' ), 403 );
+				}
+
+				return isset( $update_data['post_status'] ) && is_object( $status_obj ) ? $this->status_refusal( (int) $translated_id, (string) $update_data['post_status'], $status_obj ) : null;
+			};
+
+			$result = $this->pair_write(
+				$id,
+				$lang,
+				(int) $translated_id,
+				$rights,
+				static function () use ( $translated_id, $update_data ) {
+					// Core would rename a published translation whose slug a same-language draft holds; a publish keeps core's check.
+					$unpin = \PerfLocale\MachineTranslation\SlugPin::keep( (int) $translated_id );
+
+					try {
+						// wp_update_post() unslashes and REST params arrive unslashed: without wp_slash every backslash is lost.
+						return wp_update_post( wp_slash( $update_data ), true );
+					} finally {
+						$unpin();
+					}
+				}
+			);
+
+			[ $refused, $result ] = $result;
+
+			if ( null !== $refused ) {
+				return $refused;
+			}
 
 			if ( is_wp_error( $result ) ) {
 				// WordPress refusing the client's own status value is a 4xx, not a 5xx (a 5xx sends clients into retries);
@@ -889,7 +1063,8 @@ final class TranslationsController extends RestController {
 		$manager       = $this->get_manager();
 		$translated_id = $manager->get_translation_id( $id, $lang );
 
-		if ( ! $translated_id ) {
+		// One the user may not open answers exactly as a missing one, as the map lists it.
+		if ( ! $translated_id || self::hidden_translation( $id, (int) $translated_id ) ) {
 			return $this->error( 'not_found', __( 'Translation not found.', 'perflocale' ), 404 );
 		}
 
@@ -898,9 +1073,134 @@ final class TranslationsController extends RestController {
 			return $this->error( 'rest_forbidden', __( 'You cannot delete this translation.', 'perflocale' ), 403 );
 		}
 
-		wp_delete_post( $translated_id, true );
+		$rights = function () use ( $id, $translated_id ): ?\WP_Error {
+			if ( self::hidden_translation( $id, (int) $translated_id ) ) {
+				return $this->error( 'not_found', __( 'Translation not found.', 'perflocale' ), 404 );
+			}
+
+			return \PerfLocale\Helper::user_can_delete_object( (int) $translated_id ) ? null : $this->error( 'rest_forbidden', __( 'You cannot delete this translation.', 'perflocale' ), 403 );
+		};
+
+		[ $refused, $deleted ] = $this->pair_write( $id, $lang, (int) $translated_id, $rights, static fn() => wp_delete_post( (int) $translated_id, true ) );
+
+		if ( null !== $refused ) {
+			return $refused;
+		}
+
+		// Core answers false or null when it deleted nothing (a pre_delete_post refusal, a post gone meanwhile).
+		if ( ! $deleted instanceof \WP_Post ) {
+			return $this->error( 'translation_delete_failed', __( 'The translation was not deleted.', 'perflocale' ), 500 );
+		}
 
 		return $this->success( [ 'deleted' => true ] );
+	}
+
+	/**
+	 * Run a write to $source_id's $lang translation under the pair's creation lock, once the link read from the database
+	 * still names $translated_id and $rights (null: allowed) passes again; else nothing is written.
+	 *
+	 * @param int                    $source_id     Source named in the route.
+	 * @param string                 $lang          Language slug.
+	 * @param int                    $translated_id Translation the request looked up.
+	 * @param callable(): ?\WP_Error $rights        The object rights, checked again under the lock.
+	 * @param callable(): mixed      $write         The write; its result is returned.
+	 * @return array{0: \WP_Error|null, 1: mixed} The refusal (null when the write ran) and the write's result.
+	 */
+	private function pair_write( int $source_id, string $lang, int $translated_id, callable $rights, callable $write ): array {
+		$plugin  = \PerfLocale\Plugin::get_instance();
+		$found   = ( new \PerfLocale\Database\Repository\LanguageRepository( $plugin->cache() ) )->find_by_slug( $lang );
+		$lang_id = null === $found ? 0 : \PerfLocale\Util\Scalar::int( \PerfLocale\Util\Scalar::prop( $found, 'id' ) );
+		$groups  = new \PerfLocale\Database\Repository\TranslationGroupRepository( $plugin->cache() );
+
+		// The pair's creation lock, as PostTranslationWrites::create_translation() and CreationMark::recover_pair() name it.
+		$out = \PerfLocale\Concurrency\Lock::with(
+			'create_xlat_post_' . $source_id . '_' . $lang,
+			60,
+			function () use ( $source_id, $lang_id, $translated_id, $groups, $rights, $write ): array {
+				// The post row from the database too: rights and the write must not use this request's cached copy.
+				wp_cache_delete( $translated_id, 'posts' );
+
+				// From the table, right before the write: only Create takes this lock, other relinks none.
+				$link = $lang_id > 0 ? $groups->find_translation_link_uncached( $source_id, \PerfLocale\Enum\ObjectType::Post, $lang_id ) : false;
+
+				if ( false === $link ) {
+					return [ $this->error( 'translation_unreadable', __( 'The translation link could not be read, so nothing was changed. Please retry.', 'perflocale' ), 503 ), null ];
+				}
+
+				if ( null === $link || $link['object_id'] !== $translated_id || ! get_post( $translated_id ) instanceof \WP_Post ) {
+					return [ $this->error( 'translation_moved', __( 'This translation was relinked or removed meanwhile, so nothing was changed. Reload and try again.', 'perflocale' ), 409 ), null ];
+				}
+
+				$refused = $rights();
+
+				return null !== $refused ? [ $refused, null ] : [ null, $write() ];
+			}
+		);
+
+		if ( ! is_array( $out ) ) {
+			return [ $this->error( 'translation_busy', __( 'Another change to this translation is in progress. Please retry.', 'perflocale' ), 409 ), null ];
+		}
+
+		[ $refused, $result ] = $out + [ null, null ];
+
+		return [ $refused instanceof \WP_Error ? $refused : null, $result ];
+	}
+
+	/**
+	 * The refusal of a status change on a translation, or null: its own capabilities, as on wp/v2/posts.
+	 *
+	 * @param int    $translated_id    Translation post.
+	 * @param string $requested_status Registered status.
+	 * @param object $status_obj       Its status object.
+	 * @return \WP_Error|null
+	 */
+	private function status_refusal( int $translated_id, string $requested_status, object $status_obj ): ?\WP_Error {
+		// A status change is not an edit: publishing and trashing need their own capabilities, as on wp/v2/posts, mapped
+		// from the target's own post type (WP_REST_Posts_Controller::handle_status_param()). For the default language the
+		// target can be the source post itself.
+		$target_type = get_post_type_object( (string) get_post_type( $translated_id ) );
+
+		if ( ! $target_type instanceof \WP_Post_Type ) {
+			return $this->error(
+				'invalid_status',
+				__( 'Unknown post type for this translation.', 'perflocale' ),
+				400
+			);
+		}
+
+		// Trash is a deletion: the gate of delete_translation().
+		if ( 'trash' === $requested_status && ! \PerfLocale\Helper::user_can_delete_object( (int) $translated_id ) ) {
+			return $this->error(
+				'rest_forbidden',
+				__( 'You cannot trash this translation.', 'perflocale' ),
+				403
+			);
+		}
+
+		// Editorial statuses only: never one core registers as `internal` (auto-draft is deleted by core's cleanup,
+		// inherit takes a parent's status). Trash is internal too but gated above.
+		if ( ! empty( $status_obj->internal ) && 'trash' !== $requested_status ) {
+			return $this->error(
+				'rest_forbidden',
+				__( 'That status cannot be set through this endpoint.', 'perflocale' ),
+				403
+			);
+		}
+
+		// Public, private or scheduled is a publish (`public` covers other plugins' statuses); draft and pending are not.
+		$is_publish_transition = ! empty( $status_obj->public )
+			|| ! empty( $status_obj->private )
+			|| 'future' === $requested_status;
+
+		if ( $is_publish_transition && ! current_user_can( $target_type->cap->publish_posts ) ) {
+			return $this->error(
+				'rest_forbidden',
+				__( 'You are not allowed to publish this translation.', 'perflocale' ),
+				403
+			);
+		}
+
+		return null;
 	}
 
 	/**

@@ -83,10 +83,10 @@ final class MenuManager {
 	/**
 	 * Enqueue the Menu Language field and language-badges scripts on nav-menus.php.
 	 *
-	 * @param string $hook Current admin page hook suffix.
+	 * @param mixed $hook Current admin page hook suffix (mixed: iframe_header() passes null outside admin.php).
 	 * @return void
 	 */
-	public function enqueue_nav_menus_assets( string $hook ): void {
+	public function enqueue_nav_menus_assets( mixed $hook ): void {
 		if ( $hook !== 'nav-menus.php' ) {
 			return;
 		}

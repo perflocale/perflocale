@@ -198,9 +198,25 @@ final class SiteHealth {
 				'label' => __( 'PerfLocale string translation scale', 'perflocale' ),
 				'test'  => [ $this, 'test_string_mode_scale' ],
 			],
+			'perflocale_string_map_cache'   => [
+				'label' => __( 'PerfLocale string translations in the object cache', 'perflocale' ),
+				'test'  => [ $this, 'test_string_map_cache' ],
+			],
+			'perflocale_str_ident'          => [
+				'label' => __( 'PerfLocale string identity update', 'perflocale' ),
+				'test'  => [ $this, 'test_str_ident' ],
+			],
+			'perflocale_files_too_large'    => [
+				'label' => __( 'PerfLocale translation files for every language', 'perflocale' ),
+				'test'  => [ $this, 'test_string_files_memory' ],
+			],
 			'perflocale_rewrite_rules'     => [
 				'label' => __( 'PerfLocale rewrite rules', 'perflocale' ),
 				'test'  => [ $this, 'test_rewrite_rules' ],
+			],
+			'perflocale_url_bases'         => [
+				'label' => __( 'PerfLocale translated URL bases', 'perflocale' ),
+				'test'  => [ $this, 'test_url_bases' ],
 			],
 			'perflocale_multisite_hosts'    => [
 				'label' => __( 'PerfLocale multisite language hosts', 'perflocale' ),
@@ -289,6 +305,37 @@ final class SiteHealth {
 			],
 		];
 
+		// URL bases not in use: no test, no work.
+		if ( ! \PerfLocale\Router\UrlBases\LifecycleHooks::in_use() ) {
+			unset( $direct['perflocale_url_bases'] );
+		}
+
+		// Only with geo on: a real-IP module makes the Cloudflare header source fail silently.
+		$settings = Plugin::get_instance()->has( 'settings' ) ? Plugin::get_instance()->get( 'settings' ) : null;
+
+		if ( $settings instanceof \PerfLocale\Settings && (bool) $settings->get( 'redirect_geo_enabled' ) ) {
+			$direct['perflocale_geo_source'] = [
+				'label' => __( 'PerfLocale GeoIP header source', 'perflocale' ),
+				'test'  => [ $this, 'test_geo_source' ],
+			];
+		}
+
+		// Copies a stock change could not reach (StockDriftFlag), only while inventory sync runs; its class loads with the test.
+		if ( class_exists( 'WooCommerce' ) && ! \PerfLocale\WooCommerce\Api::ready() instanceof \WP_Error ) {
+			$direct['perflocale_stock_drift'] = [
+				'label' => __( 'PerfLocale stock across languages', 'perflocale' ),
+				'test'  => [ SiteHealthHooks::class, 'stock_drift' ],
+			];
+		}
+
+		// The legacy SQLite translator, checked as Resync\Store::legacy_sqlite() does without loading that class.
+		if ( defined( 'DB_ENGINE' ) && 'sqlite' === constant( 'DB_ENGINE' ) && class_exists( 'WP_SQLite_Translator', false ) ) {
+			$direct['perflocale_sqlite_driver'] = [
+				'label' => __( 'PerfLocale SQLite driver', 'perflocale' ),
+				'test'  => [ $this, 'test_sqlite_driver' ],
+			];
+		}
+
 		foreach ( $direct as $id => $entry ) {
 			$tests['direct'][ $id ] = $entry;
 		}
@@ -300,6 +347,32 @@ final class SiteHealth {
 			'test'              => self::LANGUAGE_PACKS_ACTION,
 			'has_rest'          => false,
 			'async_direct_test' => [ $this, 'test_language_packs' ],
+		];
+
+		require_once __DIR__ . '/SiteHealth/DuplicatePostSlugs.php';
+
+		$tests['async'][ SiteHealth\DuplicatePostSlugs::ID ] = [
+			'label'             => __( 'PerfLocale duplicate post addresses', 'perflocale' ),
+			'test'              => 'perflocale-duplicate-post-slugs',
+			'has_rest'          => false,
+			'async_direct_test' => [ SiteHealth\DuplicatePostSlugs::class, 'test' ],
+		];
+
+		require_once __DIR__ . '/SiteHealth/FallbackPages.php';
+
+		$tests['async'][ SiteHealth\FallbackPages::ID ] = [
+			'label'             => __( 'PerfLocale untranslated content', 'perflocale' ),
+			'test'              => 'perflocale-fallback-pages',
+			'has_rest'          => false,
+			'async_direct_test' => [ SiteHealth\FallbackPages::class, 'test' ],
+		];
+
+		// The action as a literal: the class loads only when the test runs.
+		$tests['async']['perflocale_term_slug_review'] = [
+			'label'             => __( 'PerfLocale term addresses', 'perflocale' ),
+			'test'              => 'perflocale-term-slug-review',
+			'has_rest'          => false,
+			'async_direct_test' => [ SiteHealthHooks::class, 'term_slug_review' ],
 		];
 
 		return $tests;
@@ -541,7 +614,7 @@ final class SiteHealth {
 					count( Schema::REQUIRED_TABLES )
 				),
 				$items,
-				esc_html__( 'This usually happens after restoring a backup from a time before the plugin was activated, when the database user lacks CREATE TABLE privileges, or when a migration was interrupted. Deactivate and reactivate the plugin to recreate them; existing data in the surviving tables is left alone.', 'perflocale' )
+				esc_html__( 'This usually happens after a site move or backup restore that left these tables out, when the database user lacks CREATE TABLE privileges, or when a migration was interrupted. Use Retry now on this screen or run wp perflocale db-migrate to create them; data in the other tables is kept.', 'perflocale' )
 			)
 		);
 	}
@@ -582,6 +655,43 @@ final class SiteHealth {
 			__( 'No default language is set', 'perflocale' ),
 			__( 'PerfLocale cannot resolve URLs without a default language. Add a language in PerfLocale → Languages and mark it as default.', 'perflocale' )
 		);
+	}
+
+	/**
+	 * GeoIP by Cloudflare header: the header arrives from a peer that is no Cloudflare address (read on this admin request).
+	 *
+	 * @return array<mixed>
+	 */
+	public function test_geo_source(): array {
+		$plugin   = Plugin::get_instance();
+		$settings = $plugin->has( 'settings' ) ? $plugin->get( 'settings' ) : null;
+		$router   = $plugin->has( 'router' ) ? $plugin->get( 'router' ) : null;
+
+		if (
+			$settings instanceof \PerfLocale\Settings && $router instanceof \PerfLocale\Router\LanguageRouter
+			&& ( new \PerfLocale\Router\GeoRedirect( $settings, $router ) )->cloudflare_header_untrusted()
+		) {
+			return $this->recommended(
+				'perflocale_geo_source',
+				__( 'The Cloudflare country header is ignored on this server', 'perflocale' ),
+				__( 'Cloudflare headers reach WordPress, but the connecting address is not a Cloudflare address, usually because a real-IP module (nginx real_ip_header, Apache mod_remoteip) replaced it with the visitor\'s. PerfLocale then trusts no CF-IPCountry header, so nobody is redirected by country. Pass the country to PHP as a server variable (for example GEOIP_COUNTRY_CODE) and choose the server GeoIP source, with the origin reachable only through Cloudflare.', 'perflocale' )
+			);
+		}
+
+		return $this->pass(
+			'perflocale_geo_source',
+			__( 'The GeoIP header source can be read', 'perflocale' ),
+			__( 'No Cloudflare header arrived from an untrusted address on this request.', 'perflocale' )
+		);
+	}
+
+	/**
+	 * Translated URL bases: suspended values, unverified routes, a pending update (body in UrlBases\Health).
+	 *
+	 * @return array<string, mixed>
+	 */
+	public function test_url_bases(): array {
+		return UrlBases\Health::test();
 	}
 
 	/**
@@ -672,11 +782,21 @@ final class SiteHealth {
 	 * resolves the host before any plugin loads, so an unregistered one never reaches PerfLocale. Resolved for real,
 	 * so domain mapping counts. Docs: docs-ai/11-code-rationale.md, "SiteHealth: language hostnames on multisite".
 	 *
-	 * @return array<string, mixed>
+	 * @return array<mixed>
 	 */
 	public function test_multisite_language_hosts(): array {
-		$id     = 'perflocale_multisite_hosts';
-		$report = self::language_host_report();
+		return $this->language_hosts_result( self::language_host_report() );
+	}
+
+	/**
+	 * The Site Health row for a language_host_report().
+	 *
+	 * @internal
+	 * @param array{applies:bool,mode:string,total:int,checked:array<int,string>,unresolved:array<int,string>,conflicts:array<string,int>,unknown:array<int,string>,label:string,description:string} $report language_host_report() output.
+	 * @return array<mixed>
+	 */
+	public function language_hosts_result( array $report ): array {
+		$id = 'perflocale_multisite_hosts';
 
 		if ( ! $report['applies'] ) {
 			return $this->pass( $id, $report['label'], $report['description'] );
@@ -686,30 +806,31 @@ final class SiteHealth {
 		$total     = $report['total'];
 		$probes    = $report['checked'];
 		$unchecked = $total - count( $probes );
+		$problems  = self::host_problems( $report );
 
-		if ( $report['unresolved'] !== [] ) {
-			$listed = [];
-
-			foreach ( $report['unresolved'] as $unresolved_host ) {
-				$listed[] = '<code>' . esc_html( $unresolved_host ) . '</code>';
-			}
-
+		if ( $report['unresolved'] !== [] || $report['conflicts'] !== [] ) {
 			return $this->critical(
 				$id,
-				__( 'Language hostnames are not registered in this network', 'perflocale' ),
-				sprintf(
-					/* translators: 1: URL mode label, 2: comma-separated list of hostnames */
-					esc_html__( 'PerfLocale is in %1$s URL mode and generates language hostnames this network cannot resolve: %2$s. On multisite, WordPress matches the requested hostname against the network\'s site list before any plugin loads, and none of these is registered there - a visitor following a translated link gets WordPress\'s "site does not exist" screen instead of a translation. Either add each hostname as a site in the network (and point its DNS or server alias at this install), or switch PerfLocale to subdirectory or query URL mode, which keep this site\'s hostname.', 'perflocale' ),
-					'<code>' . esc_html( $mode ) . '</code>',
-					implode( ', ', $listed )
-				) . self::unchecked_note( $unchecked ),
+				$report['unresolved'] !== []
+					? __( 'Language hostnames are not registered in this network', 'perflocale' )
+					: __( 'Language hostnames belong to other sites in this network', 'perflocale' ),
+				$problems . self::unchecked_paragraph( $unchecked ),
 				sprintf(
 					'<p><a href="%1$s">%2$s</a></p><p><a href="%3$s">%4$s</a></p>',
-					esc_url( network_admin_url( 'site-new.php' ) ),
-					esc_html__( 'Add a site to the network', 'perflocale' ),
+					esc_url( network_admin_url( 'sites.php' ) ),
+					esc_html__( 'Review the network\'s site list', 'perflocale' ),
 					esc_url( admin_url( 'admin.php?page=perflocale-settings&tab=url-routing' ) ),
 					esc_html__( 'Change the URL mode', 'perflocale' )
 				)
+			);
+		}
+
+		// A failed lookup is never reported as resolving.
+		if ( $report['unknown'] !== [] ) {
+			return $this->recommended(
+				$id,
+				__( 'Some language hostnames could not be checked', 'perflocale' ),
+				$problems . self::unchecked_paragraph( $unchecked )
 			);
 		}
 
@@ -767,6 +888,78 @@ final class SiteHealth {
 	}
 
 	/**
+	 * One paragraph per kind of language hostname problem in a language_host_report(); shared with the Settings screen.
+	 *
+	 * @param array{mode:string,unresolved:array<int,string>,conflicts:array<string,int>,unknown:array<int,string>} $report Report.
+	 * @return string HTML, or '' when every checked hostname reaches this site.
+	 */
+	public static function host_problems( array $report ): string {
+		$mode = '<code>' . esc_html( $report['mode'] ) . '</code>';
+		$out  = '';
+
+		if ( $report['unresolved'] !== [] ) {
+			$out .= '<p>' . sprintf(
+				/* translators: 1: URL mode label, 2: comma-separated list of hostnames */
+				esc_html__( 'PerfLocale is in %1$s URL mode and generates language hostnames this network cannot resolve: %2$s. On multisite, WordPress matches the requested hostname against the network\'s site list before any plugin loads, so a visitor following a translated link gets the "site does not exist" screen. Map each hostname to this site (a domain-mapping plugin or sunrise.php) and point its DNS at this install, or switch PerfLocale to subdirectory or query URL mode, which keep this site\'s hostname.', 'perflocale' ),
+				$mode,
+				self::code_list( $report['unresolved'] )
+			) . '</p>';
+		}
+
+		if ( $report['conflicts'] !== [] ) {
+			$listed = [];
+
+			foreach ( $report['conflicts'] as $host => $blog_id ) {
+				/* translators: 1: hostname, 2: site ID */
+				$listed[] = sprintf( esc_html__( '%1$s (site ID %2$d)', 'perflocale' ), '<code>' . esc_html( (string) $host ) . '</code>', $blog_id );
+			}
+
+			$out .= '<p>' . sprintf(
+				/* translators: 1: URL mode label, 2: comma-separated list of hostnames with their site IDs */
+				esc_html__( 'PerfLocale is in %1$s URL mode and generates language hostnames that belong to other sites in this network: %2$s. WordPress loads those sites there, not this one, so translated links and hreflang tags point at them. Map each hostname to this site (a domain-mapping plugin or sunrise.php) instead, or switch PerfLocale to subdirectory or query URL mode.', 'perflocale' ),
+				$mode,
+				implode( ', ', $listed )
+			) . '</p>';
+		}
+
+		if ( $report['unknown'] !== [] ) {
+			$out .= '<p>' . sprintf(
+				/* translators: %s: comma-separated list of hostnames */
+				esc_html__( 'The site lookup failed for these language hostnames, so they are not reported as resolving: %s. Reload this screen; if it fails again, check the database error log.', 'perflocale' ),
+				self::code_list( $report['unknown'] )
+			) . '</p>';
+		}
+
+		return $out;
+	}
+
+	/**
+	 * Hostnames as a comma-separated list of escaped code elements.
+	 *
+	 * @param array<int, string> $hosts Hostnames.
+	 */
+	private static function code_list( array $hosts ): string {
+		$listed = [];
+
+		foreach ( $hosts as $host ) {
+			$listed[] = '<code>' . esc_html( $host ) . '</code>';
+		}
+
+		return implode( ', ', $listed );
+	}
+
+	/**
+	 * The unchecked_note() sentence as its own paragraph.
+	 *
+	 * @param int $unchecked How many hostnames were left unprobed.
+	 */
+	private static function unchecked_paragraph( int $unchecked ): string {
+		$note = self::unchecked_note( $unchecked );
+
+		return $note === '' ? '' : '<p>' . ltrim( $note ) . '</p>';
+	}
+
+	/**
 	 * The sentence naming how many hostnames the run did not check.
 	 *
 	 * @param int $unchecked How many hostnames were left unprobed.
@@ -795,12 +988,12 @@ final class SiteHealth {
 	 * Resolve every language hostname of this URL mode against the network's sites and report what was looked at;
 	 * shared with the Settings screen's URL-mode warning (the mode breaks a network at save time).
 	 *
-	 * @return array{applies:bool,mode:string,total:int,checked:array<int,string>,unresolved:array<int,string>,label:string,description:string}
+	 * @return array{applies:bool,mode:string,total:int,checked:array<int,string>,unresolved:array<int,string>,conflicts:array<string,int>,unknown:array<int,string>,label:string,description:string}
 	 *         `applies` false means there is nothing to resolve, and `label` /
 	 *         `description` carry the reason; otherwise `total` counts every
-	 *         DISTINCT hostname generated, `checked` lists the ones actually
-	 *         probed (at most MAX_HOST_PROBES of them) and `unresolved` the
-	 *         subset of THOSE with no site row.
+	 *         DISTINCT hostname generated, `checked` lists the ones probed (at
+	 *         most MAX_HOST_PROBES) and, of those, `unresolved` has no site,
+	 *         `conflicts` maps to another site's blog_id, `unknown` failed.
 	 */
 	public static function language_host_report(): array {
 		$report = [
@@ -809,6 +1002,8 @@ final class SiteHealth {
 			'total'       => 0,
 			'checked'     => [],
 			'unresolved'  => [],
+			'conflicts'   => [],
+			'unknown'     => [],
 			'label'       => '',
 			'description' => '',
 		];
@@ -899,7 +1094,7 @@ final class SiteHealth {
 			$report['label']       = __( 'No language-specific hostnames are generated', 'perflocale' );
 			$report['description'] = sprintf(
 				/* translators: %s: URL mode label */
-				esc_html__( 'PerfLocale is in %s URL mode but this site generates no language-specific hostname, so there is nothing for the network to resolve. In domain mode that also means every language shares one hostname - set a domain per language on the URL & Routing settings tab if that is not intended.', 'perflocale' ),
+				esc_html__( 'PerfLocale is in %s URL mode but this site generates no language-specific hostname, so there is nothing for the network to resolve. With per-language domains that also means every language shares one hostname - set the per-language domains under PerfLocale > Settings > URL & Routing if that is not intended.', 'perflocale' ),
 				'<code>' . esc_html( $mode ) . '</code>'
 			);
 
@@ -916,16 +1111,47 @@ final class SiteHealth {
 		$site_path    = ( $current_site !== null && $current_site->path !== '' ) ? $current_site->path : '/';
 
 		foreach ( array_keys( $probes ) as $target ) {
-			$target              = (string) $target;
-			$report['checked'][] = $target;
+			$report['checked'][] = (string) $target;
+		}
+
+		return array_merge( $report, self::resolve_language_hosts( $report['checked'], $site_path ) );
+	}
+
+	/**
+	 * Look up each language hostname as ms-settings.php would; only this site's own blog_id counts as resolved.
+	 *
+	 * @param array<int, string> $hosts     Hostnames (authority) to look up.
+	 * @param string             $site_path This site's path in wp_blogs.
+	 * @return array{unresolved:array<int,string>,conflicts:array<string,int>,unknown:array<int,string>}
+	 */
+	public static function resolve_language_hosts( array $hosts, string $site_path ): array {
+		$found = [
+			'unresolved' => [],
+			'conflicts'  => [],
+			'unknown'    => [],
+		];
+
+		$wpdb = Typed::wpdb();
+		$own  = get_current_blog_id();
+
+		foreach ( $hosts as $host ) {
+			$queries = $wpdb->num_queries;
 
 			// The call ms_load_current_site_and_network() makes, filters included, so a mapped domain resolves here too.
-			if ( empty( get_site_by_path( $target, $site_path ) ) ) {
-				$report['unresolved'][] = $target;
+			$site = get_site_by_path( $host, $site_path );
+
+			// A lookup whose own query failed proves nothing either way (a cached answer runs no query).
+			if ( $own < 1 || ( $wpdb->num_queries > $queries && '' !== $wpdb->last_error ) ) {
+				$found['unknown'][] = $host;
+			} elseif ( ! $site instanceof \WP_Site ) {
+				$found['unresolved'][] = $host;
+			} elseif ( (int) $site->blog_id !== $own ) {
+				// ms-settings.php loads that site for the host, so this site's translated links land there.
+				$found['conflicts'][ $host ] = (int) $site->blog_id;
 			}
 		}
 
-		return $report;
+		return $found;
 	}
 
 	/**
@@ -1471,29 +1697,14 @@ final class SiteHealth {
 			);
 		}
 
-		$sync = new \PerfLocale\WooCommerce\ExchangeRateSync( $settings );
-
-		if ( ! $sync->is_stale() ) {
-			$last = (array) get_option( \PerfLocale\WooCommerce\ExchangeRateSync::LAST_SYNC_OPTION, [] );
-			$ts   = (int) ( $last['timestamp'] ?? 0 );
-
-			return $this->pass(
-				'perflocale_fx_staleness',
-				__( 'Exchange rates are up to date', 'perflocale' ),
-				$ts > 0
-					? sprintf(
-						/* translators: 1: human-readable time diff, 2: absolute timestamp in site locale + timezone */
-						esc_html__( 'Last synced %1$s ago (%2$s).', 'perflocale' ),
-						esc_html( human_time_diff( $ts ) ),
-						esc_html( wp_date( get_option( 'date_format' ) . ' ' . get_option( 'time_format' ) . ' T', $ts ) )
-					)
-					: esc_html__( 'Last sync timestamp unavailable but no staleness detected.', 'perflocale' )
-			);
-		}
-
-		$last      = (array) get_option( \PerfLocale\WooCommerce\ExchangeRateSync::LAST_SYNC_OPTION, [] );
-		$ts        = (int) ( $last['timestamp'] ?? 0 );
-		$last_sync = $ts > 0
+		$sync       = new \PerfLocale\WooCommerce\ExchangeRateSync( $settings );
+		$base       = (string) get_option( 'woocommerce_currency', '' );
+		$currencies = (array) $settings->get( 'wc_currencies', [] );
+		$last       = (array) get_option( \PerfLocale\WooCommerce\ExchangeRateSync::LAST_SYNC_OPTION, [] );
+		$ts         = (int) ( $last['timestamp'] ?? 0 );
+		$unpriced   = self::fx_unpriced( $currencies, get_option( \PerfLocale\WooCommerce\ExchangeRateSync::RATES_OPTION, [] ), $last, $base );
+		$stale      = $sync->is_stale();
+		$last_sync  = $ts > 0
 			? sprintf(
 				/* translators: 1: human-readable time diff (e.g. "2 hours"), 2: absolute timestamp formatted in site's locale + timezone */
 				__( '%1$s ago (%2$s)', 'perflocale' ),
@@ -1502,51 +1713,25 @@ final class SiteHealth {
 			)
 			: __( 'never', 'perflocale' );
 
-		// No rate source: every sync aborts before the network, a different remedy than WP-Cron.
-		if ( ! $sync->has_rate_source() ) {
-			// Red only when money is affected: a non-base currency charged at the base number. Docs:
-			// docs-ai/11-code-rationale.md, "SiteHealth: exchange-rate severity".
-			$base       = (string) get_option( 'woocommerce_currency', '' );
-			$currencies = (array) $settings->get( 'wc_currencies', [] );
-			$foreign    = [];
-
-			foreach ( $currencies as $slug => $data ) {
-				if ( ! is_array( $data ) ) {
-					continue;
-				}
-
-				$code = (string) ( $data['currency_code'] ?? '' );
-				$rate = (float) ( $data['exchange_rate'] ?? 1.0 );
-
-				// A money defect needs all three: a non-base currency, no pinned manual rate, and a stored rate still 1.0 (a
-				// hand-entered rate converts through MultiCurrency's stored-rate fallback).
-				if (
-					'' !== $code
-					&& '' !== $base
-					&& $code !== $base
-					&& empty( $data['manual_rate'] )
-					&& ( $rate <= 0.0 || abs( $rate - 1.0 ) < 0.000001 )
-				) {
-					$foreign[ $code ] = true;
-				}
-			}
-
-			if ( [] !== $foreign ) {
+		// No rate source: every sync aborts before the network, a different remedy than WP-Cron. Red only when a
+		// language has no price (docs-ai/11-code-rationale.md, "SiteHealth: exchange-rate severity").
+		if ( $stale && ! $sync->has_rate_source() ) {
+			if ( [] !== $unpriced ) {
 				return $this->critical(
 					'perflocale_fx_staleness',
-					__( 'Foreign-currency prices are being charged at the wrong rate', 'perflocale' ),
+					__( 'Some languages have no exchange rate', 'perflocale' ),
 					sprintf(
 						'<p>%1$s</p><p>%2$s</p>',
 						sprintf(
 							/* translators: 1: comma-separated currency codes, 2: the store's base currency, 3: time since last sync. */
-							esc_html__( 'Automatic exchange-rate sync is on but no rate source is configured, and %1$s are priced against a %2$s base with no manual rate set. Those prices are being charged at the base-currency figure - a %2$s amount taken as though it were the customer\'s currency (last sync: %3$s).', 'perflocale' ),
-							'<code>' . esc_html( implode( ', ', array_keys( $foreign ) ) ) . '</code>',
+							esc_html__( 'Automatic exchange-rate sync is on but no rate source is configured, and %1$s have no synced or manual rate. Their languages show prices in %2$s until they have one (last sync: %3$s).', 'perflocale' ),
+							'<code>' . esc_html( implode( ', ', $unpriced ) ) . '</code>',
 							'<code>' . esc_html( $base ) . '</code>',
 							'<code>' . esc_html( $last_sync ) . '</code>'
 						),
 						sprintf(
 							/* translators: 1: providers filter name, 2: rates filter name */
-							esc_html__( 'No rate provider ships with the plugin. Register one with the %1$s filter, supply rates directly with the %2$s filter, set a manual rate per language in the currency settings, or turn auto-sync off.', 'perflocale' ),
+							esc_html__( 'Select the European Central Bank as the rate provider, register one with the %1$s filter, supply rates directly with the %2$s filter, set a manual rate per language in the currency settings, or turn auto-sync off.', 'perflocale' ),
 							'<code>perflocale/woocommerce/exchange_rate_providers</code>',
 							'<code>perflocale/woocommerce/exchange_rates_fetched</code>'
 						)
@@ -1559,7 +1744,7 @@ final class SiteHealth {
 				__( 'No exchange-rate source is configured', 'perflocale' ),
 				sprintf(
 					/* translators: 1: time since last sync, 2: providers filter name, 3: rates filter name */
-					esc_html__( 'Automatic exchange-rate sync is on, but no rate source is configured, so rates cannot update (last sync: %1$s). Nothing is mispriced right now because no language is set to a currency other than the store base, but adding one would be. No provider ships with the plugin: register one with the %2$s filter, supply rates directly with the %3$s filter, or turn auto-sync off in the currency settings.', 'perflocale' ),
+					esc_html__( 'Automatic exchange-rate sync is on, but no rate source is configured, so rates cannot update (last sync: %1$s). Nothing is mispriced right now because no language is set to a currency other than the store base, but adding one would be. Select the European Central Bank as the rate provider, register one with the %2$s filter, supply rates directly with the %3$s filter, or turn auto-sync off in the currency settings.', 'perflocale' ),
 					'<code>' . esc_html( $last_sync ) . '</code>',
 					'<code>perflocale/woocommerce/exchange_rate_providers</code>',
 					'<code>perflocale/woocommerce/exchange_rates_fetched</code>'
@@ -1567,19 +1752,295 @@ final class SiteHealth {
 			);
 		}
 
-		return $this->recommended(
-			'perflocale_fx_staleness',
-			__( 'Exchange rates are stale', 'perflocale' ),
-			sprintf(
-				/* translators: %s: time since last sync */
-				esc_html__( 'Exchange rates have not been updated recently (last sync: %s). Check that WP-Cron is running, or sync manually from the currency settings.', 'perflocale' ),
-				'<code>' . esc_html( $last_sync ) . '</code>'
+		// The sync's own reason (an unpublished currency, a source failure), when newer than the last good sync.
+		$error = get_option( 'perflocale_exchange_rate_last_error', [] );
+		$error = is_array( $error ) && is_string( $error['message'] ?? null ) && (int) ( $error['timestamp'] ?? 0 ) >= $ts
+			? ' ' . sprintf(
+				/* translators: %s: the message the last exchange-rate sync stored. */
+				esc_html__( 'Last sync error: %s', 'perflocale' ),
+				esc_html( $error['message'] )
 			)
+			: '';
+
+		if ( [] !== $unpriced ) {
+			return $this->critical(
+				'perflocale_fx_staleness',
+				__( 'Some languages have no exchange rate', 'perflocale' ),
+				sprintf(
+					/* translators: 1: comma-separated currency codes, 2: the store's base currency. */
+					esc_html__( 'The rate source gave no rate for %1$s and none has a manual rate, so their languages show prices in %2$s. Tick Manual and set a rate for each in the currency settings, or choose a rate source that publishes them.', 'perflocale' ),
+					'<code>' . esc_html( implode( ', ', $unpriced ) ) . '</code>',
+					'<code>' . esc_html( $base ) . '</code>'
+				) . $error
+			);
+		}
+
+		if ( $stale ) {
+			return $this->recommended(
+				'perflocale_fx_staleness',
+				__( 'Exchange rates are stale', 'perflocale' ),
+				sprintf(
+					/* translators: %s: time since last sync */
+					esc_html__( 'Exchange rates have not been updated recently (last sync: %s). Check that WP-Cron is running, or sync manually from the currency settings.', 'perflocale' ),
+					'<code>' . esc_html( $last_sync ) . '</code>'
+				) . $error
+			);
+		}
+
+		$uncovered = self::fx_uncovered( $currencies, $last, $base );
+
+		if ( $uncovered !== [] ) {
+			return $this->recommended(
+				'perflocale_fx_staleness',
+				__( 'Some currencies get no rate from the rate source', 'perflocale' ),
+				sprintf(
+					/* translators: %s: comma-separated currency codes. */
+					esc_html__( 'The last exchange-rate sync returned no rate for %s, so their prices use a rate that sync does not update. Tick Manual and set a rate for each in the currency settings, or choose a rate source that publishes them.', 'perflocale' ),
+					'<code>' . esc_html( implode( ', ', $uncovered ) ) . '</code>'
+				)
+			);
+		}
+
+		return $this->pass(
+			'perflocale_fx_staleness',
+			__( 'Exchange rates are up to date', 'perflocale' ),
+			$ts > 0
+				? sprintf(
+					/* translators: 1: human-readable time diff, 2: absolute timestamp in site locale + timezone */
+					esc_html__( 'Last synced %1$s ago (%2$s).', 'perflocale' ),
+					esc_html( human_time_diff( $ts ) ),
+					esc_html( wp_date( get_option( 'date_format' ) . ' ' . get_option( 'time_format' ) . ' T', $ts ) )
+				)
+				: esc_html__( 'Last sync timestamp unavailable but no staleness detected.', 'perflocale' )
 		);
 	}
 
 	/**
-	 * Recommend files mode when database mode's per-language whole-map blob (all_string_translations_{lang}) gets large
+	 * Synced (non-manual, non-base) currencies the last sync reply had no usable rate for.
+	 *
+	 * @param mixed        $currencies wc_currencies.
+	 * @param array<mixed> $last       ExchangeRateSync::LAST_SYNC_OPTION.
+	 * @param mixed        $base       Store currency.
+	 * @return array<int, string>
+	 */
+	public static function fx_uncovered( mixed $currencies, array $last, mixed $base ): array {
+		$replied = $last['rates'] ?? null;
+		$replied = is_array( $replied ) ? $replied : [];
+		$codes   = [];
+
+		foreach ( is_array( $currencies ) ? $currencies : [] as $data ) {
+			if ( ! is_array( $data ) || ! empty( $data['manual_rate'] ) ) {
+				continue;
+			}
+
+			$code = $data['currency_code'] ?? '';
+
+			// A rejected value (AED => -1) is no rate: the check do_sync_rates() applies.
+			if ( is_string( $code ) && $code !== '' && $code !== $base && null === \PerfLocale\WooCommerce\MultiCurrency::usable_rate( $replied[ $code ] ?? null ) ) {
+				$codes[ $code ] = true;
+			}
+		}
+
+		return array_keys( $codes );
+	}
+
+	/**
+	 * Currencies the storefront does not price: auto-sync on, not manual, no synced rate, the 1.0 placeholder.
+	 *
+	 * Mirrors MultiCurrency::load_currencies(); the caller checks that auto-sync is on.
+	 *
+	 * @param mixed        $currencies wc_currencies.
+	 * @param mixed        $rates      ExchangeRateSync::RATES_OPTION.
+	 * @param array<mixed> $last       ExchangeRateSync::LAST_SYNC_OPTION.
+	 * @param string       $base       Store currency.
+	 * @return array<int, string>
+	 */
+	public static function fx_unpriced( mixed $currencies, mixed $rates, array $last, string $base ): array {
+		$codes = [];
+
+		foreach ( is_array( $currencies ) ? $currencies : [] as $slug => $data ) {
+			if ( ! is_array( $data ) || empty( $data['currency_code'] ) || ! empty( $data['manual_rate'] ) ) {
+				continue;
+			}
+
+			$code = sanitize_text_field( (string) $data['currency_code'] );
+			$rate = \PerfLocale\WooCommerce\MultiCurrency::usable_rate( $data['exchange_rate'] ?? 1.0 ) ?? 1.0;
+
+			if ( $code !== $base && 1.0 === $rate && null === \PerfLocale\WooCommerce\MultiCurrency::synced_rate( $rates, $last, sanitize_key( (string) $slug ), $code, $base ) ) {
+				$codes[ $code ] = true;
+			}
+		}
+
+		return array_keys( $codes );
+	}
+
+	/**
+	 * The string identity update (phase and progress, stalled, unverified and held rows, locales over the
+	 * files cap), each with one next step.
+	 *
+	 * @return array<string, mixed>
+	 */
+	public function test_str_ident(): array {
+		$id     = 'perflocale_str_ident';
+		$status = \PerfLocale\Strings\StrIdentMigration::status();
+		$scan   = sprintf( '<p><a href="%s" class="button">%s</a></p>', esc_url( admin_url( 'admin.php?page=perflocale-strings' ) ), esc_html__( 'Open the Strings screen', 'perflocale' ) );
+
+		if ( $status['stalled'] ) {
+			return $this->recommended(
+				$id,
+				__( 'The string identity update stopped', 'perflocale' ),
+				/* translators: 1: rows checked, 2: last string id. */
+				esc_html( sprintf( __( 'The update of stored string identities has checked %1$d of %2$d strings and is not scheduled. Run wp perflocale db-migrate, or deactivate and activate PerfLocale to queue it again.', 'perflocale' ), $status['checked_id'], $status['last_id'] ) )
+			);
+		}
+
+		// Unverified rows are counted from the first batch on, so the count and Scan now show while P1 runs too.
+		$actions = \PerfLocale\Admin\StrIdentNotice::scan_form() . $scan;
+
+		if ( 'done' !== $status['phase'] && $status['unverified_n'] > 0 ) {
+			return $this->recommended(
+				$id,
+				__( 'PerfLocale is updating stored string identities', 'perflocale' ),
+				/* translators: 1: rows checked, 2: last string id. */
+				esc_html( sprintf( __( 'Checked %1$d of %2$d strings; the update continues in the background.', 'perflocale' ), $status['checked_id'], $status['last_id'] ) . ' ' . \PerfLocale\Admin\StrIdentNotice::sentence( $status['unverified_n'] ) ),
+				$actions
+			);
+		}
+
+		if ( 'done' !== $status['phase'] ) {
+			return $this->build(
+				$id,
+				'good',
+				__( 'PerfLocale is updating stored string identities', 'perflocale' ),
+				/* translators: 1: rows checked, 2: last string id. */
+				esc_html( sprintf( __( 'Checked %1$d of %2$d strings. Translations are served during the update; it continues in the background.', 'perflocale' ), $status['checked_id'], $status['last_id'] ) )
+			);
+		}
+
+		$notes = [];
+
+		if ( $status['unverified_n'] > 0 ) {
+			$notes[] = \PerfLocale\Admin\StrIdentNotice::sentence( $status['unverified_n'] );
+		}
+
+		if ( $status['held_n'] > 0 ) {
+			/* translators: %d: number of strings. */
+			$notes[] = sprintf( _n( '%d string has a twin with its own translations; both are kept: review them on the Strings screen.', '%d strings have a twin with its own translations; both are kept: review them on the Strings screen.', $status['held_n'], 'perflocale' ), $status['held_n'] );
+		}
+
+		if ( [] !== $status['over_cap'] ) {
+			/* translators: %s: comma-separated locales. */
+			$notes[] = sprintf( __( 'Files mode: these locales have more than 200 domain files and are served from the combined bundle, which the next regeneration writes: %s.', 'perflocale' ), implode( ', ', $status['over_cap'] ) );
+		}
+
+		if ( [] === $notes ) {
+			return $this->build( $id, 'good', __( 'Stored string identities are up to date', 'perflocale' ), esc_html__( 'Every stored string uses the current identity.', 'perflocale' ) );
+		}
+
+		return $this->recommended( $id, __( 'Some stored strings need a scan or a review', 'perflocale' ), esc_html( implode( ' ', $notes ) ), $status['unverified_n'] > 0 ? $actions : $scan );
+	}
+
+	/**
+	 * Whether the object cache refused a language's string map in the last day (a sized cache such as Memcached's
+	 * 1 MB item limit); database mode then rebuilds it on every page view. Reads only the flag CacheDiagnostics leaves.
+	 *
+	 * @return array<string, mixed>
+	 */
+	public function test_string_map_cache(): array {
+		$id     = 'perflocale_string_map_cache';
+		$plugin = Plugin::get_instance();
+		$mode   = $plugin->has( 'settings' ) ? \PerfLocale\Util\Scalar::str( $plugin->settings()->get( 'string_translation_mode', 'files' ) ) : 'files';
+
+		if ( 'database' !== $mode ) {
+			return $this->build(
+				$id,
+				'good',
+				__( 'Files mode keeps no string translation map in the object cache', 'perflocale' ),
+				esc_html__( 'Files mode builds no string translation map, so the object cache has none to refuse.', 'perflocale' )
+			);
+		}
+
+		require_once __DIR__ . '/../Cache/CacheDiagnostics.php';
+		$flag = \PerfLocale\Cache\CacheDiagnostics::refused_string_map();
+
+		if ( null === $flag ) {
+			return $this->build(
+				$id,
+				'good',
+				__( 'No string translation map was refused by the object cache', 'perflocale' ),
+				esc_html__( 'The object cache has not refused a string translation map in the last day.', 'perflocale' )
+			);
+		}
+
+		$language_id = (int) substr( $flag['key'], strlen( 'all_str2_translations_' ) );
+		$repo        = $plugin->get( 'lang_repo' );
+		$language    = $language_id > 0 && method_exists( $repo, 'find' ) ? $repo->find( $language_id ) : null;
+		$name        = \PerfLocale\Util\Scalar::str( \PerfLocale\Util\Scalar::prop( $language, 'native_name' ) );
+		$name        = '' !== $name ? $name : \PerfLocale\Util\Scalar::str( \PerfLocale\Util\Scalar::prop( $language, 'name' ) );
+		$name        = '' !== $name ? $name : sprintf( /* translators: %d: language id */ __( 'language %d', 'perflocale' ), $language_id );
+
+		$actions = sprintf(
+			'<p><a href="%s" class="button button-primary">%s</a></p>',
+			esc_url( admin_url( 'admin.php?page=perflocale-settings&tab=performance' ) ),
+			esc_html__( 'Open PerfLocale performance settings', 'perflocale' )
+		);
+
+		return $this->recommended(
+			$id,
+			__( 'The object cache refused the string translations of a language', 'perflocale' ),
+			sprintf(
+				/* translators: 1: date and time, 2: language name, 3: number of entries */
+				esc_html__( 'On %1$s the object cache refused to store the string translations for %2$s (a map of %3$s entries), so database mode loads them from the database on every page view in that language. A cache with a size limit per item (Memcached: 1 MB) refuses a large map. Switching the string translation mode to files mode serves them from compiled files, with no size limit.', 'perflocale' ),
+				esc_html( (string) wp_date( \PerfLocale\Util\Scalar::str( get_option( 'date_format' ) ) . ' ' . \PerfLocale\Util\Scalar::str( get_option( 'time_format' ) ), $flag['time'] ) ),
+				esc_html( $name ),
+				esc_html( number_format_i18n( $flag['entries'] ) )
+			),
+			$actions
+		);
+	}
+
+	/**
+	 * Files mode: the languages whose translation files a run could not build (it stopped inside them, most likely
+	 * out of memory) and now skips until their size or the memory limit changes.
+	 *
+	 * @return array<string, mixed>
+	 */
+	public function test_string_files_memory(): array {
+		$id     = 'perflocale_files_too_large';
+		$plugin = Plugin::get_instance();
+
+		// Database mode builds no files: the entry is left for a return to files mode, where it still applies.
+		if ( $plugin->has( 'settings' ) && 'files' !== \PerfLocale\Util\Scalar::str( $plugin->settings()->get( 'string_translation_mode', 'files' ) ) ) {
+			return $this->build( $id, 'good', __( 'String translation mode is not file-based', 'perflocale' ), esc_html__( 'Strings resolve directly from the database - no compiled files to keep in sync.', 'perflocale' ) );
+		}
+
+		$generator = \PerfLocale\Strings\TranslationFileGenerator::class;
+		$state     = get_option( $generator::TOO_LARGE_OPTION, [] );
+		$big       = is_array( $state ) && is_array( $state['too_large'] ?? null ) ? $state['too_large'] : [];
+		$running   = is_array( $state ) && is_array( $state['running'] ?? null ) ? $state['running'] : [];
+
+		// A language a run died inside: the next run records it; until then the free lock tells it from one still building.
+		if ( [] !== $running && time() - \PerfLocale\Util\Scalar::int( $running[3] ?? 0 ) > $generator::RUN_STALE_AFTER && 0 === \PerfLocale\Concurrency\Lock::seconds_remaining( $generator::LOCK ) ) {
+			$big[ \PerfLocale\Util\Scalar::str( $running[0] ?? '' ) ] = [ $running[1] ?? 0, $running[2] ?? '' ];
+		}
+
+		if ( [] === $big ) {
+			return $this->build( $id, 'good', __( 'Translation files are built for every language', 'perflocale' ), esc_html__( 'No language was too large to build its translation files.', 'perflocale' ) );
+		}
+
+		// The limit each run had: a Site Health request runs with the admin limit, often higher.
+		$limits = array_unique( array_map( static fn( $entry ): string => is_array( $entry ) ? \PerfLocale\Util\Scalar::str( $entry[1] ?? '' ) : '', $big ) );
+
+		return $this->recommended(
+			$id,
+			__( 'Some languages are too large for their translation files', 'perflocale' ),
+			/* translators: 1: comma-separated locales, 2: PHP memory limit. */
+			esc_html( sprintf( __( 'Building the translation files stopped inside %1$s, most likely out of memory (PHP memory limit %2$s), so those languages are skipped and keep their earlier files. Raise the PHP memory limit, or set String Translation Mode to the database (Settings > Performance).', 'perflocale' ), implode( ', ', array_map( 'strval', array_keys( $big ) ) ), implode( ', ', array_filter( $limits ) ) ) )
+		);
+	}
+
+	/**
+	 * Recommend files mode when database mode's per-language whole-map blob (all_str2_translations_{lang}) gets large
 	 * enough to cost every request memory and CPU; never switched automatically. Docs: docs-ai/11-code-rationale.md,
 	 * "SiteHealth: string mode and translation files".
 	 *
@@ -1922,6 +2383,19 @@ final class SiteHealth {
 	}
 
 	/**
+	 * The SQLite Database Integration's legacy driver (2.2.x without its AST driver), listed only while it runs.
+	 *
+	 * @return array<string, mixed>
+	 */
+	public function test_sqlite_driver(): array {
+		return $this->critical(
+			'perflocale_sqlite_driver',
+			__( 'PerfLocale needs a newer SQLite Database Integration', 'perflocale' ),
+			__( 'This site runs the legacy driver of the SQLite Database Integration plugin, on which some PerfLocale database updates and saves fail, string translations among them. Update the SQLite Database Integration plugin to version 3 or newer.', 'perflocale' )
+		);
+	}
+
+	/**
 	 * Does the stored `perflocale_db_version` match PERFLOCALE_DB_VERSION? A mismatch means activation did not finish
 	 * or a migration is pending.
 	 *
@@ -1941,11 +2415,29 @@ final class SiteHealth {
 			);
 		}
 
+		// An identified cause has its own fix: deactivating repeats the same refused change.
+		$identified = $stored < $expected ? UpgradeNotice::identified_schema_failure() : '';
+
+		if ( '' !== $identified ) {
+			return $this->critical(
+				'perflocale_db_version',
+				__( 'A pending database migration was not applied', 'perflocale' ),
+				esc_html(
+					sprintf(
+						/* translators: 1: stored version, 2: expected version */
+						__( 'Stored schema version %1$d is behind the expected version %2$d.', 'perflocale' ),
+						$stored,
+						$expected
+					) . ' ' . $identified
+				)
+			);
+		}
+
 		if ( $stored === 0 ) {
 			return $this->critical(
 				'perflocale_db_version',
 				__( 'Database schema has never been installed', 'perflocale' ),
-				__( 'The `perflocale_db_version` option is missing. This usually means the activation hook did not run. Deactivate and reactivate the plugin to create the tables and stamp the version.', 'perflocale' )
+				__( 'The `perflocale_db_version` option is missing or 0: the activation did not run, or the database did not build every table, column and index. Deactivate and reactivate the plugin, or run `wp perflocale db-migrate`, to create them and stamp the version.', 'perflocale' )
 			);
 		}
 
@@ -3196,6 +3688,9 @@ final class SiteHealth {
 
 		// Nothing writes this key; deleting it removes an upgraded site's leftover row.
 		delete_transient( self::MT_SCORING_TRANSIENT );
+
+		// The fallback count (SiteHealth/FallbackPages.php, not loaded here).
+		delete_option( 'perflocale_fallback_counts' );
 	}
 
 	/**
@@ -3300,7 +3795,7 @@ final class SiteHealth {
 
 	/**
 	 * Report webhook deliveries given up on (exhausted retries, refused by the delivery-time safety check) in the last
-	 * 24 hours, from the log WebhookController::record_failure() writes; nothing else reads it, so this keeps a dropped
+	 * 24 hours, from the log Webhook\Delivery::record_failure() writes; nothing else reads it, so this keeps a dropped
 	 * event visible. Docs: docs-ai/11-code-rationale.md, "SiteHealth: cron and stuck checks".
 	 *
 	 * @return array<string, mixed>

@@ -1123,7 +1123,7 @@ final class TemplateBlockRefs {
 			]
 		);
 
-		return isset( $queued['job_id'] ) && is_string( $queued['job_id'] ) && '' !== $queued['job_id'];
+		return '' !== ( $queued['job_id'] ?? '' );
 	}
 
 	/**

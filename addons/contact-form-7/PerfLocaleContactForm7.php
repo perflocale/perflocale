@@ -17,6 +17,11 @@ if ( ! defined( 'ABSPATH' ) ) {
 final class PerfLocaleContactForm7 implements \PerfLocale\Addon\AddonInterface {
 
 	/**
+	 * Minimum Contact Form 7 version: hash embeds and the `_hash` meta.
+	 */
+	private const MIN_VERSION = '5.8';
+
+	/**
 	 * {@inheritDoc}
 	 */
 	public function get_id(): string {
@@ -48,7 +53,8 @@ final class PerfLocaleContactForm7 implements \PerfLocale\Addon\AddonInterface {
 	 * {@inheritDoc}
 	 */
 	public function is_compatible(): bool {
-		return defined( 'WPCF7_VERSION' );
+		// A version string only ("6.foo" passes version_compare()); a pre-release suffix such as -beta1 is allowed.
+		return defined( 'WPCF7_VERSION' ) && is_string( WPCF7_VERSION ) && preg_match( '/^\d+(\.\d+)+(-[0-9A-Za-z.]+)?$/D', WPCF7_VERSION ) && version_compare( WPCF7_VERSION, self::MIN_VERSION, '>=' );
 	}
 
 	/**
@@ -77,36 +83,20 @@ final class PerfLocaleContactForm7 implements \PerfLocale\Addon\AddonInterface {
 				[ 'context' => 'contact-form-7' ]
 			);
 
-			add_action( 'admin_enqueue_scripts', [ $this, 'enqueue_panel_styles' ] );
+			// CF7 fires this on load-<page> of its own screens; their hook suffix follows CF7's menu layout and title.
+			add_action( 'wpcf7_admin_load', [ $this, 'on_cf7_admin_load' ] );
 		}
 	}
 
 	/**
-	 * Load the panel's stylesheet on Contact Form 7's form editor.
+	 * Hand CF7's screen load to the editor-screen class, loaded only on CF7's screens.
 	 *
-	 * Reuses the metabox handle, so Helper's `perflocale*` pass adds the RTL twin.
-	 *
-	 * @param string $hook_suffix Current admin page's hook suffix.
+	 * @param mixed $page CF7 admin page slug (the `page` query argument).
 	 * @return void
 	 */
-	public function enqueue_panel_styles( string $hook_suffix ): void {
-		// CF7 pins this screen id itself; the Add New suffix comes from the localised menu title, so it is not matched.
-		if ( $hook_suffix !== 'toplevel_page_wpcf7' ) {
-			return;
-		}
-
-		// The same screen id serves the form list, where no panel renders.
-		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Reads which screen is open; changes nothing.
-		if ( absint( $_GET['post'] ?? 0 ) <= 0 ) {
-			return;
-		}
-
-		wp_enqueue_style(
-			'perflocale-metabox',
-			PERFLOCALE_URL . 'assets/css/metabox.css',
-			[],
-			PERFLOCALE_VERSION
-		);
+	public function on_cf7_admin_load( mixed $page ): void {
+		require_once __DIR__ . '/PerfLocaleContactForm7Screen.php';
+		\PerfLocaleContactForm7Screen::on_load( $page );
 	}
 
 	/**

@@ -16,6 +16,8 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
+require_once __DIR__ . '/StockChangeLock.php';
+
 /**
  * "Check stock" (StockCheckJob), "Align" one group and "Align all" (StockAlignJob), inline or as polled jobs.
  * Loaded only on its own ajax actions and the settings tab. Every action checks the
@@ -48,6 +50,7 @@ final class StockAlignScreen {
 	public static function register(): void {
 		add_action( 'wp_ajax_perflocale_wc_stock_check', [ self::class, 'ajax_check' ] );
 		add_action( 'wp_ajax_perflocale_wc_stock_status', [ self::class, 'ajax_status' ] );
+		add_action( 'wp_ajax_perflocale_wc_stock_align', [ self::class, 'ajax_align' ] );
 	}
 
 	/**
@@ -67,7 +70,7 @@ final class StockAlignScreen {
 				<?php else : ?>
 					<?php self::enqueue(); ?>
 					<div class="perflocale-wc-stock" data-perflocale-wc-stock="<?php echo esc_attr( (string) wp_json_encode( self::client_data() ) ); ?>">
-						<p class="description"><?php echo esc_html__( 'Lists products whose language copies hold different stock. Copies set to "Independent across languages" or that do not manage stock are left out.', 'perflocale' ); ?></p>
+						<p class="description"><?php echo esc_html__( 'Lists products whose language copies hold different stock, and sets them to the stock of the default-language copy. Copies set to "Independent across languages" or that do not manage stock are left out.', 'perflocale' ); ?></p>
 						<p class="perflocale-wc-stock__actions">
 							<button type="button" class="button perflocale-wc-stock__check"><?php echo esc_html__( 'Check stock', 'perflocale' ); ?></button>
 						</p>
@@ -149,7 +152,12 @@ final class StockAlignScreen {
 	 * @return void
 	 */
 	public static function ajax_align(): void {
-		$sync = self::guard();
+		$sync     = self::guard();
+		$no_locks = Api::lock_unavailable();
+
+		if ( null !== $no_locks ) {
+			self::fail( $no_locks->get_error_message(), 409 );
+		}
 
 		// phpcs:disable WordPress.Security.NonceVerification.Missing -- Nonce checked in guard().
 		$scope = isset( $_POST['scope'] ) && is_string( $_POST['scope'] ) ? sanitize_key( wp_unslash( $_POST['scope'] ) ) : '';
@@ -390,10 +398,18 @@ final class StockAlignScreen {
 		$aligning = max( 0, $drifting - $skipped );
 		[ $names, $default ] = self::languages();
 
+		$refreshed = array_values( array_filter( array_map( [ self::class, 'int_of' ], is_array( $result['refreshed'] ?? null ) ? $result['refreshed'] : [] ) ) );
+		$refresh   = [] === $refreshed ? '' : ' ' . sprintf(
+			/* translators: 1: number of products and variations, 2: their ids. */
+			_n( 'Stock status and shop data refreshed for %1$d copy: %2$s.', 'Stock status and shop data refreshed for %1$d copies: %2$s.', count( $refreshed ), 'perflocale' ),
+			count( $refreshed ),
+			'#' . implode( ', #', $refreshed )
+		);
+
 		if ( 0 === $drifting ) {
 			return [
 				'kind'    => 'check',
-				'summary' => __( 'All language copies hold the same stock.', 'perflocale' ),
+				'summary' => __( 'All language copies hold the same stock.', 'perflocale' ) . $refresh,
 				'groups'  => [],
 			];
 		}
@@ -436,11 +452,11 @@ final class StockAlignScreen {
 				/* translators: %d: number of products and variations. */
 				_n( '%d product or variation has language copies with different stock.', '%d products or variations have language copies with different stock.', $drifting, 'perflocale' ),
 				$drifting
-			),
+			) . $refresh,
 			'more'     => $drifting > count( $groups )
 				? sprintf(
 					/* translators: 1: number listed, 2: number found. */
-					__( 'Showing the first %1$d of %2$d. For the full list, run wp perflocale stock-drift.', 'perflocale' ),
+					__( 'Showing the first %1$d of %2$d. "Align all" includes every one of them. For the full list, run wp perflocale stock-drift.', 'perflocale' ),
 					count( $groups ),
 					$drifting
 				)
@@ -451,7 +467,7 @@ final class StockAlignScreen {
 				$aligning,
 				$copies
 			),
-			'canAlign' => false,
+			'canAlign' => $aligning > 0 && StockChangeLock::available(),
 			'columns'  => $columns,
 			'groups'   => $rows,
 		];
@@ -510,7 +526,7 @@ final class StockAlignScreen {
 				__( 'Align %s to the default language', 'perflocale' ),
 				'' !== $name ? $name : '#' . $anchor
 			),
-			'alignable'  => false,
+			'alignable'  => '' === $code,
 			'reason'     => '' === $code ? '' : StockDriftAlign::reason( $code ),
 		];
 	}

@@ -42,10 +42,22 @@ final class XliffImporter {
 	public const MAX_ATTRIBUTES = 64;
 
 	/**
-	 * Mark on a translation an import creates, "<source id>:<target slug>:<time>", written with the insert, extended by
-	 * ":<row fingerprint>" when the insert ends, removed when create_translation() returns: recover_creation() reads it.
+	 * Mark on a translation an import creates: \PerfLocale\Translation\CreationMark::KEY, as a literal so reading a
+	 * constant here does not load that class.
 	 */
 	public const CREATING_META_KEY = '_perflocale_xliff_creating';
+
+	/** CreationMark recovery outcomes as report causes. */
+	private const RECOVERY_CAUSES = [
+		'stopped'       => XliffImportErrors::RECOVERY_STOPPED_DRAFT,
+		'trashed'       => XliffImportErrors::RECOVERY_TRASHED,
+		'not_trashed'   => XliffImportErrors::RECOVERY_NOT_TRASHED,
+		'edited'        => XliffImportErrors::RECOVERY_EDITED_DRAFT,
+		'cannot_delete' => XliffImportErrors::RECOVERY_CANNOT_DELETE,
+		'left'          => XliffImportErrors::RECOVERY_LEFT_DRAFT,
+		'unchecked'     => XliffImportErrors::RECOVERY_UNCHECKED,
+		'guid_pending'  => XliffImportErrors::RECOVERY_GUID_PENDING,
+	];
 
 	/**
 	 * With a message limit, most bytes the kept messages take as JSON: the job result holding them is capped at 64 KB.
@@ -204,13 +216,22 @@ final class XliffImporter {
 
 			$report = new XliffImportErrors();
 
+			$open = [];
+
 			// A resumed run's first post may have been stopped inside the creation of its translation; a translation
 			// edited since keeps its text.
-			if ( null !== $resumed && $i === $start && ! self::recover_creation( $manager, $posts[ $i ][0], $target_slug, $posts[ $i ][1], $report ) ) {
+			if ( null !== $resumed && $i === $start && ! self::recover_creation( $manager, $posts[ $i ][0], $target_slug, $posts[ $i ][1], $report, $open ) ) {
 				[ $imported, $skipped ] = [ 0, count( $posts[ $i ][1] ) ];
 			} else {
 				// A resumed run's first post may have been saved before the stop: an identical save is skipped.
-				[ $imported, $skipped ] = $this->apply_post( $posts[ $i ][1], $target_slug, $manager, $report, null !== $resumed && $i === $start );
+				[ $imported, $skipped ] = $this->apply_post( $posts[ $i ][1], $target_slug, $manager, $report, null !== $resumed && $i === $start, $open );
+			}
+
+			// A creation whose copy failed again kept its mark until its post was done, so a stop before here redoes the copy.
+			foreach ( $open as $id => $mark ) {
+				if ( current_user_can( 'edit_post', $id ) ) {
+					delete_post_meta( $id, self::CREATING_META_KEY, $mark );
+				}
 			}
 
 			$state['imported'] += $imported;
@@ -306,16 +327,18 @@ final class XliffImporter {
 	/**
 	 * Apply one source post's units: the checks per unit, then one wp_update_post() of its target translation.
 	 *
-	 * @param array<int, \DOMElement> $units       The post's units, in file order.
-	 * @param string                  $target_slug Target language slug.
-	 * @param \PerfLocale\Translation\PostTranslationManager $manager Writes through it.
-	 * @param XliffImportErrors       $report      Collects the units not applied.
-	 * @param bool                    $skip_same   No save when the translation already holds every value.
+	 * @param array<int, \DOMElement>                        $units       The post's units, in file order.
+	 * @param string                                         $target_slug Target language slug.
+	 * @param \PerfLocale\Translation\PostTranslationManager $manager     Writes through it.
+	 * @param XliffImportErrors                              $report      Collects the units not applied.
+	 * @param bool                                           $skip_same   No save when the translation already holds every value.
+	 * @param array<int, string>                             $open        Kept creation marks by translation, resealed after its save.
 	 * @return array{0: int, 1: int} Units imported and units skipped.
 	 */
-	private function apply_post( array $units, string $target_slug, \PerfLocale\Translation\PostTranslationManager $manager, XliffImportErrors $report, bool $skip_same ): array {
+	private function apply_post( array $units, string $target_slug, \PerfLocale\Translation\PostTranslationManager $manager, XliffImportErrors $report, bool $skip_same, array &$open = [] ): array {
 		$skipped   = 0;
 		$target_id = 0;
+		$bind      = null;
 		/** @var array{post_title?: string, post_content?: string, post_excerpt?: string} $fields Unslashed, sanitised values. */
 		$fields = [];
 		/** @var array<string, int> $held Unit ids applied, each mapped to the post ID it names. */
@@ -373,7 +396,9 @@ final class XliffImporter {
 			$translated_text = implode( '', $parts );
 
 			// The unit id is the SOURCE post; verify it exists.
-			if ( ! get_post( $post_id ) ) {
+			$source_post = get_post( $post_id );
+
+			if ( ! $source_post ) {
 				if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
 					error_log( sprintf( 'PerfLocale XLIFF import: source post %d not found.', $post_id ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
 				}
@@ -394,8 +419,13 @@ final class XliffImporter {
 				// Check the copy source, not only the post the unit names.
 				$copy_from = $manager->get_copy_source_id( $post_id, $target_slug );
 
-				if ( $copy_from > 0 && $copy_from !== $post_id && ! \PerfLocale\Helper::user_can_copy_translation_source( $copy_from ) ) {
-					$report->add( XliffImportErrors::CANNOT_EDIT_COPY_SOURCE, $post_id, $unit_id, $copy_from );
+				if ( $copy_from > 0 && ! \PerfLocale\Helper::user_can_copy_translation_source( $copy_from ) ) {
+					// A copy source the user may not open is named nowhere.
+					if ( \PerfLocale\Helper::user_can_view_object( $copy_from ) ) {
+						$report->add( XliffImportErrors::CANNOT_EDIT_COPY_SOURCE, $post_id, $unit_id, $copy_from );
+					} else {
+						$report->add( XliffImportErrors::COPY_SOURCE_UNAVAILABLE, $post_id, $unit_id );
+					}
 					continue;
 				}
 
@@ -405,7 +435,15 @@ final class XliffImporter {
 					continue;
 				}
 
-				$created = self::create_marked( $manager, $post_id, $target_slug );
+				$recovered = [];
+				$created   = \PerfLocale\Translation\CreationMark::create( $manager, $post_id, $target_slug, true, \PerfLocale\Enum\SourceType::Manual, $was_created, $recovered );
+
+				// A stopped import's draft of this pair, recovered first.
+				foreach ( $recovered as $draft => $outcome ) {
+					$report->add( self::RECOVERY_CAUSES[ $outcome ] ?? XliffImportErrors::RECOVERY_KEPT_DRAFT, $post_id, $unit_id, (int) $draft );
+				}
+
+				\PerfLocale\Translation\CreationMark::acknowledge( $post_id, $target_slug );
 
 				if ( $created === false ) {
 					// Logged whatever WP_DEBUG says: the reported error points here.
@@ -419,7 +457,11 @@ final class XliffImporter {
 
 			// Permission is checked on the TARGET post being written.
 			if ( ! current_user_can( 'edit_post', $target_id ) ) {
-				$report->add( XliffImportErrors::CANNOT_EDIT_TRANSLATION, $post_id, $unit_id, $target_id );
+				if ( \PerfLocale\Helper::user_can_view_object( $target_id ) ) {
+					$report->add( XliffImportErrors::CANNOT_EDIT_TRANSLATION, $post_id, $unit_id, $target_id );
+				} else {
+					$report->add( XliffImportErrors::TRANSLATION_UNAVAILABLE, $post_id, $unit_id );
+				}
 				continue;
 			}
 
@@ -430,18 +472,27 @@ final class XliffImporter {
 					break;
 
 				case 'content':
-					// WordPress's trust model: unfiltered_html users get a lossless round trip, everyone else the MT allowlist
-					// (wp_update_post() applies kses by capability too).
+				case 'excerpt':
+					// A file is third-party text: markup the source's unit does not hold byte for byte must be inside the MT
+					// allowlist, else the unit is refused and named. Then the user's rules: as given with unfiltered_html,
+					// else the MT allowlist (wp_update_post() applies kses by capability too).
+					$writers = null;
+					$checked = 'content' === $field ? self::outside_protected( $translated_text, $source_post, $writers ) : $translated_text;
+
+					if ( self::adds_markup( $checked, self::trusted_source( $source_post ) ? (string) ( 'content' === $field ? $source_post->post_content : $source_post->post_excerpt ) : '' ) ) {
+						$report->add( XliffImportErrors::UNSAFE_MARKUP, $post_id, $unit_id );
+						continue 2;
+					}
+
+					if ( 'excerpt' === $field ) {
+						$fields['post_excerpt'] = current_user_can( 'unfiltered_html' ) ? $translated_text : \PerfLocale\MachineTranslation\TranslationService::sanitize_mt_html( $translated_text );
+						break;
+					}
+
+					$bind                   = null === $writers ? null : [ $post_id, $writers ];
 					$fields['post_content'] = current_user_can( 'unfiltered_html' )
 						? $translated_text
 						: \PerfLocale\Translation\ProtectedUnits::sanitize_around( $translated_text, $post_id, [ \PerfLocale\MachineTranslation\TranslationService::class, 'sanitize_mt_html' ] );
-					break;
-
-				case 'excerpt':
-					// As content: an excerpt can carry markup (WooCommerce's `<p>` short description).
-					$fields['post_excerpt'] = current_user_can( 'unfiltered_html' )
-						? $translated_text
-						: \PerfLocale\MachineTranslation\TranslationService::sanitize_mt_html( $translated_text );
 					break;
 			}
 
@@ -459,7 +510,39 @@ final class XliffImporter {
 			$postarr['ID']            = $target_id;
 			$postarr['page_template'] = '';
 
-			$result = wp_update_post( wp_slash( $postarr ), true );
+			// Kept protected bytes the check accepted on the source's writers' trust stay bound to those writers.
+			if ( null !== $bind ) {
+				\PerfLocale\MachineTranslation\ProtectedBlockSave::bind_writers( $bind[0], $bind[1] );
+			}
+
+			// A kept mark follows this save's row once it is written, before the save_post listeners run (and after them, below).
+			$reseal = isset( $open[ $target_id ] ) ? static function ( mixed $post_id ) use ( $target_id, &$open ): void {
+				if ( is_numeric( $post_id ) && (int) $post_id === $target_id && isset( $open[ $target_id ] ) ) {
+					$open[ $target_id ] = \PerfLocale\Translation\CreationMark::reseal( $target_id, $open[ $target_id ] );
+				}
+			} : null;
+
+			if ( null !== $reseal ) {
+				add_action( 'post_updated', $reseal, PHP_INT_MIN, 1 );
+			}
+
+			// Core would rename a published translation whose slug a same-language draft holds.
+			require_once __DIR__ . '/../MachineTranslation/SlugPin.php';
+			$unpin = \PerfLocale\MachineTranslation\SlugPin::keep( $target_id );
+
+			try {
+				$result = wp_update_post( wp_slash( $postarr ), true );
+			} finally {
+				$unpin();
+
+				if ( null !== $reseal ) {
+					remove_action( 'post_updated', $reseal, PHP_INT_MIN );
+				}
+
+				if ( null !== $bind ) {
+					\PerfLocale\MachineTranslation\ProtectedBlockSave::bind_writers( $bind[0], null );
+				}
+			}
 
 			if ( is_wp_error( $result ) ) {
 				// Logged whatever WP_DEBUG says: the reported error points here.
@@ -478,127 +561,129 @@ final class XliffImporter {
 			\PerfLocale\Translation\TemplateBlockRefs::content_replaced( $target_id );
 		}
 
+		// A kept mark fingerprints the row this save left, so a stop before the caller drops it redoes the copy, not "edited".
+		if ( isset( $open[ $target_id ] ) ) {
+			$open[ $target_id ] = \PerfLocale\Translation\CreationMark::reseal( $target_id, $open[ $target_id ] );
+		}
+
 		return [ count( $held ), $skipped ];
 	}
 
 	/**
-	 * Create the translation with CREATING_META_KEY on the new post (written with the insert, sealed when the insert
-	 * ends) until create_translation() returns.
+	 * Whether the source post's markup counts as kept by the file (least trust: SourceTrust).
 	 *
-	 * @param \PerfLocale\Translation\PostTranslationManager $manager     Manager.
-	 * @param int                                            $source_id   Source post.
-	 * @param string                                         $target_slug Target language slug.
-	 * @return int|false As create_translation().
+	 * @param \WP_Post $post Source post.
+	 * @return bool
 	 */
-	private static function create_marked( \PerfLocale\Translation\PostTranslationManager $manager, int $source_id, string $target_slug ): int|false {
-		$mark = $source_id . ':' . $target_slug . ':' . time();
-		$held = $mark;
-		$add  = static function ( $data, $for_source = 0, $for_slug = '' ) use ( $source_id, $target_slug, $mark ) {
-			if ( is_array( $data ) && $for_source === $source_id && $for_slug === $target_slug ) {
-				$data['meta_input']                            = is_array( $data['meta_input'] ?? null ) ? $data['meta_input'] : [];
-				$data['meta_input'][ self::CREATING_META_KEY ] = $mark;
-			}
+	private static function trusted_source( \WP_Post $post ): bool {
+		require_once __DIR__ . '/../Translation/SourceTrust.php';
 
-			return $data;
-		};
-
-		// The row as the insert left it: recovery completes only a linked row still equal to it.
-		$seal = static function ( $post_id, $post = null, $update = false ) use ( $mark, &$held ): void {
-			$id = is_numeric( $post_id ) ? (int) $post_id : 0;
-
-			if ( $update || $held !== $mark || $id <= 0 || get_post_meta( $id, self::CREATING_META_KEY, true ) !== $mark ) {
-				return;
-			}
-
-			$row = self::stored_row( $id );
-
-			if ( null !== $row && update_post_meta( $id, self::CREATING_META_KEY, $mark . ':' . self::fingerprint( $row ), $mark ) ) {
-				$held = $mark . ':' . self::fingerprint( $row );
-			}
-		};
-
-		add_filter( 'perflocale/translation/post_data', $add, PHP_INT_MAX, 3 );
-		add_action( 'wp_after_insert_post', $seal, PHP_INT_MAX, 3 );
-
-		try {
-			$created = $manager->create_translation( $source_id, $target_slug, true );
-		} finally {
-			remove_filter( 'perflocale/translation/post_data', $add, PHP_INT_MAX );
-			remove_action( 'wp_after_insert_post', $seal, PHP_INT_MAX );
-		}
-
-		if ( false !== $created ) {
-			delete_post_meta( $created, self::CREATING_META_KEY, $held );
-		}
-
-		return $created;
+		return \PerfLocale\Translation\SourceTrust::trusted( (int) $post->ID );
 	}
 
 	/**
-	 * A creation of this source's translation a stopped worker left (CREATING_META_KEY older than a lease): linked, its
-	 * copy steps run again, only on a row equal to the sealed one and with the rights the creation needed; otherwise it is
-	 * kept (and the mark too when a right is missing) and reported. An unlinked draft is always kept, and reported to a
-	 * user who may edit the source.
+	 * The text with each block byte-identical to one of the source's protected units (ProtectedUnits rules) masked, when
+	 * the source's author and last editor have `unfiltered_html`: those bytes are the source's, not the file's.
+	 *
+	 * @param string               $text    Imported content.
+	 * @param \WP_Post             $source  Source post.
+	 * @param array{int, int}|null $writers Set to the writers checked when a block was masked; the save binds them.
+	 * @return string
+	 */
+	private static function outside_protected( string $text, \WP_Post $source, ?array &$writers ): string {
+		require_once __DIR__ . '/../Translation/SourceTrust.php';
+
+		$writers = null;
+		$checked = \PerfLocale\Translation\BlockSkipFilter::may_have_marker( $text ) ? \PerfLocale\Translation\SourceTrust::writers( (int) $source->ID ) : null;
+		$units   = \PerfLocale\Translation\SourceTrust::trusted_writers( $checked, 0 ) ? \PerfLocale\Translation\ProtectedUnits::of_source( (string) $source->post_content ) : [];
+		$spans   = [] === $units ? [] : \PerfLocale\Translation\ProtectedUnits::spans( $text, $units );
+
+		if ( [] === $spans ) {
+			return $text;
+		}
+
+		$writers = $checked;
+
+		return \PerfLocale\Translation\ProtectedUnits::splice( $text, $spans, static fn(): string => '<!-- perflocale-hold-' . wp_generate_uuid4() . ' -->' )[0];
+	}
+
+	/**
+	 * Whether an imported text adds markup outside the MT allowlist or a script construct the source's text lacks.
+	 *
+	 * @param string $text   Imported text.
+	 * @param string $source The source post's stored text.
+	 * @return bool
+	 */
+	private static function adds_markup( string $text, string $source ): bool {
+		if ( ! str_contains( $text, '<' ) ) {
+			return false;
+		}
+
+		require_once __DIR__ . '/../MachineTranslation/HeldMarkup.php';
+
+		return \PerfLocale\MachineTranslation\HeldMarkup::adds_markup( $text, $source ) || [] !== \PerfLocale\Resync\WriteTripwire::added( [ $text ], [ $source ] );
+	}
+
+	/**
+	 * A creation of this source's translation a stopped worker left linked (CREATING_META_KEY older than a lease): its
+	 * copy steps run again while its row is unchanged, with the creation's rights; else reported. An unlinked draft is
+	 * left to CreationMark (recovered by the pair's next creation).
 	 *
 	 * @param \PerfLocale\Translation\PostTranslationManager $manager     Manager.
 	 * @param int                                            $source_id   Source post.
 	 * @param string                                         $target_slug Target language slug.
 	 * @param array<int, \DOMElement>                        $units       The post's units, named in a report.
 	 * @param XliffImportErrors                              $report      Collects what was kept.
+	 * @param array<int, string>                             $open        Set to translation => mark kept because its copy
+	 *                                                                    failed twice; the caller drops it after the post.
 	 * @return bool False when the post's units must not be applied: its translation was edited since.
 	 */
-	private static function recover_creation( \PerfLocale\Translation\PostTranslationManager $manager, int $source_id, string $target_slug, array $units, XliffImportErrors $report ): bool {
-		global $wpdb;
-
-		if ( ! $wpdb instanceof \wpdb ) {
-			return true;
-		}
-
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- One indexed read, on the first post of a resumed import only.
-		$rows   = $wpdb->get_results( $wpdb->prepare( 'SELECT m.post_id, m.meta_value, p.post_status FROM %i m INNER JOIN %i p ON p.ID = m.post_id WHERE m.meta_key = %s AND m.meta_value LIKE %s', $wpdb->postmeta, $wpdb->posts, self::CREATING_META_KEY, $wpdb->esc_like( $source_id . ':' . $target_slug . ':' ) . '%' ), ARRAY_A );
-		$prefix = $source_id . ':' . $target_slug . ':';
-		$apply  = true;
-		$note   = static function ( string $cause, int $id ) use ( $report, $units, $source_id ): void {
+	private static function recover_creation( \PerfLocale\Translation\PostTranslationManager $manager, int $source_id, string $target_slug, array $units, XliffImportErrors $report, array &$open = [] ): bool {
+		$apply = true;
+		$note  = static function ( string $cause, int $id, string $detail = '' ) use ( $report, $units, $source_id ): void {
 			foreach ( $units as $unit ) {
-				$report->add( $cause, $source_id, $unit->getAttribute( 'id' ), $id );
+				$report->add( $cause, $source_id, $unit->getAttribute( 'id' ), $id, $detail );
 			}
 		};
 
-		foreach ( is_array( $rows ) ? $rows : [] as $row ) {
-			$id   = is_numeric( $row['post_id'] ?? null ) ? (int) $row['post_id'] : 0;
-			$mark = is_string( $row['meta_value'] ?? null ) ? $row['meta_value'] : '';
-			$seal = explode( ':', substr( $mark, strlen( $prefix ) ), 2 );
-			$time = (int) $seal[0];
+		// The stopped creation's unlinked draft, also when the pair was linked since; left for a user who may edit the source.
+		$drafts = current_user_can( 'edit_post', $source_id ) ? \PerfLocale\Translation\CreationMark::recover_pair( $source_id, $target_slug ) : [];
 
-			// Younger than a lease: a live import's.
-			if ( $id <= 0 || $time <= 0 || time() - $time < \PerfLocale\Background\JobResume::LEASE ) {
+		foreach ( $drafts as $draft => $outcome ) {
+			$note( self::RECOVERY_CAUSES[ $outcome ] ?? XliffImportErrors::RECOVERY_KEPT_DRAFT, (int) $draft );
+		}
+
+		\PerfLocale\Translation\CreationMark::acknowledge( $source_id, $target_slug );
+
+		foreach ( \PerfLocale\Translation\CreationMark::stale( $source_id, $target_slug ) as $row ) {
+			$id = $row['id'];
+
+			if ( (int) $manager->get_translation_id( $source_id, $target_slug ) !== $id ) {
 				continue;
 			}
 
-			if ( (int) $manager->get_translation_id( $source_id, $target_slug ) === $id ) {
-				if ( ! self::may_finish( $manager, $source_id, $id ) ) {
-					$note( XliffImportErrors::RECOVERY_CANNOT_FINISH, $id );
+			if ( ! self::may_finish( $manager, $source_id, $id ) ) {
+				$note( XliffImportErrors::RECOVERY_CANNOT_FINISH, $id );
+				continue;
+			}
+
+			if ( \PerfLocale\Translation\CreationMark::unchanged( $id, $row['seal'] ) ) {
+				// One retry: a second failure is reported and the copy warning stays on the translation.
+				$failed = self::complete_creation( $manager, $id, $source_id, $target_slug );
+				$failed = null === $failed ? null : self::complete_creation( $manager, $id, $source_id, $target_slug );
+
+				if ( null !== $failed ) {
+					$note( XliffImportErrors::RECOVERY_COPY_FAILED, $id, \PerfLocale\Translation\CopyFailureWatch::items( $failed ) );
+					$open[ $id ] = $row['mark'];
 					continue;
 				}
-
-				if ( self::unchanged( $id, $seal[1] ?? '' ) ) {
-					self::complete_creation( $manager, $id, $source_id, $target_slug );
-				} else {
-					$note( XliffImportErrors::RECOVERY_EDITED_TRANSLATION, $id );
-					$apply = false;
-				}
-			} elseif ( null === $manager->detect_post_language( $id ) && in_array( $row['post_status'] ?? '', [ 'draft', 'pending' ], true ) ) {
-				// apply_post() reports the source as CANNOT_EDIT.
-				if ( ! current_user_can( 'edit_post', $source_id ) ) {
-					continue;
-				}
-
-				// Never trashed: cached link reads and a posts-row seal cannot prove nobody linked or edited it since.
-				$note( XliffImportErrors::RECOVERY_KEPT_DRAFT, $id );
+			} else {
+				$note( XliffImportErrors::RECOVERY_EDITED_TRANSLATION, $id );
+				$apply = false;
 			}
 
 			if ( current_user_can( 'edit_post', $id ) ) {
-				delete_post_meta( $id, self::CREATING_META_KEY, $mark );
+				delete_post_meta( $id, self::CREATING_META_KEY, $row['mark'] );
 			}
 		}
 
@@ -625,60 +710,8 @@ final class XliffImporter {
 		$copy_from = '' !== $slug ? (int) ( $manager->get_translations( $source_id )[ $slug ] ?? 0 ) : 0;
 		$copy_from = $copy_from > 0 && get_post( $copy_from ) instanceof \WP_Post ? $copy_from : $source_id;
 
-		return ( $copy_from === $source_id || \PerfLocale\Helper::user_can_copy_translation_source( $copy_from ) )
+		return \PerfLocale\Helper::user_can_copy_translation_source( $copy_from )
 			&& \PerfLocale\Helper::user_can_create_like( $copy_from );
-	}
-
-	/**
-	 * Whether the stored row still equals the one the seal fingerprints; no seal proves nothing.
-	 *
-	 * @param int    $id   Post ID.
-	 * @param string $seal Fingerprint from the mark, or ''.
-	 * @return bool
-	 */
-	private static function unchanged( int $id, string $seal ): bool {
-		$row = '' !== $seal ? self::stored_row( $id ) : null;
-
-		return null !== $row && hash_equals( $seal, self::fingerprint( $row ) );
-	}
-
-	/**
-	 * A post's whole row as the database holds it now, every value a string; null when absent or the read failed.
-	 *
-	 * @param int $id Post ID.
-	 * @return array<string, string>|null
-	 */
-	private static function stored_row( int $id ): ?array {
-		global $wpdb;
-
-		if ( ! $wpdb instanceof \wpdb ) {
-			return null;
-		}
-
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The stored row: another request may have saved it.
-		$row = $wpdb->get_row( $wpdb->prepare( 'SELECT * FROM %i WHERE ID = %d', $wpdb->posts, $id ), ARRAY_A );
-
-		if ( ! is_array( $row ) || '' !== $wpdb->last_error ) {
-			return null;
-		}
-
-		$out = [];
-
-		foreach ( $row as $column => $value ) {
-			$out[ (string) $column ] = is_scalar( $value ) ? (string) $value : '';
-		}
-
-		return $out;
-	}
-
-	/**
-	 * A row's fingerprint.
-	 *
-	 * @param array<string, string> $row Row from stored_row().
-	 * @return string
-	 */
-	private static function fingerprint( array $row ): string {
-		return md5( (string) wp_json_encode( $row ) );
 	}
 
 	/**
@@ -689,9 +722,10 @@ final class XliffImporter {
 	 * @param int                                            $id          Translation post.
 	 * @param int                                            $source_id   Source post.
 	 * @param string                                         $target_slug Target language slug.
-	 * @return void
+	 * @phpstan-impure
+	 * @return array<int, mixed>|null The failed steps (perflocale/translation/meta_copy_failed for the translation), or null.
 	 */
-	private static function complete_creation( \PerfLocale\Translation\PostTranslationManager $manager, int $id, int $source_id, string $target_slug ): void {
+	private static function complete_creation( \PerfLocale\Translation\PostTranslationManager $manager, int $id, int $source_id, string $target_slug ): ?array {
 		$held = [];
 
 		// Without a key get_post_meta() answers the stored strings, as maybe_serialize() writes them.
@@ -731,7 +765,7 @@ final class XliffImporter {
 		add_filter( 'add_post_metadata', $skip, 1, 4 );
 
 		try {
-			$manager->complete_imported_translation( $id, $source_id, $target_slug );
+			return \PerfLocale\Translation\CopyFailureWatch::run( $id, static fn() => $manager->complete_imported_translation( $id, $source_id, $target_slug ) );
 		} finally {
 			remove_filter( 'add_post_metadata', $skip, 1 );
 		}
@@ -767,8 +801,8 @@ final class XliffImporter {
 	}
 
 	/**
-	 * Refuse a document over MAX_BYTES or MAX_UNITS units without building a DOM: substr_count( "<unit" ) is an upper
-	 * bound, and only a file over it pays for the exact count.
+	 * Refuse a document over MAX_BYTES, in an encoding the byte counts cannot read, or over MAX_UNITS units without
+	 * building a DOM: substr_count( "<unit" ) is an upper bound, and only a file over it pays for the exact count.
 	 *
 	 * @param string $xml XLIFF XML string.
 	 * @throws XliffFormatException When a limit is exceeded.
@@ -778,18 +812,154 @@ final class XliffImporter {
 			throw self::limit_refusal( 'bytes' ); // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- The message is escaped in limit_refusal().
 		}
 
+		$text = self::countable_text( $xml );
+
 		// Before the unit count: its XMLReader pass parses too.
-		if ( self::over_markup( $xml ) ) {
+		if ( self::over_markup( $text ) ) {
 			throw self::limit_refusal( 'nodes' ); // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- The message is escaped in limit_refusal().
 		}
 
-		if ( substr_count( $xml, '<unit' ) <= self::MAX_UNITS ) {
+		if ( substr_count( $text, '<unit' ) <= self::MAX_UNITS ) {
 			return;
 		}
 
 		if ( $this->count_units( $xml, self::MAX_UNITS + 1 ) > self::MAX_UNITS ) {
 			throw self::limit_refusal( 'units' ); // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- The message is escaped in limit_refusal().
 		}
+	}
+
+	/**
+	 * The text the byte checks read: the document itself in UTF-8, US-ASCII, ISO-8859-n or windows-125n (every byte
+	 * below 0x80 is that ASCII character), its one-byte-per-unit copy in UTF-16 (U+4E22 holds a quote byte). Anything
+	 * else is refused: EBCDIC and UTF-7 hide `<`, UTF-32 and Shift_JIS-style trail bytes fake quotes or `]]>`.
+	 *
+	 * @param string $xml XLIFF XML string.
+	 * @return string
+	 * @throws XliffFormatException When the encoding is refused or the UTF-16 text cannot be read.
+	 */
+	private static function countable_text( string $xml ): string {
+		$order = '';
+		$start = 0;
+
+		if ( str_starts_with( $xml, "\xEF\xBB\xBF" ) ) {
+			$start = 3;
+		} elseif ( str_starts_with( $xml, "\xFF\xFE" ) || str_starts_with( $xml, "<\0" ) ) {
+			$order = 'LE';
+			$start = str_starts_with( $xml, "\xFF\xFE" ) ? 2 : 0;
+		} elseif ( str_starts_with( $xml, "\xFE\xFF" ) || str_starts_with( $xml, "\0<" ) ) {
+			$order = 'BE';
+			$start = str_starts_with( $xml, "\xFE\xFF" ) ? 2 : 0;
+		}
+
+		if ( '' === $order ) {
+			$start += strspn( $xml, " \t\r\n", $start );
+			$head   = substr( $xml, $start, 256 );
+		} else {
+			// The ASCII prefix of the UTF-16 text: the declaration is ASCII. A zero second unit is UTF-32.
+			$head = '';
+			$stop = min( strlen( $xml ) - 1, $start + 512 );
+
+			for ( $i = $start; $i < $stop; $i += 2 ) {
+				$low  = 'LE' === $order ? $xml[ $i ] : $xml[ $i + 1 ];
+				$high = 'LE' === $order ? $xml[ $i + 1 ] : $xml[ $i ];
+
+				if ( "\0" !== $high || "\0" === $low ) {
+					break;
+				}
+
+				$head .= $low;
+			}
+
+			if ( strlen( $head ) < 2 ) {
+				$head = '';
+			}
+		}
+
+		if ( ! str_starts_with( $head, '<' ) || ! self::allowed_encoding( $head, $order ) ) {
+			throw new XliffFormatException( esc_html__( 'XLIFF import refused: the file is not XML saved as UTF-8, UTF-16 or a single-byte ISO-8859 or Windows encoding. Save it as a UTF-8 XLIFF file and import it again.', 'perflocale' ) );
+		}
+
+		if ( '' === $order ) {
+			return $xml;
+		}
+
+		$text = self::utf16_ascii( $xml, $start, 'LE' === $order );
+
+		if ( null === $text ) {
+			throw new XliffFormatException( esc_html__( 'XLIFF import refused: this server cannot read UTF-16 XLIFF files. Save the file as UTF-8 and import it again.', 'perflocale' ) );
+		}
+
+		return $text;
+	}
+
+	/**
+	 * Each UTF-16 code unit as one byte: an ASCII one as itself, any other as 0x81. Neither mbstring nor iconv: a
+	 * plugin's mb_convert_encoding() polyfill calls iconv(), which may be missing too.
+	 *
+	 * @param string $utf16 The document.
+	 * @param int    $start Offset of the first code unit (after a BOM).
+	 * @param bool   $le    Little-endian.
+	 * @return string|null Null when PCRE fails.
+	 */
+	private static function utf16_ascii( string $utf16, int $start, bool $le ): ?string {
+		$map = [];
+
+		for ( $c = 1; $c < 128; $c++ ) {
+			$map[ sprintf( $le ? "%02x00\xFF" : "00%02x\xFF", $c ) ] = chr( $c );
+		}
+
+		$end = $start + ( ( strlen( $utf16 ) - $start ) & ~1 );
+		$out = '';
+
+		// Hex units ended by 0xFF, so strtr() meets every unit at its own offset; 256 KiB slices of the document itself
+		// (no copy of it) bound the temporaries, so the peak is the half-size result plus about 1.3 MiB.
+		for ( $at = $start; $at < $end; $at += 262144 ) {
+			$part = preg_replace( '/[0-9a-f]{4}\xFF/', "\x81", strtr( chunk_split( bin2hex( substr( $utf16, $at, min( 262144, $end - $at ) ) ), 4, "\xFF" ), $map ) );
+
+			if ( ! is_string( $part ) ) {
+				return null;
+			}
+
+			$out .= $part;
+		}
+
+		return $out;
+	}
+
+	/**
+	 * Whether the XML declaration at the start of $head (ASCII), if any, names an encoding countable_text() reads.
+	 *
+	 * @param string $head  The document's first characters.
+	 * @param string $order '' for a byte encoding, LE or BE for UTF-16.
+	 * @return bool
+	 */
+	private static function allowed_encoding( string $head, string $order ): bool {
+		if ( 1 !== preg_match( '/^<\?xml[ \t\r\n]/', $head ) ) {
+			return true;
+		}
+
+		$end  = strpos( $head, '?>' );
+		$decl = false === $end ? '' : substr( $head, 0, $end );
+
+		if ( '' === $decl ) {
+			return false;
+		}
+
+		if ( ! str_contains( $decl, 'encoding' ) ) {
+			return true;
+		}
+
+		if ( 1 !== preg_match( '/[ \t\r\n]encoding[ \t\r\n]*=[ \t\r\n]*(["\'])([A-Za-z][A-Za-z0-9._-]*)\1/', $decl, $m ) ) {
+			return false;
+		}
+
+		$name = str_replace( [ '-', '_' ], '', strtolower( $m[2] ) );
+
+		if ( '' !== $order ) {
+			return in_array( $name, [ 'utf16', 'utf16' . strtolower( $order ) ], true );
+		}
+
+		return in_array( $name, [ 'utf8', 'usascii' ], true ) || 1 === preg_match( '/^(?:iso8859(?:[1-9]|1[0-6])|windows125[0-8])\z/', $name );
 	}
 
 	/**

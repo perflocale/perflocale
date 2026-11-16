@@ -200,15 +200,6 @@ final class PerfLocaleYoast implements \PerfLocale\Addon\AddonInterface {
 	}
 
 	/**
-	 * Machine-translatable SEO meta (titles, descriptions, social), gated by mt_meta_seo.
-	 *
-	 * The focus keyword is left out on purpose: keyword targeting is a human decision.
-	 *
-	 * @param array<int, string> $keys      Meta keys.
-	 * @param string             $post_type Post type.
-	 * @return array<int, string>
-	 */
-	/**
 	 * Yoast meta keys this addon machine-translates, all plain text (text mode).
 	 */
 	private const MT_TEXT_KEYS = [
@@ -220,6 +211,16 @@ final class PerfLocaleYoast implements \PerfLocale\Addon\AddonInterface {
 		'_yoast_wpseo_twitter-description',
 	];
 
+	/** The focus keyphrase: one phrase, text mode. */
+	private const MT_KEYWORD_KEY = '_yoast_wpseo_focuskw';
+
+	/**
+	 * Machine-translatable SEO meta (titles, descriptions, social), gated by mt_meta_seo; the focus keyphrase also by mt_meta_seo_keywords.
+	 *
+	 * @param array<int, string> $keys      Meta keys.
+	 * @param string             $post_type Post type.
+	 * @return array<int, string>
+	 */
 	public function add_mt_meta_keys( array $keys, string $post_type ): array {
 		$settings = \PerfLocale\Plugin::get_instance()->get( 'settings' );
 
@@ -227,7 +228,7 @@ final class PerfLocaleYoast implements \PerfLocale\Addon\AddonInterface {
 			return $keys;
 		}
 
-		return array_merge( $keys, self::MT_TEXT_KEYS );
+		return array_merge( $keys, self::MT_TEXT_KEYS, (bool) $settings->get( 'mt_meta_seo_keywords', false ) ? [ self::MT_KEYWORD_KEY ] : [] );
 	}
 
 	/**
@@ -240,7 +241,7 @@ final class PerfLocaleYoast implements \PerfLocale\Addon\AddonInterface {
 	 * @return string 'text' for this addon's SEO keys, else $format.
 	 */
 	public function mt_meta_key_format( string $format, string $key, string $post_type ): string {
-		return in_array( $key, self::MT_TEXT_KEYS, true ) ? 'text' : $format;
+		return 'copy' !== $format && ( self::MT_KEYWORD_KEY === $key || in_array( $key, self::MT_TEXT_KEYS, true ) ) ? 'text' : $format;
 	}
 
 

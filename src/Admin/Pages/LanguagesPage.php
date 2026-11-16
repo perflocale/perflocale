@@ -812,9 +812,9 @@ final class LanguagesPage {
 					$rest    = [];
 
 					foreach ( $predefined as $pl ) {
-						$slug = (string) ( $pl['slug'] ?? '' );
-						if ( isset( $popular_order[ $slug ] ) ) {
-							$popular[ $popular_order[ $slug ] ] = $pl;
+						$pl_slug = (string) ( $pl['slug'] ?? '' );
+						if ( isset( $popular_order[ $pl_slug ] ) ) {
+							$popular[ $popular_order[ $pl_slug ] ] = $pl;
 						} else {
 							$rest[] = $pl;
 						}
@@ -1106,10 +1106,46 @@ final class LanguagesPage {
 			return;
 		}
 
+		// A code whose root path a default-language post holds: nothing was saved.
+		if ( $message === 'slug_used_by_content' ) {
+			// phpcs:ignore WordPress.Security.NonceVerification.Recommended
+			$code = isset( $_GET['dup'] ) && is_string( $_GET['dup'] ) ? sanitize_key( wp_unslash( $_GET['dup'] ) ) : '';
+			require_once dirname( __DIR__, 2 ) . '/Translation/LanguageCodeSlugs.php';
+			$text = \PerfLocale\Translation\LanguageCodeSlugs::refusal( $code, \PerfLocale\Plugin::get_instance()->settings() );
+
+			echo '<div class="notice notice-error is-dismissible"><p>' . esc_html( '' !== $text ? $text : __( 'Nothing was saved: a page used this language code as its address. Try again.', 'perflocale' ) ) . '</p></div>';
+			return;
+		}
+
+		// A slug change not done (LanguageWrites::refusal()): refused before its row write, or not confirmed after it.
+		if ( $message === 'rename_refused' ) {
+			// phpcs:ignore WordPress.Security.NonceVerification.Recommended
+			$reason = isset( $_GET['reason'] ) && is_string( $_GET['reason'] ) ? sanitize_key( wp_unslash( $_GET['reason'] ) ) : '';
+			// phpcs:ignore WordPress.Security.NonceVerification.Recommended
+			$slug = isset( $_GET['dup'] ) && is_string( $_GET['dup'] ) ? sanitize_key( wp_unslash( $_GET['dup'] ) ) : '';
+			$text = \PerfLocale\Database\Repository\LanguageWrites::refusal( in_array( $reason, [ 'data', 'data_new', 'changed', 'unknown', 'failed' ], true ) ? $reason : 'busy', $slug );
+
+			echo '<div class="notice notice-error is-dismissible"><p>' . esc_html( $text ) . '</p></div>';
+			return;
+		}
+
 		// A slug routing cannot express: update() refused it before writing, so nothing was saved.
 		if ( $message === 'invalid_slug' ) {
 			// phpcs:ignore WordPress.Security.NonceVerification.Recommended
 			$bad = isset( $_GET['dup'] ) ? sanitize_text_field( wp_unslash( $_GET['dup'] ) ) : '';
+
+			if ( '' === $bad ) {
+				echo '<div class="notice notice-error is-dismissible"><p>' . wp_kses(
+					sprintf(
+						/* translators: %1$s and %2$s: example slugs */
+						__( 'The slug cannot be empty, so nothing was saved. Use two or three lowercase letters, optionally followed by a hyphen and two or three more - for example %1$s or %2$s.', 'perflocale' ),
+						'<code>de</code>',
+						'<code>pt-br</code>'
+					),
+					[ 'code' => [] ]
+				) . '</p></div>';
+				return;
+			}
 
 			echo '<div class="notice notice-error is-dismissible"><p>' . wp_kses(
 				sprintf(
@@ -1143,6 +1179,18 @@ final class LanguagesPage {
 			}
 
 			echo '</p></div>';
+			return;
+		}
+
+		// A delete refused while the language has URL bases data the database cannot remove with it (LanguageWrites::refusal()).
+		if ( $message === 'delete_url_bases' ) {
+			echo '<div class="notice notice-error is-dismissible"><p>' . esc_html( \PerfLocale\Database\Repository\LanguageWrites::refusal( 'delete_data' ) ) . '</p></div>';
+			return;
+		}
+
+		// A delete the database did not confirm: it may have happened.
+		if ( $message === 'delete_unknown' ) {
+			echo '<div class="notice notice-warning is-dismissible"><p>' . esc_html( \PerfLocale\Database\Repository\LanguageWrites::refusal( 'delete_unknown' ) ) . '</p></div>';
 			return;
 		}
 

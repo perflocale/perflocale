@@ -12,35 +12,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * MetaBox integration: field sync, machine translation and front-end reference fields.
+ * MetaBox integration: field map, field sync, machine translation and front-end reference fields.
  */
 final class PerfLocaleMetabox implements \PerfLocale\Addon\AddonInterface {
-
-	/**
-	 * Field types that contain translatable text content.
-	 *
-	 * @var array<int, string>
-	 */
-	private const TEXT_TYPES = [
-		'text',
-		'textarea',
-		'wysiwyg',
-		'url',
-		'email',
-		'oembed',
-	];
-
-	/**
-	 * Field types that store translatable text inside serialized arrays.
-	 *
-	 * @var array<int, string>
-	 */
-	private const SERIALIZED_TEXT_TYPES = [
-		'fieldset_text',
-		'text_list',
-		'key_value',
-		'input_list',
-	];
 
 	/**
 	 * Cached field definitions per post type.
@@ -69,6 +43,13 @@ final class PerfLocaleMetabox implements \PerfLocale\Addon\AddonInterface {
 	 * @var \PerfLocaleMetaboxTranslatedHooks|null
 	 */
 	private ?\PerfLocaleMetaboxTranslatedHooks $hooks = null;
+
+	/**
+	 * The field-map producer, once loaded.
+	 *
+	 * @var \PerfLocaleMetaboxFields|null
+	 */
+	private ?\PerfLocaleMetaboxFields $fields = null;
 
 	/**
 	 * {@inheritDoc}
@@ -110,8 +91,20 @@ final class PerfLocaleMetabox implements \PerfLocale\Addon\AddonInterface {
 	 */
 	public function boot( \PerfLocale\Plugin $plugin ): void {
 		add_filter( 'perflocale/translatable_meta_keys', [ $this, 'add_meta_keys' ], 10, 2 );
-		add_filter( 'perflocale/mt/translatable_meta_keys', [ $this, 'add_mt_meta_keys' ], 10, 2 );
+		add_filter( 'perflocale/mt/translatable_meta_keys', [ $this, 'add_mt_meta_keys' ], 10, 3 );
 		add_filter( 'perflocale/mt/meta_key_format', [ $this, 'mt_meta_key_format' ], 10, 3 );
+		add_filter( 'perflocale/fields/map', [ $this, 'produce_map' ], 10, 4 );
+		// A write with no snapshot taken has nothing to release: do not load the class for it.
+		add_action(
+			'wp_after_insert_post',
+			static function ( mixed $post_id ): void {
+				if ( class_exists( \PerfLocale\Translation\Fields\FieldSnapshot::class, false ) ) {
+					\PerfLocale\Translation\Fields\FieldSnapshot::release_post( $post_id );
+				}
+			},
+			PHP_INT_MAX,
+			1
+		);
 
 		// Meta Box deletes the row of a field saved empty, so record a person's clear where Meta Box still knows it.
 		// The seed would otherwise refill it; rwmb_before_save_post fires after the form's nonce check.
@@ -230,19 +223,7 @@ final class PerfLocaleMetabox implements \PerfLocale\Addon\AddonInterface {
 	 * @return array<int, string>
 	 */
 	public function exclude_password_fields( array $excluded, int $source_id ): array {
-		$post_type = $source_id > 0 ? get_post_type( $source_id ) : false;
-
-		if ( ! is_string( $post_type ) || ! function_exists( 'rwmb_get_object_fields' ) ) {
-			return $excluded;
-		}
-
-		foreach ( $this->get_fields_for_post_type( $post_type ) as $field ) {
-			if ( is_array( $field ) && 'password' === ( $field['type'] ?? '' ) && ! empty( $field['id'] ) && self::is_post_meta_storage( $field ) ) {
-				$excluded[] = (string) $field['id'];
-			}
-		}
-
-		return $excluded;
+		return $this->fields()->exclude_password_fields( $excluded, $source_id );
 	}
 
 	/**
@@ -284,134 +265,66 @@ final class PerfLocaleMetabox implements \PerfLocale\Addon\AddonInterface {
 	}
 
 	/**
-	 * Detect all translatable MetaBox fields for a post type.
+	 * `perflocale/translatable_meta_keys`: the top-level text and group fields that store post meta.
 	 *
-	 * @param array<int, string> $keys Existing translatable meta keys.
+	 * @param array<int, string> $keys      Existing translatable meta keys.
 	 * @param string             $post_type Post type being queried.
 	 * @return array<int, string>
 	 */
 	public function add_meta_keys( array $keys, string $post_type ): array {
-		if ( ! function_exists( 'rwmb_get_object_fields' ) ) {
-			return $keys;
-		}
-
-		$fields = $this->get_fields_for_post_type( $post_type );
-
-		if ( empty( $fields ) ) {
-			return $keys;
-		}
-
-		$new_keys = $this->collect_translatable_fields( $fields );
-
-		if ( ! empty( $new_keys ) ) {
-			$keys = array_unique( array_merge( $keys, $new_keys ) );
-		}
-
-		return $keys;
+		return $this->fields()->add_meta_keys( $keys, $post_type );
 	}
 
 	/**
-	 * Machine-translatable MetaBox keys: leaf text, textarea and wysiwyg fields only.
-	 *
-	 * Serialized types and groups are whole-array blobs; url/email/oembed are never machine translated.
+	 * `perflocale/mt/translatable_meta_keys`: leaf text, textarea and wysiwyg fields only.
 	 *
 	 * @param array<int, string> $keys      Meta keys.
 	 * @param string             $post_type Post type.
+	 * @param int                $post_id   Source post ID (0 = type-level).
 	 * @return array<int, string>
 	 */
-	public function add_mt_meta_keys( array $keys, string $post_type ): array {
-		$settings = \PerfLocale\Plugin::get_instance()->get( 'settings' );
-
-		if ( ! (bool) $settings->get( 'mt_meta_custom_fields', false ) ) {
-			return $keys;
-		}
-
-		if ( ! function_exists( 'rwmb_get_object_fields' ) ) {
-			return $keys;
-		}
-
-		$fields   = $this->get_fields_for_post_type( $post_type );
-		$mt_types = [ 'text', 'textarea', 'wysiwyg' ];
-		$new_keys = [];
-
-		foreach ( (array) $fields as $field ) {
-			$type = is_array( $field ) ? ( $field['type'] ?? '' ) : '';
-			$name = is_array( $field ) ? ( $field['id'] ?? ( $field['name'] ?? '' ) ) : '';
-
-			// No clones: with clone_as_multiple the translated row-0 value would collapse onto every row.
-			if ( ! is_array( $field ) || ! empty( $field['clone'] ) || ! self::is_post_meta_storage( $field ) ) {
-				continue;
-			}
-
-			if ( $name !== '' && in_array( $type, $mt_types, true ) ) {
-				$new_keys[] = (string) $name;
-			}
-		}
-
-		return $new_keys === [] ? $keys : array_values( array_unique( array_merge( $keys, $new_keys ) ) );
+	public function add_mt_meta_keys( array $keys, string $post_type, int $post_id = 0 ): array {
+		return $this->fields()->add_mt_meta_keys( $keys, $post_type, $post_id );
 	}
 
 	/**
-	 * Route Meta Box text and textarea fields to the provider's text mode; only ever turns a key into text.
+	 * `perflocale/mt/meta_key_format`: 'text' for Meta Box text and textarea fields.
 	 *
 	 * @param string $format    Inherited format ('html' default).
 	 * @param string $key       Meta key.
 	 * @param string $post_type Source post type.
-	 * @return string 'text' for a text/textarea field, else $format.
+	 * @return string
 	 */
 	public function mt_meta_key_format( string $format, string $key, string $post_type ): string {
-		if ( 'text' === $format ) {
-			return $format;
-		}
-
-		$set = $this->plaintext_mt_key_set( $post_type );
-
-		return isset( $set[ $key ] ) ? 'text' : $format;
+		return 'html' !== $format ? $format : $this->fields()->mt_meta_key_format( $format, $key, $post_type );
 	}
 
 	/**
-	 * Meta Box text and textarea (not wysiwyg) field names of a post type, memoised per blog.
+	 * `perflocale/fields/map`: this host's descriptors (the map is never built on a page view).
 	 *
-	 * @param string $post_type Source post type.
-	 * @return array<string, bool> field name => true.
+	 * @param mixed $map       The map being built.
+	 * @param mixed $object_id Object id.
+	 * @param mixed $kind      Object kind.
+	 * @param mixed $subtype   Post type.
+	 * @return mixed
 	 */
-	private function plaintext_mt_key_set( string $post_type ): array {
-		static $cache = [];
-
-		$blog = get_current_blog_id();
-
-		if ( isset( $cache[ $blog ][ $post_type ] ) ) {
-			return $cache[ $blog ][ $post_type ];
-		}
-
-		$set = [];
-
-		if ( function_exists( 'rwmb_get_object_fields' ) ) {
-			foreach ( (array) $this->get_fields_for_post_type( $post_type ) as $field ) {
-				if ( ! is_array( $field ) || ! empty( $field['clone'] ) || ! self::is_post_meta_storage( $field ) ) {
-					continue;
-				}
-
-				$type = $field['type'] ?? '';
-				$name = $field['id'] ?? ( $field['name'] ?? '' );
-
-				if ( $name !== '' && in_array( $type, [ 'text', 'textarea' ], true ) ) {
-					$set[ (string) $name ] = true;
-				}
-			}
-		}
-
-		if ( count( $cache[ $blog ] ?? [] ) >= 32 ) {
-			unset( $cache[ $blog ] );
-		}
-
-		$cache[ $blog ][ $post_type ] = $set;
-
-		return $set;
+	public function produce_map( mixed $map, mixed $object_id = 0, mixed $kind = '', mixed $subtype = '' ): mixed {
+		return $this->fields()->produce_map( $map, $object_id, $kind, $subtype );
 	}
 
 	/**
-	 * `rwmb_after_save_field`: record an empty save of a field that held a value, and forget it once it holds one again.
+	 * The field-map producer and key lists, loaded on first use (never on a page view).
+	 *
+	 * @return \PerfLocaleMetaboxFields
+	 */
+	private function fields(): \PerfLocaleMetaboxFields {
+		require_once __DIR__ . '/PerfLocaleMetaboxFields.php';
+
+		return $this->fields ??= new \PerfLocaleMetaboxFields( $this->get_fields_for_post_type( ... ), self::is_post_meta_storage( ... ) );
+	}
+
+	/**
+	 * `rwmb_after_save_field`: snapshot the old value; record an empty save of a field that held a value, and forget it once it holds one again.
 	 *
 	 * @param mixed $passthru  Filter value, returned unchanged.
 	 * @param mixed $field     Field settings.
@@ -421,6 +334,10 @@ final class PerfLocaleMetabox implements \PerfLocale\Addon\AddonInterface {
 	 * @return mixed
 	 */
 	public function record_clear_on_save( mixed $passthru = null, mixed $field = null, mixed $new_value = null, mixed $old_value = null, mixed $object_id = 0 ): mixed {
+		if ( is_array( $field ) && ! \PerfLocale\Translation\SyncMeta::is_page_view() ) {
+			$this->fields()->snapshot_old_value( $field, $old_value, $object_id );
+		}
+
 		// Meta Box's emptiness rule: only '' and [] delete the row; '0' is a value.
 		$had = '' !== $old_value && [] !== $old_value && null !== $old_value;
 		$has = '' !== $new_value && [] !== $new_value && null !== $new_value;
@@ -495,35 +412,7 @@ final class PerfLocaleMetabox implements \PerfLocale\Addon\AddonInterface {
 
 		$key = (string) $field['id'];
 
-		return isset( $this->seed_key_set( $post_type )[ $key ] ) ? $key : '';
-	}
-
-	/**
-	 * The keys add_meta_keys() registers for a post type, as a set memoised per blog.
-	 *
-	 * @param string $post_type Post type.
-	 * @return array<string, bool>
-	 */
-	private function seed_key_set( string $post_type ): array {
-		static $cache = [];
-
-		$blog = get_current_blog_id();
-
-		if ( isset( $cache[ $blog ][ $post_type ] ) ) {
-			return $cache[ $blog ][ $post_type ];
-		}
-
-		$set = function_exists( 'rwmb_get_object_fields' )
-			? array_fill_keys( array_map( 'strval', $this->collect_translatable_fields( $this->get_fields_for_post_type( $post_type ) ) ), true )
-			: [];
-
-		if ( count( $cache[ $blog ] ?? [] ) >= 32 ) {
-			unset( $cache[ $blog ] );
-		}
-
-		$cache[ $blog ][ $post_type ] = $set;
-
-		return $set;
+		return isset( $this->fields()->seed_key_set( $post_type )[ $key ] ) ? $key : '';
 	}
 
 	/**
@@ -590,38 +479,6 @@ final class PerfLocaleMetabox implements \PerfLocale\Addon\AddonInterface {
 	 */
 	private static function is_post_meta_storage( array $field ): bool {
 		return ! isset( $field['storage'] ) || $field['storage'] instanceof \RWMB_Post_Storage;
-	}
-
-	/**
-	 * Collect the top-level translatable field meta keys.
-	 *
-	 * A group is one meta row holding every sub-field, so its child IDs are not meta keys.
-	 *
-	 * @param array<string, array<string, mixed>> $fields MetaBox field definitions.
-	 * @return array<int, string>
-	 */
-	private function collect_translatable_fields( array $fields ): array {
-		$keys = [];
-
-		foreach ( $fields as $field ) {
-			if ( ! is_array( $field ) || empty( $field['id'] ) || empty( $field['type'] ) || ! self::is_post_meta_storage( $field ) ) {
-				continue;
-			}
-
-			$type     = $field['type'];
-			$field_id = $field['id'];
-
-			if ( in_array( $type, self::TEXT_TYPES, true ) || in_array( $type, self::SERIALIZED_TEXT_TYPES, true ) ) {
-				$keys[] = $field_id;
-				continue;
-			}
-
-			if ( $type === 'group' && ! empty( $field['fields'] ) && is_array( $field['fields'] ) ) {
-				$keys[] = $field_id;
-			}
-		}
-
-		return $keys;
 	}
 
 	/**

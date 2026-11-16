@@ -35,6 +35,13 @@ final class Schema {
 	private const TABLES_EXIST_OPTION = 'perflocale_tables_exist';
 
 	/**
+	 * Per-request tables_exist() verdicts by blog id.
+	 *
+	 * @var array<int, bool>
+	 */
+	private static array $exists = [];
+
+	/**
 	 * Create or update all plugin tables (idempotent).
 	 *
 	 * @return void
@@ -148,6 +155,9 @@ final class Schema {
 		'content_hashes',
 		'jobs',
 		'migration_source_map',
+		'pending_changes',
+		'resync_base',
+		'resync_state',
 	];
 
 	/**
@@ -164,25 +174,23 @@ final class Schema {
 	/**
 	 * Check if PerfLocale's database tables actually exist.
 	 *
-	 * Only the positive verdict is cached (static, autoloaded option, object cache), so an activation is seen at once;
-	 * flush_tables_exist_cache() clears it on create or drop. See docs-ai/11-code-rationale.md, "Schema: tables_exist".
+	 * Only the positive verdict is cached across requests (autoloaded option, object cache), a negative one only for this
+	 * request and never a failed probe. flush_tables_exist_cache() clears it on create or drop. See
+	 * docs-ai/11-code-rationale.md, "Schema: tables_exist".
 	 *
 	 * @return bool True if the languages table exists.
 	 */
 	public static function tables_exist(): bool {
 		// Keyed by blog: a flat static would carry blog A's verdict into blog B after switch_to_blog().
-		/** @var array<int, bool> $exists */
-		static $exists = [];
-
 		$blog = function_exists( 'get_current_blog_id' ) ? get_current_blog_id() : 0;
 
-		if ( isset( $exists[ $blog ] ) ) {
-			return $exists[ $blog ];
+		if ( isset( self::$exists[ $blog ] ) ) {
+			return self::$exists[ $blog ];
 		}
 
 		// Autoloaded option: without an external object cache, SHOW TABLES would otherwise run on every request.
 		if ( get_option( self::TABLES_EXIST_OPTION ) ) {
-			$exists[ $blog ] = true;
+			self::$exists[ $blog ] = true;
 			return true;
 		}
 
@@ -190,37 +198,34 @@ final class Schema {
 		$found = false;
 		wp_cache_get( self::TABLES_EXIST_KEY, self::CACHE_GROUP, false, $found );
 		if ( $found ) {
-			$exists[ $blog ] = true;
+			self::$exists[ $blog ] = true;
 			return true;
 		}
 
-		global $wpdb;
+		// Every cache missed: the probe is cold code; a failed one (null) is no answer and is not kept.
+		$verdict = SchemaWrites::probe_tables( self::table( 'languages' ) );
 
-		$table = self::table( 'languages' );
-
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Positive result cached in an autoloaded option + the object cache + a per-request static; busted via flush_tables_exist_cache() on create/drop.
-		$verdict = (bool) $wpdb->get_var(
-			$wpdb->prepare( 'SHOW TABLES LIKE %s', $table )
-		);
-
-		if ( $verdict ) {
+		if ( true === $verdict ) {
 			update_option( self::TABLES_EXIST_OPTION, 1, true );
 			wp_cache_set( self::TABLES_EXIST_KEY, 1, self::CACHE_GROUP, HOUR_IN_SECONDS );
 		}
 
-		$exists[ $blog ] = $verdict;
+		if ( null !== $verdict ) {
+			self::$exists[ $blog ] = $verdict;
+		}
 
-		return $verdict;
+		return true === $verdict;
 	}
 
 	/**
 	 * Invalidate the cross-request {@see tables_exist()} verdict.
 	 *
-	 * The per-request static is left alone: it is only set by a resolution earlier in the same request.
+	 * Also this blog's per-request verdict: a new site's setup request asks before its tables are created.
 	 *
 	 * @return void
 	 */
 	public static function flush_tables_exist_cache(): void {
+		unset( self::$exists[ get_current_blog_id() ] );
 		delete_option( self::TABLES_EXIST_OPTION );
 		wp_cache_delete( self::TABLES_EXIST_KEY, self::CACHE_GROUP );
 	}

@@ -526,7 +526,7 @@ final class StringScanner {
 	 * @param int $codepoint Unicode codepoint.
 	 * @return string UTF-8 encoded character.
 	 */
-	private static function codepoint_to_utf8( int $codepoint ): string {
+	public static function codepoint_to_utf8( int $codepoint ): string {
 		if ( $codepoint < 0 || $codepoint > 0x10FFFF || ( $codepoint >= 0xD800 && $codepoint <= 0xDFFF ) ) {
 			return "\xEF\xBF\xBD"; // U+FFFD REPLACEMENT CHARACTER.
 		}

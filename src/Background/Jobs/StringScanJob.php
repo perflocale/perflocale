@@ -41,7 +41,7 @@ final class StringScanJob extends AbstractJob {
 	/**
 	 * {@inheritDoc}
 	 *
-	 * As StringsController's REST permission.
+	 * Running a scan also needs manage_options, as its form and REST route (JobAccess::ALSO_REQUIRES).
 	 */
 	public function get_required_capability(): string {
 		return 'perflocale_translate';

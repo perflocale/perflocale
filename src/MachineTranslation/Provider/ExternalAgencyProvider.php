@@ -35,6 +35,13 @@ final class ExternalAgencyProvider extends AbstractProvider {
 	private const BATCH_MAX_CHARS = 20000;
 
 	/**
+	 * Bounds of the "Maximum characters per request" setting (mt_agency_max_chars); 500 is also the smallest piece size.
+	 */
+	public const MAX_CHARS_MIN = 500;
+
+	public const MAX_CHARS_MAX = 100000;
+
+	/**
 	 * {@inheritDoc}
 	 */
 	public function get_id(): string {
@@ -77,6 +84,7 @@ final class ExternalAgencyProvider extends AbstractProvider {
 
 		/** This filter is documented in src/MachineTranslation/Provider/DeepLProvider.php */
 		$text = (string) apply_filters( 'perflocale/machine_translation/text_before_send', $text, 'external_agency', $target_lang );
+		$this->guard_send( \PerfLocale\Util\Utf8::length( $text ) );
 
 		// Dash form ('en-us', not 'en_US'): the BCP 47 shape an agency most likely accepts.
 		$request_id = wp_generate_uuid4();
@@ -174,7 +182,7 @@ final class ExternalAgencyProvider extends AbstractProvider {
 			return parent::translate_batch( $texts, $source_lang, $target_lang, $fast_fail, $format );
 		}
 
-		return $this->without_blank( $texts, fn( array $sent ): array => $this->send_lists( $sent, $source_lang, $target_lang, $fast_fail, $format ) );
+		return $this->without_blank( $texts, fn( array $sent ): array => $this->send_lists( $sent, $source_lang, $target_lang, $fast_fail, $format ), $format );
 	}
 
 	/**
@@ -182,6 +190,53 @@ final class ExternalAgencyProvider extends AbstractProvider {
 	 */
 	public function batches_natively(): bool {
 		return (bool) $this->settings->get( 'mt_agency_batch', false );
+	}
+
+	/**
+	 * Most characters in one batch request; long classic content is cut into pieces of this size.
+	 *
+	 * @since 1.0.8
+	 * @return int
+	 */
+	public function batch_max_chars(): int {
+		$chars = $this->max_chars();
+
+		/**
+		 * Filter the most characters the External Agency provider sends in one batch request; a longer text goes alone.
+		 *
+		 * @hook  perflocale/mt/agency_batch_max_chars
+		 * @since 1.0.7.5
+		 *
+		 * @param int $max_chars Default: the "Maximum characters per request" setting, else 20000.
+		 */
+		return max( 1, (int) apply_filters( 'perflocale/mt/agency_batch_max_chars', $chars > 0 ? $chars : self::BATCH_MAX_CHARS ) );
+	}
+
+	/**
+	 * The "Maximum characters per request" setting; 0 when empty.
+	 *
+	 * @since 1.0.8
+	 * @return int
+	 */
+	public function max_chars(): int {
+		return self::max_chars_value( $this->settings->get( 'mt_agency_max_chars', 0 ) );
+	}
+
+	/**
+	 * A stored or posted "Maximum characters per request": empty, 0 or not a number is 0, else clamped to the bounds.
+	 *
+	 * @since 1.0.8
+	 * @param mixed $value Raw value.
+	 * @return int
+	 */
+	public static function max_chars_value( mixed $value ): int {
+		$chars = is_numeric( $value ) ? (float) $value : 0.0;
+
+		if ( $chars < 1 ) {
+			return 0;
+		}
+
+		return (int) min( self::MAX_CHARS_MAX, max( self::MAX_CHARS_MIN, floor( $chars ) ) );
 	}
 
 	/**
@@ -217,6 +272,8 @@ final class ExternalAgencyProvider extends AbstractProvider {
 			$filtered[] = is_string( $sent ) ? $sent : $text;
 		}
 
+		$this->guard_send( (int) array_sum( array_map( static fn( $t ): int => \PerfLocale\Util\Utf8::length( (string) $t ), $filtered ) ) );
+
 		/**
 		 * Filter the most texts the External Agency provider sends in one batch request.
 		 *
@@ -227,22 +284,14 @@ final class ExternalAgencyProvider extends AbstractProvider {
 		 */
 		$max_texts = max( 1, (int) apply_filters( 'perflocale/mt/agency_batch_max_texts', self::BATCH_MAX_TEXTS ) );
 
-		/**
-		 * Filter the most characters the External Agency provider sends in one batch request; a longer text goes alone.
-		 *
-		 * @hook  perflocale/mt/agency_batch_max_chars
-		 * @since 1.0.7.5
-		 *
-		 * @param int $max_chars Default 20000.
-		 */
-		$max_chars = max( 1, (int) apply_filters( 'perflocale/mt/agency_batch_max_chars', self::BATCH_MAX_CHARS ) );
+		$max_chars = $this->batch_max_chars();
 
 		$chunks  = [];
 		$current = [];
 		$chars   = 0;
 
 		foreach ( $filtered as $i => $text ) {
-			$length = mb_strlen( $text );
+			$length = \PerfLocale\Util\Utf8::length( $text );
 
 			if ( [] !== $current && ( count( $current ) >= $max_texts || $chars + $length > $max_chars ) ) {
 				$chunks[] = $current;
@@ -258,7 +307,8 @@ final class ExternalAgencyProvider extends AbstractProvider {
 		$results  = [];
 
 		foreach ( $chunks as $positions ) {
-			$list = array_map( static fn( int $i ): string => $filtered[ $i ], $positions );
+			$list          = array_map( static fn( int $i ): string => $filtered[ $i ], $positions );
+			$this->sending = (int) array_sum( array_map( [ \PerfLocale\Util\Utf8::class, 'length' ], $list ) );
 
 			try {
 				$answers = $this->send_list( $url, $list, $source_lang, $target_lang, $fast_fail, $format );
@@ -370,7 +420,7 @@ final class ExternalAgencyProvider extends AbstractProvider {
 			}
 
 			$out[]  = $translation;
-			$chars += mb_strlen( $texts[ $k ] );
+			$chars += \PerfLocale\Util\Utf8::length( $texts[ $k ] );
 		}
 
 		$this->accept_response();

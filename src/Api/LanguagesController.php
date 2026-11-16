@@ -302,6 +302,17 @@ final class LanguagesController extends RestController {
 			);
 		}
 
+		// An active language takes the root paths of its code and URL prefix: refused while a published root post holds one.
+		if ( $is_active ) {
+			require_once dirname( __DIR__ ) . '/Translation/LanguageCodeSlugs.php';
+			$settings = \PerfLocale\Plugin::get_instance()->settings();
+			$clash    = \PerfLocale\Translation\LanguageCodeSlugs::clash( \PerfLocale\Translation\LanguageCodeSlugs::paths( $slug, $locale, $settings ), $settings )[1];
+
+			if ( '' !== $clash ) {
+				return $this->error( 'slug_used_by_content', $clash, 409 );
+			}
+		}
+
 		$id = $repo->insert(
 			[
 				'slug'           => $slug,
@@ -398,6 +409,17 @@ final class LanguagesController extends RestController {
 			}
 		}
 
+		if ( ! empty( $data['is_active'] ) && empty( $language->is_active ) ) {
+			require_once dirname( __DIR__ ) . '/Translation/LanguageCodeSlugs.php';
+			$settings = \PerfLocale\Plugin::get_instance()->settings();
+			$paths    = is_string( $language->slug ?? null ) && is_string( $language->locale ?? null ) ? \PerfLocale\Translation\LanguageCodeSlugs::paths( $language->slug, $language->locale, $settings ) : [];
+			$clash    = \PerfLocale\Translation\LanguageCodeSlugs::clash( $paths, $settings )[1];
+
+			if ( '' !== $clash ) {
+				return $this->error( 'slug_used_by_content', $clash, 409 );
+			}
+		}
+
 		$written = $repo->update( (int) $language->id, $data );
 
 		// update() is false on a failed write and on a PATCH with no recognised field (no SET clause): that no-op keeps its 200.
@@ -460,8 +482,17 @@ final class LanguagesController extends RestController {
 			);
 		}
 
-		// False means the cascade rolled back: the language and its links are all still there.
+		// False means the cascade rolled back (the language and its links are all still there), or it was not confirmed.
 		if ( ! $repo->delete( (int) $language->id ) ) {
+			if ( 'delete_data' === \PerfLocale\Database\Repository\LanguageWrites::refused() ) {
+				return $this->error( 'delete_refused', \PerfLocale\Database\Repository\LanguageWrites::refusal( 'delete_data' ), 409 );
+			}
+
+			// Not confirmed: it may have been deleted.
+			if ( 'delete_unknown' === \PerfLocale\Database\Repository\LanguageWrites::refused() ) {
+				return $this->error( 'delete_unconfirmed', \PerfLocale\Database\Repository\LanguageWrites::refusal( 'delete_unknown' ), 500 );
+			}
+
 			return $this->error(
 				'delete_failed',
 				__( 'The language could not be deleted; nothing was changed.', 'perflocale' ),

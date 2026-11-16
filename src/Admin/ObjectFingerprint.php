@@ -151,12 +151,17 @@ final class ObjectFingerprint {
 	}
 
 	/**
-	 * The kind of object (`post` or `term`) a row's type column names, or '' for one without a fingerprint.
+	 * The kind of object (`post` or `term`) a row's type column names, or '' for one without a fingerprint; a term's old
+	 * URL slug rows (term_h1..term_h5) are the term's.
 	 *
 	 * @param mixed $type The row's `type` or `object_type`.
 	 * @return string
 	 */
 	public static function kind( $type ): string {
+		if ( is_string( $type ) && 1 === preg_match( '/^term_h[1-5]\z/', $type ) ) {
+			return 'term';
+		}
+
 		return ( 'post' === $type || 'term' === $type ) ? (string) $type : '';
 	}
 

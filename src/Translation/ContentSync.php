@@ -43,6 +43,40 @@ final class ContentSync {
 	private readonly CacheManager $cache;
 
 	/**
+	 * A saved post's rows as the least trusted of the saver, its author and its last editor may store them
+	 * (SourceTrust: KSES without unfiltered_html; core never filters meta). Null: a row cannot be cleaned, not copied.
+	 *
+	 * @param int       $source_id The post the rows come from.
+	 * @param mixed     $rows      Rows as get_post_meta() read them.
+	 * @param bool|null $least     Whether the post is untrusted; computed on first use.
+	 * @return array<int|string, mixed>|null
+	 */
+	private static function least_rows( int $source_id, mixed $rows, ?bool &$least ): ?array {
+		if ( ! is_array( $rows ) || [] === $rows ) {
+			return is_array( $rows ) ? $rows : [];
+		}
+
+		require_once __DIR__ . '/SourceTrust.php';
+		$least ??= ! SourceTrust::trusted( $source_id );
+
+		if ( ! $least ) {
+			return $rows;
+		}
+
+		foreach ( $rows as $i => $row ) {
+			$clean = SourceTrust::least_row( $row );
+
+			if ( null === $clean && null !== $row ) {
+				return null;
+			}
+
+			$rows[ $i ] = $clean;
+		}
+
+		return $rows;
+	}
+
+	/**
 	 * Cross-request sync lock TTL (seconds).
 	 *
 	 * Outlives a normal sync; a crashed request blocks later saves only this long.
@@ -60,6 +94,12 @@ final class ContentSync {
 		'comment_status' => 'comment_status',
 		'ping_status'    => 'ping_status',
 	];
+
+	/**
+	 * Sync Fields that are the post's comment and ping status: synced only when the type offers it and the save
+	 * carried it (unsynced_status_fields()).
+	 */
+	private const STATUS_FIELDS = [ 'comment_status', 'ping_status' ];
 
 	/**
 	 * Most posts one per-request state array tracks; past it the oldest entry is dropped, or synced at once (deferred writes).
@@ -86,6 +126,13 @@ final class ContentSync {
 	 * @var int
 	 */
 	private static int $suspended = 0;
+
+	/**
+	 * Posts whose featured image a write removed in this request, as "blog:post" => true.
+	 *
+	 * @var array<string, true>
+	 */
+	private static array $thumb_removed = [];
 
 	/**
 	 * Posts inside a save ("{blog_id}:{post_id}" => true), from `pre_post_update`, `save_post` or the edit-screen
@@ -221,6 +268,27 @@ final class ContentSync {
 	private static array $stale_marks = [];
 
 	/**
+	 * Status fields each save carried ("{blog_id}:{post_id}" => fields), set on `post_updated`; a new post has none.
+	 *
+	 * @var array<string, list<string>>
+	 */
+	private static array $status_carried = [];
+
+	/**
+	 * Status fields a posts-endpoint REST write had in its body ("{blog_id}:{post_id}" => field => true), while it runs.
+	 *
+	 * @var array<string, array<string, true>>
+	 */
+	private static array $rest_status = [];
+
+	/**
+	 * Status fields the edit form had ("{blog_id}:{post_id}" => fields), read before core fills in missing ones.
+	 *
+	 * @var array<string, list<string>>
+	 */
+	private static array $form_status = [];
+
+	/**
 	 * Constructor.
 	 *
 	 * @param Settings     $settings Plugin settings.
@@ -230,6 +298,19 @@ final class ContentSync {
 		$this->settings = $settings;
 		$this->cache    = $cache;
 		$this->manager  = new PostTranslationManager( $cache, $settings );
+	}
+
+	/**
+	 * Forward edit_terms to TermSlugFollow, which is outside the class map and so required here.
+	 *
+	 * @param mixed $term_id  Term ID.
+	 * @param mixed $taxonomy Taxonomy.
+	 * @param mixed $args     Arguments of wp_update_term().
+	 * @return void
+	 */
+	public static function follow_term_slug( mixed $term_id, mixed $taxonomy = '', mixed $args = [] ): void {
+		require_once __DIR__ . '/TermSlugFollow.php';
+		TermSlugFollow::before( $term_id, $taxonomy, $args );
 	}
 
 	/**
@@ -243,6 +324,12 @@ final class ContentSync {
 
 		// Term edits sync to the sibling terms too.
 		add_action( 'edited_term', [ $this, 'sync_on_term_edit' ], 20, 3 );
+
+		// A term's URL slug follows a Slug rename. Here, not in Bootstrap: these hooks boot on the first write
+		// (edit_terms at PHP_INT_MIN), and TermSlugFollow loads only inside wp_update_term().
+		add_action( 'edit_terms', [ self::class, 'follow_term_slug' ], 10, 3 );
+		// Term URL slugs a creation could not write during an import; every runner of the event is a write context.
+		add_action( 'perflocale_term_slug_retry', [ \PerfLocale\BootstrapMaintenance::class, 'term_slug_retry' ], 10, 2 );
 
 		// The featured image and Sync Fields meta also change without a post save or after it (set_post_thumbnail(),
 		// WooCommerce CRUD, REST `featured_media` / `meta`): each such write syncs that one field.
@@ -262,6 +349,9 @@ final class ContentSync {
 
 		// The row of a post a person is saving, as it was before the save.
 		add_action( 'post_updated', [ $this, 'note_person_row' ], 10, 3 );
+
+		// The status fields each save carried.
+		add_action( 'post_updated', [ $this, 'note_status_carried' ], 10, 3 );
 
 		// The block editor's meta-box form of a translation marked stale
 		// names the mark, for the meta-box requests sent after its saves.
@@ -728,6 +818,7 @@ final class ContentSync {
 
 			if ( 1 === $result || 2 === $result ) {
 				self::open_person_edit( substr( $action, 12 ) );
+				self::note_form_status( (int) substr( $action, 12 ) );
 			}
 		}
 	}
@@ -744,8 +835,13 @@ final class ContentSync {
 	 */
 	public function open_rest_person_edit( mixed $response = null, mixed $handler = null, mixed $request = null ): mixed {
 		if ( is_wp_error( $response ) || ! $request instanceof \WP_REST_Request
-			|| in_array( $request->get_method(), [ 'GET', 'HEAD', 'OPTIONS' ], true )
-			|| true !== ( $GLOBALS['wp_rest_auth_cookie'] ?? null ) || ! \PerfLocale\Helper::is_rest_request() ) {
+			|| in_array( $request->get_method(), [ 'GET', 'HEAD', 'OPTIONS' ], true ) ) {
+			return $response;
+		}
+
+		self::note_rest_status( $handler, $request );
+
+		if ( true !== ( $GLOBALS['wp_rest_auth_cookie'] ?? null ) || ! \PerfLocale\Helper::is_rest_request() ) {
 			return $response;
 		}
 
@@ -754,6 +850,153 @@ final class ContentSync {
 		}
 
 		return $response;
+	}
+
+	/**
+	 * Note the status fields a posts-endpoint REST write has in its body or query: the ones it carried.
+	 *
+	 * @param mixed            $handler Route handler.
+	 * @param \WP_REST_Request $request Request.
+	 * @return void
+	 */
+	private static function note_rest_status( mixed $handler, \WP_REST_Request $request ): void {
+		if ( ! is_array( $handler ) || ! is_array( $handler['callback'] ?? null )
+			|| ! ( $handler['callback'][0] ?? null ) instanceof \WP_REST_Posts_Controller ) {
+			return;
+		}
+
+		$id = $request->get_param( 'id' );
+
+		if ( ! is_numeric( $id ) || (int) $id <= 0 ) {
+			return;
+		}
+
+		$body    = array_merge( (array) $request->get_query_params(), (array) $request->get_body_params(), (array) $request->get_json_params() );
+		$carried = [];
+
+		foreach ( self::STATUS_FIELDS as $field ) {
+			if ( array_key_exists( $field, $body ) ) {
+				$carried[ $field ] = true;
+			}
+		}
+
+		if ( count( self::$rest_status ) >= self::DEFERRED_CAP ) {
+			unset( self::$rest_status[ array_key_first( self::$rest_status ) ] );
+		}
+
+		self::$rest_status[ get_current_blog_id() . ':' . (int) $id ] = $carried;
+	}
+
+	/**
+	 * Note the status fields the edit form had, after its nonce check and before edit_post() fills 'closed' for a missing
+	 * one: those it sent, both with core's Discussion box (`advanced_view`), Comment Status with WooCommerce's box.
+	 *
+	 * @param int $post_id Post the form saves.
+	 * @return void
+	 */
+	private static function note_form_status( int $post_id ): void {
+		if ( $post_id <= 0 ) {
+			return;
+		}
+
+		$fields = [];
+
+		// phpcs:disable WordPress.Security.NonceVerification.Missing -- Called from the form's own passed nonce check; only which fields were sent is read.
+		foreach ( self::STATUS_FIELDS as $field ) {
+			if ( isset( $_POST[ $field ] ) || isset( $_POST['advanced_view'] )
+				|| ( 'comment_status' === $field && isset( $_POST['woocommerce_meta_nonce'] ) && 'product' === get_post_type( $post_id ) ) ) {
+				$fields[] = $field;
+			}
+		}
+		// phpcs:enable
+
+		$key = get_current_blog_id() . ':' . $post_id;
+		unset( self::$form_status[ $key ] );
+
+		if ( count( self::$form_status ) >= self::DEFERRED_CAP ) {
+			unset( self::$form_status[ array_key_first( self::$form_status ) ] );
+		}
+
+		self::$form_status[ $key ] = $fields;
+	}
+
+	/**
+	 * Drop the note of a REST write once its callbacks have run.
+	 *
+	 * @param \WP_REST_Request $request Request.
+	 * @return void
+	 */
+	private static function forget_rest_status( \WP_REST_Request $request ): void {
+		$id = $request->get_param( 'id' );
+
+		if ( is_numeric( $id ) ) {
+			unset( self::$rest_status[ get_current_blog_id() . ':' . (int) $id ] );
+		}
+	}
+
+	/**
+	 * `post_updated`: keep the status fields this save carried (carried_status_fields()), for its sync.
+	 *
+	 * @param int|mixed           $post_id     Post ID (unused).
+	 * @param \WP_Post|mixed|null $post_after  Post after the update.
+	 * @param \WP_Post|mixed|null $post_before Post before the update.
+	 * @return void
+	 */
+	public function note_status_carried( mixed $post_id = 0, mixed $post_after = null, mixed $post_before = null ): void {
+		unset( $post_id );
+
+		if ( ! $post_after instanceof \WP_Post || ! $post_before instanceof \WP_Post ) {
+			return;
+		}
+
+		$key = $this->state_key( (int) $post_after->ID );
+		unset( self::$status_carried[ $key ] );
+
+		if ( count( self::$status_carried ) >= self::DEFERRED_CAP ) {
+			unset( self::$status_carried[ array_key_first( self::$status_carried ) ] );
+		}
+
+		self::$status_carried[ $key ] = self::carried_status_fields( (int) $post_after->ID, $post_after, $post_before );
+	}
+
+	/**
+	 * The status fields a save carried: a REST write's or the edit form's own, every field for Quick Edit, else the
+	 * fields it changed, so a value WordPress filled in for a field the form lacked ('closed') is never carried.
+	 *
+	 * @param int      $post_id Post saved.
+	 * @param \WP_Post $after   Post after the save.
+	 * @param \WP_Post $before  Post before the save.
+	 * @return list<string>
+	 */
+	private static function carried_status_fields( int $post_id, \WP_Post $after, \WP_Post $before ): array {
+		$key = get_current_blog_id() . ':' . $post_id;
+
+		if ( isset( self::$rest_status[ $key ] ) ) {
+			return array_keys( self::$rest_status[ $key ] );
+		}
+
+		if ( isset( self::$form_status[ $key ] ) ) {
+			return self::$form_status[ $key ];
+		}
+
+		// phpcs:disable WordPress.Security.NonceVerification.Missing -- Read after Quick Edit's own nonce check (check_ajax_referer), only to tell which post it saves.
+		$action  = isset( $_POST['action'] ) && is_string( $_POST['action'] ) ? sanitize_key( wp_unslash( $_POST['action'] ) ) : '';
+		$form_id = isset( $_POST['post_ID'] ) && is_numeric( $_POST['post_ID'] ) ? (int) $_POST['post_ID'] : 0;
+		// phpcs:enable
+
+		if ( $form_id === $post_id && 'inline-save' === $action && wp_doing_ajax() ) {
+			return self::STATUS_FIELDS;
+		}
+
+		$carried = [];
+
+		foreach ( self::STATUS_FIELDS as $field ) {
+			if ( (string) $before->$field !== (string) $after->$field ) {
+				$carried[] = $field;
+			}
+		}
+
+		return $carried;
 	}
 
 	/**
@@ -983,6 +1226,10 @@ final class ContentSync {
 	 * @return mixed
 	 */
 	public function add_skipped_to_rest_response( mixed $response = null, mixed $handler = null, mixed $request = null ): mixed {
+		if ( self::$rest_status !== [] && $request instanceof \WP_REST_Request ) {
+			self::forget_rest_status( $request );
+		}
+
 		if ( ! $response instanceof \WP_REST_Response || ! $request instanceof \WP_REST_Request
 			|| ! in_array( $request->get_method(), [ 'POST', 'PUT', 'PATCH' ], true )
 			|| ! is_array( $handler ) || ! is_array( $handler['callback'] ?? null )
@@ -1460,7 +1707,17 @@ final class ContentSync {
 			return;
 		}
 
+		// A meta write of a post Content ReSync is writing syncs nothing, as its save does not.
+		if ( self::resync_writing( (int) $object_id ) ) {
+			return;
+		}
+
 		self::note_person_write_after( $object_id, $meta_key );
+
+		// A featured image removed from this post; a post that never had one fires no delete.
+		if ( '_thumbnail_id' === $meta_key && 'deleted_post_meta' === current_action() ) {
+			self::$thumb_removed[ get_current_blog_id() . ':' . (int) $object_id ] = true;
+		}
 
 		$field = $this->configured_field_for_meta_key( $meta_key );
 
@@ -2321,6 +2578,17 @@ final class ContentSync {
 	}
 
 	/**
+	 * Whether Content ReSync is writing this post now.
+	 * A request that has not loaded ChangeService runs no ReSync write, so the check loads no class.
+	 *
+	 * @param int $post_id Post ID.
+	 * @return bool
+	 */
+	private static function resync_writing( int $post_id ): bool {
+		return class_exists( \PerfLocale\Automation\ChangeService::class, false ) && \PerfLocale\Automation\ChangeService::is_writing_post( $post_id );
+	}
+
+	/**
 	 * Synchronize configured fields when a post is saved.
 	 *
 	 * @param int           $post_id Post ID.
@@ -2330,6 +2598,11 @@ final class ContentSync {
 	public function sync_on_save( int $post_id, ?\WP_Post $post = null ): void {
 		// Core hands over its re-read row, null when the post was deleted meanwhile; some plugins pass one argument.
 		if ( ! $post instanceof \WP_Post ) {
+			return;
+		}
+
+		// A Content ReSync write's Sync Fields never reach the group: nothing is synced, queued, counted or marked.
+		if ( self::resync_writing( $post_id ) ) {
 			return;
 		}
 
@@ -2391,6 +2664,9 @@ final class ContentSync {
 			return;
 		}
 
+		// One patterns answer for this sync and the field maps it builds (each field addon asks for them too).
+		$window = PostTranslationWrites::open_patterns_window();
+
 		try {
 			$user_fields = (array) $this->settings->get( 'sync_fields', [] );
 
@@ -2422,6 +2698,7 @@ final class ContentSync {
 			 * @param int                $post_id     Source post id.
 			 */
 			$sync_fields = (array) apply_filters( 'perflocale/sync_fields/for_post', $sync_fields, (int) $post_id );
+			$sync_fields = array_diff( $sync_fields, self::unsynced_status_fields( $post_id, $post->post_type, $clearing ) );
 
 			if ( empty( $sync_fields ) ) {
 				return;
@@ -2488,8 +2765,36 @@ final class ContentSync {
 				$this->sync_siblings( $post_id, $translations, $sync_fields, $is_default_source, $seed_only );
 			}
 		} finally {
+			if ( $window ) {
+				PostTranslationWrites::close_patterns_window();
+			}
+
 			Lock::release( $this->post_lock( $post_id ) );
 		}
+	}
+
+	/**
+	 * The status fields a save leaves out of the synced fields: each needs type support ('comments', 'trackbacks')
+	 * and must be carried by this save, since a value WordPress filled in for a missing field is not the person's.
+	 * Applied after both `perflocale/sync_fields` filters, so filter-added fields follow the same rule.
+	 *
+	 * @param int    $post_id   Post saved.
+	 * @param string $post_type Post type of the saved post.
+	 * @param bool   $clearing  Whether the save clears the post's stale mark.
+	 * @return list<string> Among comment_status and ping_status.
+	 */
+	private static function unsynced_status_fields( int $post_id, string $post_type, bool $clearing = false ): array {
+		$carried = self::$status_carried[ get_current_blog_id() . ':' . $post_id ] ?? [];
+		$fields  = [];
+
+		foreach ( self::STATUS_FIELDS as $field ) {
+			if ( ! post_type_supports( $post_type, 'comment_status' === $field ? 'comments' : 'trackbacks' )
+				|| ( ! $clearing && ! in_array( $field, $carried, true ) ) ) {
+				$fields[] = $field;
+			}
+		}
+
+		return $fields;
 	}
 
 	/**
@@ -2567,10 +2872,11 @@ final class ContentSync {
 		/** This filter is documented in src/Translation/ContentSync.php */
 		$fields = (array) apply_filters( 'perflocale/sync_fields/for_post', $fields, $post_id );
 
-		$names = [];
+		$names    = [];
+		$unsynced = self::unsynced_status_fields( $post_id, $post->post_type );
 
 		foreach ( $fields as $field ) {
-			if ( is_string( $field ) && '' !== $field ) {
+			if ( is_string( $field ) && '' !== $field && ! in_array( $field, $unsynced, true ) ) {
 				$names[ $field ] = $field;
 			}
 		}
@@ -2666,6 +2972,9 @@ final class ContentSync {
 				}
 			}
 		}
+
+		// A status field the save did not carry is never the person's change: the post takes the group's value.
+		$changed = array_values( array_diff( $changed, self::unsynced_status_fields( $post_id, (string) get_post_type( $post_id ) ) ) );
 
 		// Sync Fields an earlier save that could not clear the mark changed
 		// (keep_pending_changes()) count as changed by this one.
@@ -2786,7 +3095,7 @@ final class ContentSync {
 	 *
 	 * @param int                $post_id           Post whose values are copied.
 	 * @param array<string, int> $translations      language_slug => post_id map for the group.
-	 * @param array<string>      $fields            Fields to sync.
+	 * @param array<string>      $fields            Fields to sync; of the status fields only those the save carried and the type offers (unsynced_status_fields()).
 	 * @param bool               $is_default_source Whether $post_id is the group's default-language member.
 	 * @param array<string>      $seed_only         Seed-only meta keys among $fields.
 	 * @return void
@@ -3024,6 +3333,13 @@ final class ContentSync {
 		$fields    = array_values( array_filter( $fields, $internal ) );
 		$seed_only = array_values( array_filter( $seed_only, $internal ) );
 
+		// Switched to another blog, only post fields and known meta keys are mirrored or seeded (definitions unknown there).
+		if ( \PerfLocale\Translation\Fields\FieldMap::definitions_unavailable() ) {
+			$known     = static fn ( mixed $field ): bool => is_string( $field ) && \PerfLocale\Translation\Fields\FieldMap::travels_switched( $field );
+			$fields    = array_values( array_filter( $fields, static fn ( mixed $field ): bool => 'featured_image' === $field || isset( self::POST_FIELD_MAP[ (string) $field ] ) || $known( $field ) ) );
+			$seed_only = array_values( array_filter( $seed_only, $known ) );
+		}
+
 		// Post fields that can be batched into a single wp_update_post() call.
 		$post_field_map = self::POST_FIELD_MAP;
 
@@ -3204,15 +3520,19 @@ final class ContentSync {
 		if ( $has_thumb ) {
 			$thumbnail_id = get_post_thumbnail_id( $source_id );
 
+			// No image clears the siblings' only when this request removed it: a post that never had one (a copy core
+			// refused a file-less image) must not take the group's away.
+			$clears = ! $thumbnail_id && isset( self::$thumb_removed[ get_current_blog_id() . ':' . $source_id ] );
+
 			if ( $dry_run ) {
 				$image_id = $thumbnail_id ? $this->manager->attachment_in_language( (int) $thumbnail_id, $target_lang_slug ) : 0;
 
-				if ( $image_id !== (int) get_post_thumbnail_id( $target_id ) ) {
+				if ( ( $thumbnail_id || $clears ) && $image_id !== (int) get_post_thumbnail_id( $target_id ) ) {
 					return true;
 				}
 			} elseif ( $thumbnail_id ) {
 				set_post_thumbnail( $target_id, $this->manager->attachment_in_language( (int) $thumbnail_id, $target_lang_slug ) );
-			} else {
+			} elseif ( $clears ) {
 				delete_post_thumbnail( $target_id );
 			}
 		}
@@ -3226,6 +3546,7 @@ final class ContentSync {
 			$seed_set           = array_fill_keys( $seed_only, true );
 			$cleared            = null;
 			$sensitive_patterns = null;
+			$least              = null;
 
 			foreach ( $fields as $field ) {
 				if ( $field === 'featured_image' || isset( $post_field_map[ $field ] ) ) {
@@ -3258,6 +3579,12 @@ final class ContentSync {
 						continue;
 					}
 
+					$seed_values = self::least_rows( $source_id, $seed_values, $least );
+
+					if ( null === $seed_values ) {
+						continue;
+					}
+
 					if ( $dry_run ) {
 						return true;
 					}
@@ -3285,7 +3612,11 @@ final class ContentSync {
 
 				// MIRROR keys: clear the target and re-add every source row. An absent or single empty-string source
 				// deletes the target's rows by design (docs-ai/04-do-not-fix.md 2.15).
-				$values = get_post_meta( $source_id, $field, false );
+				$values = self::least_rows( $source_id, get_post_meta( $source_id, $field, false ), $least );
+
+				if ( null === $values ) {
+					continue;
+				}
 
 				// Skip identical rows so a title fix rewrites no builder JSON. Compare SERIALIZED forms: builder meta can
 				// hold objects (Beaver nodes), which a strict array compare never matches.

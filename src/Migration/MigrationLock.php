@@ -109,20 +109,45 @@ final class MigrationLock {
 	}
 
 	/**
-	 * Seconds until the lock expires, or 0 when no import holds it.
+	 * Seconds until the lock expires, or 0 when no import holds it; 1 when the read failed (counts as held). Read past
+	 * the options cache: the row is written with raw SQL.
 	 *
 	 * @return int
 	 */
 	public static function seconds_remaining(): int {
-		$stored = get_option( JobLock::TYPE_PREFIX . self::TYPE, '' );
+		$wpdb = \PerfLocale\Admin\Typed::wpdb();
 
-		if ( ! is_string( $stored ) || $stored === '' ) {
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$stored = $wpdb->get_var( $wpdb->prepare( 'SELECT option_value FROM %i WHERE option_name = %s LIMIT 1', $wpdb->options, self::option_name() ) );
+
+		if ( '' !== $wpdb->last_error ) {
+			return 1;
+		}
+
+		return self::remaining_of( is_string( $stored ) ? $stored : null );
+	}
+
+	/**
+	 * The lock's option name.
+	 *
+	 * @return string
+	 */
+	public static function option_name(): string {
+		return JobLock::TYPE_PREFIX . self::TYPE;
+	}
+
+	/**
+	 * Seconds left on the lock option's stored value.
+	 *
+	 * @param string|null $stored The option's value (null: no row).
+	 * @return int
+	 */
+	public static function remaining_of( ?string $stored ): int {
+		if ( null === $stored || '' === $stored ) {
 			return 0;
 		}
 
-		$expires = (int) strtok( $stored, '|' );
-
-		return max( 0, $expires - time() );
+		return max( 0, (int) strtok( $stored, '|' ) - time() );
 	}
 
 	/**

@@ -369,10 +369,12 @@ final class MediaTranslationManager {
 	/**
 	 * Media picker for the metabox on post-edit screens.
 	 *
-	 * @param string $hook Current admin page hook.
+	 * @param mixed $hook Current admin page hook (mixed: iframe_header() passes null outside admin.php).
 	 * @return void
 	 */
-	public function enqueue_media_picker_on_post_edit( string $hook ): void {
-		MediaTranslationAdmin::enqueue_media_picker_on_post_edit( $hook );
+	public function enqueue_media_picker_on_post_edit( mixed $hook ): void {
+		if ( is_string( $hook ) ) {
+			MediaTranslationAdmin::enqueue_media_picker_on_post_edit( $hook );
+		}
 	}
 }

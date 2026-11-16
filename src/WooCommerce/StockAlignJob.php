@@ -129,6 +129,7 @@ final class StockAlignJob extends AbstractJob {
 	 */
 	public function execute( array $args, callable $progress ): array {
 		$sync = Api::ready();
+		$sync = $sync instanceof \WP_Error ? $sync : ( Api::lock_unavailable() ?? $sync );
 
 		if ( $sync instanceof \WP_Error ) {
 			throw new \RuntimeException( esc_html( $sync->get_error_message() ) );

@@ -119,6 +119,36 @@ a.perflocale-panel-status:hover {
 	color: #166534;
 }
 
+.perflocale-panel-update {
+	display: inline-block;
+	margin-right: 6px;
+	padding: 2px 10px;
+	border-radius: 10px;
+	font-size: 11px;
+	font-weight: 600;
+	line-height: 1.5;
+	text-decoration: none;
+	background: #fcf3d9;
+	color: #7a5b00;
+}
+
+.perflocale-panel-update:hover {
+	background: #f8e9b8;
+	color: #7a5b00;
+}
+
+.perflocale-panel-update-note {
+	margin: 0 0 10px;
+	padding: 8px 10px;
+	border: 1px solid #f0d58c;
+	border-radius: 4px;
+	background: #fcf3d9;
+	color: #7a5b00;
+	font-size: 13px;
+}
+
+.perflocale-panel-update-note a { color: #7a5b00; font-weight: 600; }
+
 .perflocale-panel-create {
 	display: inline-flex;
 	align-items: center;
@@ -258,4 +288,57 @@ a.perflocale-panel-status:hover {
 	margin: 16px;
 	border-right-color: #dba617;
 	background: #fcf9e8;
+}
+
+/* ---- Content ReSync: "Resync" on a row is a pill; the panel's bar link is a core secondary button ---- */
+.perflocale-panel-resync:not(.components-button) {
+	display: inline-block;
+	margin-right: 6px;
+	padding: 2px 10px;
+	border-radius: 10px;
+	font-size: 11px;
+	font-weight: 600;
+	line-height: 1.5;
+	text-decoration: none;
+	background: #e7f0f9;
+	color: #135e96;
+}
+
+.perflocale-panel-resync:not(.components-button):hover {
+	background: #d4e4f5;
+	color: #135e96;
+}
+
+.perflocale-panel-resync.is-disabled {
+	cursor: not-allowed;
+}
+
+/* Core greys a disabled secondary button itself. */
+.perflocale-panel-resync.is-disabled:not(.components-button) {
+	opacity: 0.6;
+}
+
+.perflocale-panel-resync-bar {
+	margin: 0 0 10px;
+}
+
+.perflocale-panel-resync-bar .perflocale-panel-resync:not(.components-button) {
+	margin-right: 0;
+}
+
+/* Full width like the rows below; a long translated label wraps instead of overflowing the sidebar. */
+.perflocale-panel-resync-bar .perflocale-panel-resync.components-button {
+	justify-content: center;
+	box-sizing: border-box;
+	width: 100%;
+	height: auto;
+	min-height: 36px;
+	white-space: normal;
+	text-align: center;
+}
+
+.perflocale-panel-resync-hint {
+	margin: -6px 0 10px;
+	font-size: 12px;
+	color: #50575e;
 }

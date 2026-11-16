@@ -245,6 +245,31 @@ final class SourceBoundWrite {
 	}
 
 	/**
+	 * SQL condition: the source's author and its one `_edit_last` row (none when $last is 0) are still these.
+	 *
+	 * @param int $source_id Source post id.
+	 * @param int $author    Author checked.
+	 * @param int $last      Last editor checked (0: no row).
+	 * @return string
+	 */
+	public static function writers_hold( int $source_id, int $author, int $last ): string {
+		/**
+		 * WordPress database.
+		 *
+		 * @var \wpdb $wpdb
+		 */
+		global $wpdb;
+
+		$rows = '`' . esc_sql( $wpdb->postmeta ) . '` pfl_m WHERE pfl_m.post_id = ' . $source_id . " AND pfl_m.meta_key = '_edit_last'";
+
+		return 'EXISTS ( SELECT 1 FROM ( SELECT pfl_a.ID FROM `' . esc_sql( $wpdb->posts ) . '` pfl_a WHERE pfl_a.ID = ' . $source_id
+			. ' AND pfl_a.post_author = ' . $author
+			. ' AND ( SELECT COUNT(*) FROM ' . $rows . ' ) = ' . ( $last > 0 ? 1 : 0 )
+			. ( $last > 0 ? ' AND EXISTS ( SELECT 1 FROM ' . $rows . " AND pfl_m.meta_value = '" . $last . "' )" : '' )
+			. ' LIMIT 1 ) pfl_w )';
+	}
+
+	/**
 	 * A value as a quoted SQL literal, escaped as wpdb escapes.
 	 *
 	 * @param string $value Value.

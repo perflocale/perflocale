@@ -40,9 +40,17 @@ final class SiteHealthHooks {
 
 		add_action( 'admin_notices', [ self::class, 'render_leftover_notice' ] );
 
+		// The network upgrade pass runs from WP-Cron and Action Scheduler (cron or admin-ajax); WP-CLI registers it too.
+		if ( is_multisite() ) {
+			add_action( \PerfLocale\Database\NetworkUpgrade::HOOK, [ \PerfLocale\Database\NetworkUpgrade::class, 'run' ] );
+		}
+
 		// The Status screen runs the language-pack test through this admin-ajax action.
 		if ( wp_doing_ajax() ) {
 			add_action( 'wp_ajax_health-check-perflocale-language-packs', [ self::class, 'ajax_language_packs' ] );
+			add_action( 'wp_ajax_health-check-perflocale-duplicate-post-slugs', [ self::class, 'ajax_duplicate_post_slugs' ] );
+			add_action( 'wp_ajax_health-check-perflocale-fallback-pages', [ self::class, 'ajax_fallback_pages' ] );
+			add_action( 'wp_ajax_health-check-perflocale-term-slug-review', [ self::class, 'ajax_term_slug_review' ] );
 		}
 	}
 
@@ -110,5 +118,59 @@ final class SiteHealthHooks {
 	 */
 	public static function ajax_language_packs(): void {
 		self::health()->ajax_language_packs();
+	}
+
+	/**
+	 * Admin-ajax endpoint of the duplicate post address test (its class stays out of the classmap).
+	 *
+	 * @return void
+	 */
+	public static function ajax_duplicate_post_slugs(): void {
+		require_once __DIR__ . '/SiteHealth/DuplicatePostSlugs.php';
+
+		SiteHealth\DuplicatePostSlugs::ajax();
+	}
+
+	/**
+	 * Admin-ajax endpoint of the untranslated content test (its class stays out of the classmap).
+	 *
+	 * @return void
+	 */
+	public static function ajax_fallback_pages(): void {
+		require_once __DIR__ . '/SiteHealth/FallbackPages.php';
+
+		SiteHealth\FallbackPages::ajax();
+	}
+
+	/**
+	 * The stock flag test (StockDriftFlag, outside the class map).
+	 *
+	 * @return array<string, mixed>
+	 */
+	public static function stock_drift(): array {
+		require_once dirname( __DIR__ ) . '/WooCommerce/StockDriftFlag.php';
+
+		return \PerfLocale\WooCommerce\StockDriftFlag::health();
+	}
+
+	/**
+	 * The term address review (weekly check); the class is outside the class map, so it is required here.
+	 *
+	 * @return array<string, mixed>
+	 */
+	public static function term_slug_review(): array {
+		require_once __DIR__ . '/SiteHealth/TermSlugReview.php';
+
+		return SiteHealth\TermSlugReview::test();
+	}
+
+	/**
+	 * Admin-ajax endpoint of the term address review (Status screen).
+	 *
+	 * @return void
+	 */
+	public static function ajax_term_slug_review(): void {
+		require_once __DIR__ . '/SiteHealth/TermSlugReview.php';
+		SiteHealth\TermSlugReview::ajax();
 	}
 }

@@ -385,9 +385,6 @@ final class PostQueryFilter {
 		// Redirect front/blog page slugs to their canonical language root URL.
 		add_action( 'template_redirect', [ $this, 'redirect_front_page_slug' ], 5 );
 
-		// Priority 1: strip the `perflocale_fb` sentinel before the fallback handler can re-fire on it.
-		add_action( 'template_redirect', [ $this, 'clean_fallback_sentinel' ], 1 );
-
 		// Enforce missing translation action on singular pages.
 		add_action( 'template_redirect', [ $this, 'handle_missing_translation' ] );
 
@@ -643,8 +640,7 @@ final class PostQueryFilter {
 			$canonical .= substr( $request_uri, $qs_pos );
 		}
 
-		wp_safe_redirect( $canonical, 301 );
-		exit;
+		\PerfLocale\Router\Redirect\Sender::to( $canonical, 301, 'front_page_slug' );
 	}
 
 	/**
@@ -881,23 +877,19 @@ final class PostQueryFilter {
 		$pagename = Helper::normalize_slug_for_query( (string) $query->get( 'pagename' ) );
 
 		if ( ! empty( $pagename ) ) {
-			// Nested page: look up by basename, then require get_page_uri() to equal the path.
-			// Do not remove the URI checks: a same-basename page under another parent would be served.
-			$lookup_slug = $pagename;
-			$require_uri = '';
-
-			if ( str_contains( (string) $pagename, '/' ) ) {
-				$lookup_slug = wp_basename( (string) $pagename );
-				$require_uri = trim( (string) $pagename, '/' );
-			}
+			// A hierarchical type without its own query var arrives as post_type + pagename.
+			$type = $query->get( 'post_type' );
+			$type = is_string( $type ) && '' !== $type && is_post_type_hierarchical( $type ) ? $type : 'page';
+			$page = 'page' === $type;
+			$path = trim( (string) $pagename, '/' );
+			$slug = wp_basename( $path );
 
 			// A preview_id loads that post first. Only this route checks the path at depth 0 too:
 			// slugs are unique only among siblings. Do not harmonise with the lookups below.
-			$preview_id  = $this->logged_in_preview_id( $query );
-			$preview_uri = $require_uri !== '' ? $require_uri : $lookup_slug;
+			$preview_id = $page ? $this->logged_in_preview_id( $query ) : -1;
 
 			if ( $preview_id > 0 ) {
-				$preview_target = $this->find_preview_target( $lookup_slug, $language_id, 'page', $preview_uri, $preview_id );
+				$preview_target = $this->find_preview_target( $slug, $language_id, 'page', $path, $preview_id );
 
 				if ( $preview_target > 0 ) {
 					$this->route_to_preview_target( $query, $preview_target, true );
@@ -905,27 +897,16 @@ final class PostQueryFilter {
 				}
 			}
 
-			$resolved_id = $this->find_post_by_slug_and_language( $lookup_slug, $language_id, 'page' );
-
-			if ( $resolved_id && $require_uri !== '' && get_page_uri( $resolved_id ) !== $require_uri ) {
-				$resolved_id = 0;
-			}
+			$resolved_id = $this->pick( $slug, $type, $language_id, 0, $path );
 
 			if ( $resolved_id ) {
-				$query->set( 'page_id', $resolved_id );
-				$query->set( 'pagename', '' );
-				$query->is_page     = true;
-				$query->is_singular = true;
-
-				// Drop parse_request's language-blind queried object.
-				$query->queried_object    = null;
-				$query->queried_object_id = 0;
+				$this->route( $query, $resolved_id, $page );
 				return;
 			}
 
 			// Published lookup missed: a bare preview link (or a page builder's, without one) to an unpublished translation.
-			if ( $preview_id === 0 || ( $preview_id === -1 && $this->may_edit_unpublished( 'page' ) ) ) {
-				$preview_target = $this->find_preview_target( $lookup_slug, $language_id, 'page', $preview_uri, 0 );
+			if ( $preview_id === 0 || ( $preview_id === -1 && $page && $this->may_edit_unpublished( 'page' ) ) ) {
+				$preview_target = $this->find_preview_target( $slug, $language_id, 'page', $path, 0 );
 
 				if ( $preview_target > 0 ) {
 					$this->route_to_preview_target( $query, $preview_target, true );
@@ -933,45 +914,7 @@ final class PostQueryFilter {
 				}
 			}
 
-			// Load the default-language post so handle_missing_translation() applies the configured action.
-			$fallback_id = $this->find_fallback_post( $lookup_slug, $language_id, 'page' );
-
-			if ( $fallback_id && $require_uri !== '' && get_page_uri( $fallback_id ) !== $require_uri ) {
-				$fallback_id = 0;
-			}
-
-			if ( $fallback_id ) {
-				$this->guard_editor_fallback( $fallback_id );
-				$query->set( 'page_id', $fallback_id );
-				$query->set( 'pagename', '' );
-				$query->set( 'perflocale_all_languages', true );
-				$query->is_page        = true;
-				$query->is_singular    = true;
-				$this->loaded_fallback = true;
-
-				$query->queried_object    = null;
-				$query->queried_object_id = 0;
-				return;
-			}
-
-			// Load any sibling: otherwise redirect_guess_404_permalink() 301s past the fallback chain.
-			$any_id = $this->find_any_translated_post_by_slug( $lookup_slug, 'page', $language_id );
-
-			if ( $any_id && $require_uri !== '' && get_page_uri( $any_id ) !== $require_uri ) {
-				$any_id = 0;
-			}
-
-			if ( $any_id ) {
-				$this->guard_editor_fallback( $any_id );
-				$query->set( 'page_id', $any_id );
-				$query->set( 'pagename', '' );
-				$query->set( 'perflocale_all_languages', true );
-				$query->is_page        = true;
-				$query->is_singular    = true;
-				$this->loaded_fallback = true;
-
-				$query->queried_object    = null;
-				$query->queried_object_id = 0;
+			if ( $this->route_fallback( $query, $slug, $type, $language_id, $path, $page ) ) {
 				return;
 			}
 		}
@@ -991,13 +934,12 @@ final class PostQueryFilter {
 				return;
 			}
 
-			$preview_id = $this->logged_in_preview_id( $query );
-
 			// Core turns a hierarchical own-query-var request into a pagename lookup with its own ID
-			// condition (class-wp-query.php:2156-2217), which a `p` route cannot survive.
-			if ( $preview_id >= 0 && $this->is_own_query_var_request( $query, $post_type ) ) {
-				$preview_id = -1;
-			}
+			// condition (class-wp-query.php:2156-2217): resolve it by path, as pages, and no preview route.
+			$own        = $this->is_own_query_var_request( $query, $post_type );
+			$path       = $own ? trim( $name, '/' ) : null;
+			$slug       = $own ? wp_basename( $name ) : $name;
+			$preview_id = $own ? -1 : $this->logged_in_preview_id( $query );
 
 			if ( $preview_id > 0 ) {
 				$preview_target = $this->find_preview_target( $name, $language_id, $post_type, '', $preview_id );
@@ -1008,19 +950,15 @@ final class PostQueryFilter {
 				}
 			}
 
-			$resolved_id = $this->find_post_by_slug_and_language( $name, $language_id, $post_type );
+			$resolved_id = $this->pick( $slug, $post_type, $language_id, 0, $path );
 
 			if ( $resolved_id ) {
-				$query->set( 'p', $resolved_id );
-				$query->set( 'name', '' );
-
-				$query->queried_object    = null;
-				$query->queried_object_id = 0;
+				$this->route( $query, $resolved_id, false );
 				return;
 			}
 
 			// Same reason as the pagename branch above.
-			if ( $preview_id === 0 || ( $preview_id === -1 && $this->may_edit_unpublished( $post_type ) && ! $this->is_own_query_var_request( $query, $post_type ) ) ) {
+			if ( $preview_id === 0 || ( $preview_id === -1 && ! $own && $this->may_edit_unpublished( $post_type ) ) ) {
 				$preview_target = $this->find_preview_target( $name, $language_id, $post_type, '', 0 );
 
 				if ( $preview_target > 0 ) {
@@ -1029,64 +967,134 @@ final class PostQueryFilter {
 				}
 			}
 
-			// No translation: fall back to the default language.
-			$fallback_id = $this->find_fallback_post( $name, $language_id, $post_type );
-
-			if ( $fallback_id ) {
-				$this->guard_editor_fallback( $fallback_id );
-				$query->set( 'p', $fallback_id );
-				$query->set( 'name', '' );
-				$query->set( 'perflocale_all_languages', true );
-				$this->loaded_fallback = true;
-
-				$query->queried_object    = null;
-				$query->queried_object_id = 0;
-				return;
-			}
-
-			// Last resort: any sibling, as in the pagename branch.
-			$any_id = $this->find_any_translated_post_by_slug( $name, $post_type, $language_id );
-
-			if ( $any_id ) {
-				$this->guard_editor_fallback( $any_id );
-				$query->set( 'p', $any_id );
-				$query->set( 'name', '' );
-				$query->set( 'perflocale_all_languages', true );
-				$this->loaded_fallback = true;
-
-				$query->queried_object    = null;
-				$query->queried_object_id = 0;
-				return;
-			}
+			$this->route_fallback( $query, $slug, $post_type, $language_id, $path, false );
 		}
 	}
 
 	/**
-	 * Find the first published, linked post with this slug in any other language.
+	 * Load the default-language post, else any sibling (otherwise redirect_guess_404_permalink() 301s past the
+	 * fallback chain), so handle_missing_translation() applies the configured action.
 	 *
-	 * @param string $slug Post slug.
-	 * @param string $post_type Post type.
-	 * @param int    $exclude_language_id Language to exclude from the search.
-	 * @return int|null
+	 * @param \WP_Query   $query       The main query.
+	 * @param string      $slug        Post slug.
+	 * @param string      $post_type   Post type.
+	 * @param int         $language_id Current language ID.
+	 * @param string|null $path        Requested path, or null for a flat type.
+	 * @param bool        $page        Whether to route as a page.
+	 * @return bool Whether a post was routed.
 	 */
-	private function find_any_translated_post_by_slug( string $slug, string $post_type, int $exclude_language_id ): ?int {
-		// Lowest ID wins (candidates are ordered by ID).
+	private function route_fallback( \WP_Query $query, string $slug, string $post_type, int $language_id, ?string $path, bool $page ): bool {
+		$default = $this->router->get_default_language();
+		$id      = $default && (int) $default->id !== $language_id ? $this->pick( $slug, $post_type, (int) $default->id, 0, $path ) : 0;
+		$id      = $id ? $id : $this->pick( $slug, $post_type, 0, $language_id, $path );
+
+		if ( ! $id ) {
+			return false;
+		}
+
+		$this->guard_editor_fallback( $id );
+		$query->set( 'perflocale_all_languages', true );
+		$this->loaded_fallback = true;
+		$this->route( $query, $id, $page );
+
+		return true;
+	}
+
+	/**
+	 * Point the main query at a resolved post. The type's own query var is cleared: core would turn it into a
+	 * language-blind path lookup (`ID = queried_object_id`, reset by any later get_queried_object() call).
+	 *
+	 * @param \WP_Query $query   The main query.
+	 * @param int       $post_id Post to load.
+	 * @param bool      $page    Whether to route as a page.
+	 * @return void
+	 */
+	private function route( \WP_Query $query, int $post_id, bool $page ): void {
+		if ( $page ) {
+			$query->set( 'page_id', $post_id );
+			$query->is_page     = true;
+			$query->is_singular = true;
+		} else {
+			$type = $query->get( 'post_type' );
+			$type = is_string( $type ) ? get_post_type_object( $type ) : null;
+
+			$query->set( 'p', $post_id );
+			$query->set( 'name', '' );
+
+			if ( $type && is_string( $type->query_var ) && '' !== $type->query_var ) {
+				$query->set( $type->query_var, '' );
+			}
+		}
+
+		$query->set( 'pagename', '' );
+
+		$query->queried_object    = null;
+		$query->queried_object_id = $post_id;
+	}
+
+	/**
+	 * First published, linked post with this slug in a language (0: any but $exclude), lowest ID first.
+	 * With a path (hierarchical types): depth 0 takes top-level posts only, a nested path the post at that path.
+	 *
+	 * @param string      $slug        Post slug.
+	 * @param string      $post_type   Post type.
+	 * @param int         $language_id Language ID, or 0 for any.
+	 * @param int         $exclude     Language skipped when $language_id is 0.
+	 * @param string|null $path        Requested path, or null for a flat type.
+	 * @return int Post ID or 0.
+	 */
+	private function pick( string $slug, string $post_type, int $language_id, int $exclude, ?string $path ): int {
+		$nested = null !== $path && str_contains( $path, '/' );
+		$rows   = [];
+
 		foreach ( $this->find_slug_candidates( $slug, $post_type ) as $row ) {
-			if ( (int) $row->language_id !== $exclude_language_id ) {
+			$lang = (int) $row->language_id;
+
+			// Do not remove the place rule: a same-basename post elsewhere in the tree would be served.
+			if ( ( $language_id > 0 ? $lang !== $language_id : $lang === $exclude ) || ( null !== $path && ( (int) $row->post_parent > 0 ) !== $nested ) ) {
+				continue;
+			}
+
+			$rows[] = $row;
+		}
+
+		// Several path walks: load their trees first, one query per level.
+		if ( $nested && count( $rows ) > 1 ) {
+			$this->prime_tree( $rows );
+		}
+
+		foreach ( $rows as $row ) {
+			if ( ! $nested || get_page_uri( (int) $row->ID ) === $path ) {
 				return (int) $row->ID;
 			}
 		}
 
-		return null;
+		return 0;
 	}
 
 	/**
-	 * Every published, linked post sharing a slug, with its language; memoised per blog, type and slug.
+	 * Load the nested candidates and their ancestors, one query per tree level, so the path walks read cache.
+	 *
+	 * @param array<int, object> $rows Candidates.
+	 * @return void
+	 */
+	private function prime_tree( array $rows ): void {
+		$ids = wp_parse_id_list( wp_list_pluck( $rows, 'ID' ) );
+
+		// Capped: a parent loop in bad data would never end.
+		for ( $level = 0; [] !== $ids && $level < 20; ++$level ) {
+			_prime_post_caches( $ids, false, false );
+			$ids = array_filter( array_unique( array_map( static fn( int $id ): int => get_post( $id )->post_parent ?? 0, $ids ) ) );
+		}
+	}
+
+	/**
+	 * Every published, linked post sharing a slug, with its language and parent; memoised per blog, type and slug.
 	 * Published only: the preview lookup is separate and must not widen this or its memo.
 	 *
 	 * @param string $slug      Post slug.
 	 * @param string $post_type Post type.
-	 * @return array<int, object> Rows with ID + language_id, ordered by ID.
+	 * @return array<int, object> Rows with ID, language_id and post_parent, ordered by ID.
 	 */
 	private function find_slug_candidates( string $slug, string $post_type ): array {
 		$blog = function_exists( 'get_current_blog_id' ) ? (int) get_current_blog_id() : 0;
@@ -1110,7 +1118,7 @@ final class PostQueryFilter {
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$rows = (array) $wpdb->get_results(
 			$wpdb->prepare(
-				"SELECT p.ID, tl.language_id FROM {$wpdb->posts} p
+				"SELECT p.ID, tl.language_id, p.post_parent FROM {$wpdb->posts} p
 				INNER JOIN %i tl ON tl.object_id = p.ID
 				INNER JOIN %i tg ON tg.id = tl.group_id AND tg.type = 'post'
 				WHERE p.post_name = %s AND p.post_type = %s AND p.post_status = 'publish'
@@ -1126,42 +1134,6 @@ final class PostQueryFilter {
 		$this->slug_candidates_memo[ $key ] = $rows;
 
 		return $rows;
-	}
-
-	/**
-	 * Find a post by slug filtered by language.
-	 *
-	 * @param string $slug Post slug.
-	 * @param int    $language_id Language ID.
-	 * @param string $post_type Post type.
-	 * @return int|null Post ID or null.
-	 */
-	private function find_post_by_slug_and_language( string $slug, int $language_id, string $post_type ): ?int {
-		foreach ( $this->find_slug_candidates( $slug, $post_type ) as $row ) {
-			if ( (int) $row->language_id === $language_id ) {
-				return (int) $row->ID;
-			}
-		}
-
-		return null;
-	}
-
-	/**
-	 * Find a fallback post in the default language when no translation exists.
-	 *
-	 * @param string $slug Post slug.
-	 * @param int    $language_id Current language ID (to exclude - already checked).
-	 * @param string $post_type Post type.
-	 * @return int|null Post ID or null.
-	 */
-	private function find_fallback_post( string $slug, int $language_id, string $post_type ): ?int {
-		$default = $this->router->get_default_language();
-
-		if ( ! $default || (int) $default->id === $language_id ) {
-			return null;
-		}
-
-		return $this->find_post_by_slug_and_language( $slug, (int) $default->id, $post_type );
 	}
 
 	/**
@@ -1359,6 +1331,11 @@ final class PostQueryFilter {
 	 * @return string|false URL to redirect to, or false to cancel.
 	 */
 	public function prevent_fallback_canonical_redirect( $redirect_url, $requested_url ) {
+		// Attachment pages off: core's hop to the file (its visibility checks ran), in any language.
+		if ( is_attachment() && ! get_option( 'wp_attachment_pages_enabled' ) ) {
+			return $redirect_url;
+		}
+
 		if ( $this->loaded_fallback ) {
 			return false;
 		}
@@ -1371,15 +1348,16 @@ final class PostQueryFilter {
 				$current_lang_id = $this->router->get_current_language_id();
 				$post_lang_id    = $this->get_post_language_id( (int) $post->ID );
 
-				if ( $current_lang_id > 0 && $post_lang_id > 0 && $current_lang_id !== $post_lang_id ) {
-					return false;
-				}
-
-				// Unlinked attachments are served in place under a non-default prefix.
-				if ( $current_lang_id > 0 && $post_lang_id === 0 && is_attachment() && ! $this->router->is_default_language() ) {
+				// Linked: another language. Unlinked: an attachment served in place under a non-default prefix (pages on).
+				if ( $current_lang_id > 0 && ( $post_lang_id > 0 ? $current_lang_id !== $post_lang_id : is_attachment() && ! $this->router->is_default_language() ) ) {
 					return false;
 				}
 			}
+		}
+
+		// One hop: rule #9's, when core's target (an added slash) would get #9's hop again.
+		if ( ( is_tax() || is_category() || is_tag() ) && \PerfLocale\Router\TermRedirect::core_yields( $redirect_url, $requested_url ) ) {
+			return false;
 		}
 
 		return $redirect_url;
@@ -2831,9 +2809,9 @@ final class PostQueryFilter {
 
 		$handled = true;
 
-		// Landing on our own fallback redirect: never fall back again (loop guard).
+		// Landing on our own fallback redirect (the marker is signed for that URL): never fall back again.
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
-		if ( ! empty( $_GET['perflocale_fb'] ) ) {
+		if ( ! empty( $_GET['perflocale_fb'] ) && \PerfLocale\Router\MarkerHop::fb_landed() ) {
 			return;
 		}
 
@@ -2898,13 +2876,24 @@ final class PostQueryFilter {
 				$own_url = get_permalink( $own_id );
 
 				if ( is_string( $own_url ) && $own_url !== '' && ! $this->is_current_url( $own_url ) ) {
-					// One permanent redirect to the sibling; it returns only when
-					// the sibling's URL does not route back to the sibling.
-					$this->redirect_to_own_language_sibling( $own_url, $current_slug, (int) $post->ID, $own_id );
-					$this->redirect_to_fallback( $own_url, $current_slug, $current_slug, (int) $post->ID, $own_id );
-					// Both redirect methods exit once they redirect.
+					// One permanent hop to the sibling; 0 means its URL does not route back, so the sentinel hop runs.
+					if ( $this->redirect_to_own_language_sibling( $own_url, $current_slug, (int) $post->ID, $own_id ) === 0 ) {
+						$this->redirect_to_fallback( $own_url, $current_slug, $current_slug, (int) $post->ID, $own_id );
+					}
+
+					// A hop that returns was not sent: serve the page as show_default would, noindex included.
+					UrlLanguageServe::serve_declined( $post, $translations_map, (string) $current_slug, $this->settings->get_missing_translation_action() );
+
+					return;
 				}
 			}
+		}
+
+		$action = UrlLanguageServe::action( $post, (string) $current_slug, $this->settings->get_missing_translation_action() );
+
+		// WooCommerce system pages (filterable) serve in the URL's language: WooCommerce links them there.
+		if ( UrlLanguageServe::applies( $post, $translations_map, (string) $current_slug, $action ) ) {
+			return;
 		}
 
 		// 'post_query' chain, deliberately separate from the 'strings' chain.
@@ -2948,14 +2937,16 @@ final class PostQueryFilter {
 					}
 
 					$this->redirect_to_fallback( $target_url, $current_slug, $try_slug, (int) $post->ID, $target_id );
-					// redirect_to_fallback() exits.
+
+					// A hop that returns was not sent: the page is served, noindex included.
+					UrlLanguageServe::serve( $action );
+
+					return;
 				}
 			}
 		}
 
 		// Chain exhausted: apply the configured action.
-		$action = $this->settings->get_missing_translation_action();
-
 		if ( $action === 'show_404' ) {
 			global $wp_query;
 			$wp_query->set_404();
@@ -2965,27 +2956,22 @@ final class PostQueryFilter {
 
 		if ( $action === 'redirect_default' ) {
 			if ( $default ) {
-				$default_post_id = (int) ( $translations_map[ (int) $default->id ] ?? 0 );
+				// The post being served, at its own language's URL; the default home only when it has none.
+				$source_url = $this->fallback_target_url( (int) $post->ID, $unlinked_id, $default );
 
-				// The queried post may itself be the default-language sibling: still canonicalise its URL.
-				if ( $default_post_id > 0 ) {
-					$default_post = get_post( $default_post_id );
-
-					if ( $default_post instanceof \WP_Post && $default_post->post_status === 'publish' ) {
-						$default_url = $this->fallback_target_url( $default_post_id, $unlinked_id, $default );
-
-						if ( $default_url !== '' ) {
-							// Already there: the stripped sentinel cannot stop a loop. Return, not fall through to the home redirect.
-							if ( $this->is_current_url( $default_url ) ) {
-								return;
-							}
-
-							$this->redirect_to_fallback( $default_url, $current_slug, $default->slug, (int) $post->ID, $default_post_id );
-						}
+				if ( $source_url !== '' ) {
+					// Already there: a hop to the current URL loops once the marker is gone. Return, not fall through to the home redirect.
+					if ( $this->is_current_url( $source_url ) ) {
+						return;
 					}
+
+					require_once __DIR__ . '/../Frontend/FallbackResponse.php';
+					$this->redirect_to_fallback( $source_url, $current_slug, \PerfLocale\Frontend\FallbackResponse::language_slug( $post_lang ), (int) $post->ID, (int) $post->ID, 'missing_redirect_default' );
+
+					return;
 				}
 
-				// No default-language version: its homepage, from raw get_option( 'home' ) (home_url adds the current prefix).
+				// No URL for it: the default language's homepage, from raw get_option( 'home' ) (home_url adds the current prefix).
 				$home_base = rtrim( (string) get_option( 'home' ), '/' );
 
 				if ( $home_base !== '' ) {
@@ -2997,23 +2983,28 @@ final class PostQueryFilter {
 						? $home_base . '/' . $this->settings->get_url_prefix( $default ) . '/'
 						: $home_base . '/';
 
-					$this->redirect_to_fallback( $home_url, $current_slug, $default->slug, (int) $post->ID, 0 );
+					$this->redirect_to_fallback( $home_url, $current_slug, $default->slug, (int) $post->ID, 0, 'missing_redirect_default' );
 				}
 			}
 		}
 
-		// show_default: the post is shown as-is.
+		// show_default (and its noindex form): the post is shown as-is.
+		UrlLanguageServe::serve( $action );
 	}
 
 	/**
 	 * Whether a request for this post in the given language serves content, for first-visit redirects.
 	 * Must mirror handle_missing_translation(): a chain landing on the default language is false (it sends the visitor back).
 	 *
-	 * @param \WP_Post $post     Post the request resolved to.
-	 * @param object   $language Language row (id, slug) the visitor would be sent to.
+	 * @param \WP_Post     $post     Post the request resolved to.
+	 * @param object       $language Language row (id, slug) the visitor would be sent to.
+	 * @param string|null  $kind     Set to own, serve, serve_noindex, redirect or none (404, or a hop back).
+	 * @param-out string   $kind
 	 * @return bool
 	 */
-	public function serves_in_language( \WP_Post $post, object $language ): bool {
+	public function serves_in_language( \WP_Post $post, object $language, ?string &$kind = null ): bool {
+		$kind = 'own';
+
 		if ( ! in_array( $post->post_type, $this->settings->get_translatable_post_types(), true ) ) {
 			return true;
 		}
@@ -3046,37 +3037,11 @@ final class PostQueryFilter {
 			}
 		}
 
-		$chain = $this->settings->get_fallback_chain( (string) ( $language->slug ?? '' ), 'post_query' );
+		require_once __DIR__ . '/../Frontend/FallbackResponse.php';
 
-		if ( $chain !== [] && $translations_map !== [] ) {
-			$lang_repo = new \PerfLocale\Database\Repository\LanguageRepository(
-				\PerfLocale\Plugin::get_instance()->get( 'cache' )
-			);
+		$kind = \PerfLocale\Frontend\FallbackResponse::outcome( $post, $language, $translations_map, $default_id, $this->settings );
 
-			foreach ( $chain as $try_slug ) {
-				$lang = $lang_repo->find_by_slug( $try_slug );
-
-				if ( ! $lang ) {
-					continue;
-				}
-
-				$lang_id   = (int) $lang->id;
-				$target_id = (int) ( $translations_map[ $lang_id ] ?? 0 );
-
-				if ( $target_id <= 0 ) {
-					continue;
-				}
-
-				$target_post = get_post( $target_id );
-
-				// First published chain member; the default language would send the visitor back.
-				if ( $target_post instanceof \WP_Post && $target_post->post_status === 'publish' ) {
-					return $lang_id !== $default_id;
-				}
-			}
-		}
-
-		return $this->settings->get_missing_translation_action() === 'show_default';
+		return $kind !== 'none';
 	}
 
 	/**
@@ -3154,31 +3119,15 @@ final class PostQueryFilter {
 	 * @param string $slug         Current language slug.
 	 * @param int    $from_post_id Post being rendered.
 	 * @param int    $to_post_id   Translation in the current language.
-	 * @return void Returns only when no redirect was issued.
+	 * @return int 0 when the sibling's URL does not route back (no send tried), else the sender's result.
 	 */
-	private function redirect_to_own_language_sibling( string $url, string $slug, int $from_post_id, int $to_post_id ): void {
+	private function redirect_to_own_language_sibling( string $url, string $slug, int $from_post_id, int $to_post_id ): int {
 		if ( url_to_postid( $url ) !== $to_post_id ) {
-			return;
+			return 0;
 		}
 
-		$url = $this->with_passthrough_query( $url );
-
-		/** This filter is documented in src/Translation/PostQueryFilter.php (redirect_to_fallback). */
-		$status = (int) apply_filters(
-			'perflocale/fallback/redirect_status',
-			301,
-			$slug,
-			$slug,
-			$from_post_id,
-			$to_post_id
-		);
-
-		if ( ! in_array( $status, [ 301, 302, 307, 308 ], true ) ) {
-			$status = 301;
-		}
-
-		wp_safe_redirect( $url, $status );
-		exit;
+		// The sender applies perflocale/fallback/redirect_status (default 301 here).
+		return \PerfLocale\Router\Redirect\Sender::to( $this->with_passthrough_query( $url ), 301, 'own_sibling', [ 'fb' => [ $slug, $slug, $from_post_id, $to_post_id ] ] );
 	}
 
 	/**
@@ -3205,6 +3154,11 @@ final class PostQueryFilter {
 				// The fallback guard must only see the walker's own sentinel.
 				unset( $passthrough['perflocale_fb'] );
 
+				// With the cookie the visitor marker is no longer a fuse (no hop of ours carries it on).
+				if ( ! empty( $_COOKIE['perflocale_lang'] ) ) {
+					unset( $passthrough['perflocale_redirected'] );
+				}
+
 				// Object-routing params name the old post and would clobber the target's own ?p= (ping-pong).
 				unset(
 					$passthrough['p'],
@@ -3214,7 +3168,7 @@ final class PostQueryFilter {
 					$passthrough['attachment_id']
 				);
 
-				// Query mode: a stale language param loops, as clean_fallback_sentinel() strips the sentinel first.
+				// Query mode: the request's language param would override the target's (a loop once the marker is gone).
 				if ( $this->settings->get_url_mode() === 'query' ) {
 					// The configured name, not the literal 'lang': the name is filterable.
 					unset( $passthrough[ \PerfLocale\Router\UrlConverter::query_var() ] );
@@ -3257,49 +3211,21 @@ final class PostQueryFilter {
 	}
 
 	/**
-	 * Issue a fallback redirect with the sentinel, the status filter and its allow-list.
+	 * Issue a fallback redirect with the sentinel; the sender applies perflocale/fallback/redirect_status (default 302).
 	 *
 	 * @param string $url Target URL (from get_permalink / home_url).
 	 * @param string $from_slug Current language slug.
 	 * @param string $to_slug Target language slug.
 	 * @param int    $from_post_id Source post being rendered.
-	 * @param int    $to_post_id Target post ID (0 for homepage fallback).
-	 * @return never
+	 * @param int    $to_post_id Target post ID (0 for homepage fallback: the sender then classifies the destination as another object).
+	 * @param string $reason Sender reason code.
+	 * @return int The sender's result; returns only when nothing was sent.
 	 */
-	private function redirect_to_fallback( string $url, string $from_slug, string $to_slug, int $from_post_id, int $to_post_id ): void {
-		$url = $this->with_passthrough_query( $url );
-
+	private function redirect_to_fallback( string $url, string $from_slug, string $to_slug, int $from_post_id, int $to_post_id, string $reason = 'fallback' ): int {
 		// The sentinel stops the landing request from re-running the walker.
-		$url = add_query_arg( 'perflocale_fb', '1', $url );
+		$url = \PerfLocale\Router\MarkerHop::fb_url( $this->with_passthrough_query( $url ) );
 
-		/**
-		 * Filter the HTTP status code used for language-fallback redirects.
-		 *
-		 * Default 302, so fallbacks stop once the translation is published; 301 for the current
-		 * language's own translation. Values outside {301, 302, 307, 308} fall back to the default.
-		 *
-		 * @hook perflocale/fallback/redirect_status
-		 * @param int $status Default 302; 301 for the current language's own translation.
-		 * @param string $from_slug Source language slug.
-		 * @param string $to_slug Target language slug.
-		 * @param int $from_post_id Source post being rendered.
-		 * @param int $to_post_id Target post ID (0 if redirecting to the language homepage).
-		 */
-		$status = (int) apply_filters(
-			'perflocale/fallback/redirect_status',
-			302,
-			$from_slug,
-			$to_slug,
-			$from_post_id,
-			$to_post_id
-		);
-
-		if ( ! in_array( $status, [ 301, 302, 307, 308 ], true ) ) {
-			$status = 302;
-		}
-
-		wp_safe_redirect( $url, $status );
-		exit;
+		return \PerfLocale\Router\Redirect\Sender::to( $url, 302, $reason, [ 'fb' => [ $from_slug, $to_slug, $from_post_id, $to_post_id ] ] );
 	}
 
 	/**
@@ -3344,40 +3270,5 @@ final class PostQueryFilter {
 		self::$translations_map_cache[ $key ] = $map;
 
 		return $map;
-	}
-
-	/**
-	 * Strip the `perflocale_fb` sentinel from the URL with a 301.
-	 *
-	 * @return void
-	 */
-	public function clean_fallback_sentinel(): void {
-		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
-		if ( empty( $_GET['perflocale_fb'] ) ) {
-			return;
-		}
-
-		if ( is_admin() || wp_doing_ajax() || wp_doing_cron() ) {
-			return;
-		}
-
-		if ( defined( 'REST_REQUEST' ) || defined( 'XMLRPC_REQUEST' ) || ( defined( 'WP_CLI' ) && WP_CLI ) ) {
-			return;
-		}
-
-		$method = strtoupper( isset( $_SERVER['REQUEST_METHOD'] ) ? sanitize_text_field( wp_unslash( (string) $_SERVER['REQUEST_METHOD'] ) ) : 'GET' );
-
-		if ( $method !== 'GET' && $method !== 'HEAD' ) {
-			return;
-		}
-
-		$clean = remove_query_arg( 'perflocale_fb' );
-
-		if ( ! is_string( $clean ) || $clean === '' ) {
-			return;
-		}
-
-		wp_safe_redirect( $clean, 301 );
-		exit;
 	}
 }

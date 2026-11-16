@@ -11,6 +11,7 @@ namespace PerfLocale\Admin;
 
 use PerfLocale\Cache\CacheManager;
 use PerfLocale\Router\LanguageRouter;
+use PerfLocale\Translation\PostSlugCheck;
 use PerfLocale\Translation\PostTranslationManager;
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -28,9 +29,21 @@ final class MetaBox {
 	public const SYNC_SKIPPED_ARG = 'perflocale_sync_skipped';
 
 	/**
+	 * The admin-post.php action (and nonce prefix) that drops a translation's copy warning.
+	 */
+	public const DISMISS_COPY_ERRORS = 'perflocale_dismiss_copy_errors';
+
+	/**
 	 * @var CacheManager
 	 */
 	private readonly CacheManager $cache;
+
+	/**
+	 * Published URL per post before this request's metabox save.
+	 *
+	 * @var array<int, string>
+	 */
+	private array $url_before = [];
 
 	/**
 	 * Constructor.
@@ -49,6 +62,7 @@ final class MetaBox {
 	 */
 	public function register_hooks(): void {
 		add_action( 'add_meta_boxes', [ $this, 'add_meta_box' ] );
+		add_action( 'pre_post_update', [ $this, 'remember_url' ] );
 		add_action( 'save_post', [ $this, 'save_meta_box' ], 10, 2 );
 		add_action( 'admin_enqueue_scripts', [ $this, 'enqueue_assets' ] );
 		add_action( 'admin_notices', [ $this, 'maybe_show_meta_copy_errors' ] );
@@ -131,10 +145,10 @@ final class MetaBox {
 	/**
 	 * Enqueue the metabox stylesheet on the classic editor of a translatable post type.
 	 *
-	 * @param string $hook Current admin page hook.
+	 * @param mixed $hook Current admin page hook (mixed: iframe_header() passes null outside admin.php).
 	 * @return void
 	 */
-	public function enqueue_assets( string $hook ): void {
+	public function enqueue_assets( mixed $hook ): void {
 		if ( $hook !== 'post.php' && $hook !== 'post-new.php' ) {
 			return;
 		}
@@ -316,8 +330,19 @@ final class MetaBox {
 
 		if ( $language !== '' ) {
 			$manager = new PostTranslationManager( $this->cache, \PerfLocale\Plugin::get_instance()->get( 'settings' ) );
+			$before  = $manager->detect_post_language( $post_id );
+			$before  = $before ? ( get_object_vars( $before )['slug'] ?? '' ) : '';
 
-			if ( ! $manager->set_post_language( $post_id, $language ) ) {
+			if ( $manager->set_post_language( $post_id, $language ) ) {
+				// Only a language change: a slug, parent or date edit also moves the URL.
+				if ( $before !== $language ) {
+					$this->note_url_moved( $post_id );
+				}
+			} else {
+				// The slug may have been decided for the refused language.
+				require_once __DIR__ . '/../Translation/PostSlugCheck.php';
+				PostSlugCheck::recheck( $post_id, null );
+
 				// Shown once by maybe_show_language_save_error(); otherwise the editor silently shows the old language.
 				$user_id = get_current_user_id();
 
@@ -336,6 +361,41 @@ final class MetaBox {
 			}
 		}
 
+	}
+
+	/**
+	 * Remember a published post's URL before its metabox save, for the moved-URL notice.
+	 *
+	 * @param int|mixed $post_id Post about to be updated.
+	 * @return void
+	 */
+	public function remember_url( $post_id ): void {
+		// phpcs:ignore WordPress.Security.NonceVerification.Missing -- Reads a URL only; save_meta_box() verifies before any write.
+		$form = isset( $_POST['perflocale_meta_nonce'], $_POST['post_ID'] ) && is_scalar( $_POST['post_ID'] ) ? absint( $_POST['post_ID'] ) : 0;
+
+		if ( $form > 0 && is_numeric( $post_id ) && $form === (int) $post_id && 'publish' === get_post_status( $form ) ) {
+			$this->url_before[ $form ] = (string) get_permalink( $form );
+		}
+	}
+
+	/**
+	 * Queue the one-shot notice naming the old and new URL when a language change moved a published post.
+	 *
+	 * @param int $post_id Saved post.
+	 * @return void
+	 */
+	private function note_url_moved( int $post_id ): void {
+		$before = $this->url_before[ $post_id ] ?? '';
+
+		// The link memos still hold the language from before the change.
+		\PerfLocale\Router\UrlConverter::reset_static_caches();
+
+		$after   = 'publish' === get_post_status( $post_id ) ? (string) get_permalink( $post_id ) : '';
+		$user_id = get_current_user_id();
+
+		if ( '' !== $before && '' !== $after && $before !== $after && $user_id > 0 ) {
+			set_transient( 'perflocale_lang_save_error_' . $user_id, [ $before, $after ], 60 );
+		}
 	}
 
 	/**
@@ -359,6 +419,29 @@ final class MetaBox {
 		}
 
 		delete_transient( $key );
+
+		// An array is note_url_moved()'s old and new URL.
+		if ( is_array( $message ) ) {
+			$from = is_string( $message[0] ?? null ) ? $message[0] : '';
+			$to   = is_string( $message[1] ?? null ) ? $message[1] : '';
+
+			printf(
+				'<div class="notice notice-warning is-dismissible"><p>%s</p></div>',
+				wp_kses(
+					sprintf(
+						/* translators: 1: old URL, 2: new URL. */
+						__( 'The language change moved this post: its address is now %2$s (it was %1$s).', 'perflocale' ),
+						'<code>' . esc_html( $from ) . '</code>',
+						'<a href="' . esc_url( $to ) . '">' . esc_html( $to ) . '</a>'
+					),
+					[
+						'a'    => [ 'href' => true ],
+						'code' => [],
+					]
+				)
+			);
+			return;
+		}
 
 		printf(
 			'<div class="notice notice-error is-dismissible"><p>%s</p></div>',
@@ -450,7 +533,7 @@ final class MetaBox {
 	/**
 	 * Warn which steps of create_translation() failed to copy (`_perflocale_meta_copy_errors`).
 	 *
-	 * Read-only: Bootstrap's save_post hook clears the meta on the next real save.
+	 * Read-only: a save that fills the items in (Bootstrap's save_post hook) or the Dismiss button clears it.
 	 *
 	 * @return void
 	 */
@@ -475,30 +558,105 @@ final class MetaBox {
 			return;
 		}
 
-		// No state change on this GET: the notice stays until the next real save.
+		// No state change on this GET: the notice stays until a save fills the items in, or its Dismiss button.
+		$text = self::copy_errors_text( $errors );
 
-		$step_label_map = [
-			'post_meta'      => __( 'post meta + custom fields', 'perflocale' ),
-			'featured_image' => __( 'featured image', 'perflocale' ),
-			'taxonomy_terms' => __( 'categories and tags', 'perflocale' ),
-		];
+		// Escaped late. The button posts its hidden form through form="", so the form stays out of the paragraph.
+		$form_id = 'perflocale-dismiss-copy-errors-' . $post_id;
+		printf(
+			'<div class="notice notice-warning"><p>%1$s</p><p><button type="submit" form="%2$s" class="button">%3$s</button></p>'
+			. '<form id="%2$s" method="post" action="%4$s" hidden><input type="hidden" name="action" value="%5$s">'
+			. '<input type="hidden" name="post" value="%6$d"><input type="hidden" name="_wpnonce" value="%7$s"></form></div>',
+			esc_html( $text ),
+			esc_attr( $form_id ),
+			esc_html__( 'Dismiss this warning', 'perflocale' ),
+			esc_url( admin_url( 'admin-post.php' ) ),
+			esc_attr( self::DISMISS_COPY_ERRORS ),
+			(int) $post_id,
+			esc_attr( wp_create_nonce( self::DISMISS_COPY_ERRORS . '_' . $post_id ) )
+		);
+	}
 
-		$step_labels = [];
-		foreach ( $errors as $err ) {
-			$step                 = (string) ( $err['step'] ?? '' );
-			$step_labels[ $step ] = $step_label_map[ $step ] ?? $step;
+	/**
+	 * The block editor's copy warning for this post (it hides admin notices), null without one or edit rights.
+	 *
+	 * @param int $post_id The edited post.
+	 * @return array{text: string, label: string, url: string, action: string, post: int, nonce: string}|null
+	 */
+	public static function copy_errors_editor( int $post_id ): ?array {
+		if ( $post_id <= 0 || ! current_user_can( 'edit_post', $post_id ) ) {
+			return null;
 		}
 
-		// Escaped late, at the output.
-		printf(
-			'<div class="notice notice-warning is-dismissible"><p>%s</p></div>',
-			esc_html(
-				sprintf(
-					/* translators: %s is a comma-separated list of items (e.g. "featured image, categories and tags"). */
-					__( 'PerfLocale created this translation, but the following items did not copy from the source post: %s. Please fill them in manually.', 'perflocale' ),
-					implode( ', ', array_values( $step_labels ) )
-				)
-			)
+		$errors = get_post_meta( $post_id, '_perflocale_meta_copy_errors', true );
+		if ( ! is_array( $errors ) || empty( $errors ) ) {
+			return null;
+		}
+
+		// The classic button's fields: its Dismiss posts to the same handler.
+		return [
+			'text'   => self::copy_errors_text( $errors ),
+			'label'  => __( 'Dismiss this warning', 'perflocale' ),
+			'url'    => admin_url( 'admin-post.php' ),
+			'action' => self::DISMISS_COPY_ERRORS,
+			'post'   => $post_id,
+			'nonce'  => wp_create_nonce( self::DISMISS_COPY_ERRORS . '_' . $post_id ),
+		];
+	}
+
+	/**
+	 * The copy warning's text: the items that did not copy, and what to change for a refused value.
+	 *
+	 * @param array<mixed> $errors The `_perflocale_meta_copy_errors` entries.
+	 * @return string Plain text.
+	 */
+	private static function copy_errors_text( array $errors ): string {
+		$text = sprintf(
+			/* translators: %s is a comma-separated list of items (e.g. "custom fields (_price, gallery), featured image"). */
+			__( 'PerfLocale created this translation, but the following items did not copy from the source post: %s. Please fill them in manually.', 'perflocale' ),
+			\PerfLocale\Translation\CopyFailureWatch::items( $errors )
 		);
+
+		// A refused value fails the same way on every copy, and a hidden key cannot be filled in here: the button is the way out.
+		if ( \PerfLocale\Translation\CopyFailureWatch::refused( $errors ) ) {
+			$text .= ' ' . __( 'The database refused those custom fields (a value too large, or characters it cannot store). Fill them in with values it accepts, or dismiss this warning if this translation does not need them.', 'perflocale' );
+		}
+
+		return $text;
+	}
+
+	/**
+	 * POST only (admin-post.php): drop one translation's copy warning (`_perflocale_meta_copy_errors`), then back to its editor.
+	 *
+	 * @return void
+	 */
+	public static function dismiss_copy_errors(): void {
+		// POST only, nonce from the body only: a nonce in an address must never act.
+		$method = isset( $_SERVER['REQUEST_METHOD'] ) && is_string( $_SERVER['REQUEST_METHOD'] ) ? strtoupper( sanitize_text_field( wp_unslash( $_SERVER['REQUEST_METHOD'] ) ) ) : '';
+		if ( 'POST' !== $method ) {
+			if ( ! headers_sent() ) {
+				header( 'Allow: POST' );
+			}
+			wp_die( esc_html__( 'This runs only when you press the button.', 'perflocale' ), '', [ 'response' => 405 ] );
+		}
+
+		// The id names the nonce action, so it is read before the check.
+		// phpcs:disable WordPress.Security.NonceVerification.Missing -- Verified below, per post.
+		$post_id = isset( $_POST['post'] ) && is_scalar( $_POST['post'] ) ? absint( wp_unslash( $_POST['post'] ) ) : 0;
+		$nonce   = isset( $_POST['_wpnonce'] ) && is_string( $_POST['_wpnonce'] ) ? sanitize_text_field( wp_unslash( $_POST['_wpnonce'] ) ) : '';
+		// phpcs:enable WordPress.Security.NonceVerification.Missing
+
+		if ( $post_id <= 0 || ! wp_verify_nonce( $nonce, self::DISMISS_COPY_ERRORS . '_' . $post_id ) ) {
+			wp_nonce_ays( self::DISMISS_COPY_ERRORS );
+		}
+
+		if ( ! current_user_can( 'edit_post', $post_id ) ) {
+			wp_die( esc_html__( 'You do not have permission to do this.', 'perflocale' ), '', [ 'response' => 403 ] );
+		}
+
+		delete_post_meta( $post_id, '_perflocale_meta_copy_errors' );
+
+		wp_safe_redirect( get_edit_post_link( $post_id, 'raw' ) ?? admin_url( 'edit.php' ) );
+		exit;
 	}
 }

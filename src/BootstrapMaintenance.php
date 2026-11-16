@@ -35,6 +35,54 @@ final class BootstrapMaintenance {
 	private const SCHEDULES_VERIFIED_OPTION = 'perflocale_schedules_verified_at';
 
 	/**
+	 * One-time job state options, copied so a done job's class is not autoloaded on admin pages.
+	 * BootstrapOneTimeJobGateTest keeps them equal to the jobs' constants.
+	 */
+	private const TEMPLATE_REFS_BACKFILL_OPTION = 'perflocale_template_refs_backfill';
+	private const SQLITE_GROUP_REPAIR_OPTION    = 'perflocale_sqlite_string_groups_repair_job';
+
+	/**
+	 * `admin_init`: TemplateRefsBackfillJob::maybe_dispatch(), unless the state option says done.
+	 *
+	 * The done check reads the autoloaded option before any job class loads.
+	 *
+	 * @return void
+	 */
+	public static function maybe_dispatch_template_refs_backfill(): void {
+		if ( self::one_time_job_done( self::TEMPLATE_REFS_BACKFILL_OPTION ) ) {
+			return;
+		}
+
+		Background\Jobs\TemplateRefsBackfillJob::maybe_dispatch();
+	}
+
+	/**
+	 * `admin_init` on SQLite: Background\Jobs\StringGroupRepairJob::maybe_dispatch(),
+	 * after the same done check as maybe_dispatch_template_refs_backfill().
+	 *
+	 * @return void
+	 */
+	public static function maybe_dispatch_sqlite_group_repair(): void {
+		if ( self::one_time_job_done( self::SQLITE_GROUP_REPAIR_OPTION ) ) {
+			return;
+		}
+
+		Background\Jobs\StringGroupRepairJob::maybe_dispatch();
+	}
+
+	/**
+	 * Whether a one-time job's state option says done (`done:<unix time>`).
+	 *
+	 * @param string $option State option.
+	 * @return bool
+	 */
+	private static function one_time_job_done( string $option ): bool {
+		$state = get_option( $option, '' );
+
+		return is_string( $state ) && str_starts_with( $state, 'done:' );
+	}
+
+	/**
 	 * Throttled ensure_recurring_schedules() for admin_init: full run on engine drift, else every 6 hours.
 	 *
 	 * Settings saves (update_option_perflocale_settings:20), WP-CLI, network activation and
@@ -206,6 +254,18 @@ final class BootstrapMaintenance {
 	}
 
 	/**
+	 * Term URL slugs a creation could not write during an import (Translation\TermSlugRetry::HOOK).
+	 *
+	 * @param mixed $items Items.
+	 * @param mixed $try   Attempt number.
+	 * @return void
+	 */
+	public static function term_slug_retry( mixed $items, mixed $try = 1 ): void {
+		require_once __DIR__ . '/Translation/TermSlugRetry.php';
+		Translation\TermSlugRetry::run( $items, $try );
+	}
+
+	/**
 	 * Delete an abandoned import temp file, only inside the temp dir (perflocale_cleanup_temp_import).
 	 *
 	 * @param string $file File path, or an XLIFF import's key.
@@ -221,22 +281,38 @@ final class BootstrapMaintenance {
 			return;
 		}
 
-		// An unimported chunked upload frees its quota slot, whether or not its file remains.
-		Admin\ImportUpload::release_path( $file );
-
-		// Only files inside `uploads/perflocale/temp/`.
-		$temp_dir = realpath( Helper::uploads_temp_dir() );
-		$real     = realpath( $file );
-
-		if ( $temp_dir === false || $real === false ) {
+		// Read and delete under the import lock, so no Retry re-queues the import between them; busy: an hour later.
+		if ( ! Background\Jobs\DataImportJob::lock_files( 1 ) ) {
+			Background\Jobs\DataImportJob::keep_for_retry( $file );
 			return;
 		}
 
-		if ( ! str_starts_with( $real, rtrim( $temp_dir, '/\\' ) . DIRECTORY_SEPARATOR ) ) {
-			return;
-		}
+		try {
+			// A queued or running import (a Retry) still reads it: checked again in an hour.
+			if ( Background\Jobs\DataImportJob::holds( $file ) ) {
+				Background\Jobs\DataImportJob::keep_for_retry( $file );
+				return;
+			}
 
-		wp_delete_file( $real );
+			// An unimported chunked upload frees its quota slot, whether or not its file remains.
+			Admin\ImportUpload::release_path( $file );
+
+			// Only files inside `uploads/perflocale/temp/`.
+			$temp_dir = realpath( Helper::uploads_temp_dir() );
+			$real     = realpath( $file );
+
+			if ( $temp_dir === false || $real === false ) {
+				return;
+			}
+
+			if ( ! str_starts_with( $real, rtrim( $temp_dir, '/\\' ) . DIRECTORY_SEPARATOR ) ) {
+				return;
+			}
+
+			wp_delete_file( $real );
+		} finally {
+			Admin\ImportLock::release();
+		}
 	}
 
 	/**
@@ -255,7 +331,8 @@ final class BootstrapMaintenance {
 	}
 
 	/**
-	 * Daily GC of a blog: jobs, empty groups, stale uploads, expired transients, stale strings (perflocale_jobs_gc).
+	 * Daily GC of a blog: jobs, empty groups, stale uploads, expired transients, stale strings, orphan term slug history
+	 * (perflocale_jobs_gc).
 	 * The row-deleting sweeps wait while SchemaWrites::ready() is false: they select rows by columns.
 	 *
 	 * @param mixed $blog_id Blog ID.
@@ -263,6 +340,9 @@ final class BootstrapMaintenance {
 	 */
 	public static function jobs_gc( $blog_id = 0 ) : void {
 		Background\JobState::run_recurring_for_blog( (int) $blog_id, [ Background\JobState::class, 'gc' ] );
+
+		// Creation guid resets that could not finish (CreationMark state g): a bounded batch per day.
+		Background\JobState::run_recurring_for_blog( is_numeric( $blog_id ) ? (int) $blog_id : 0, [ Translation\CreationMark::class, 'sweep' ] );
 
 		// Also sweep empty translation_groups rows (orphans, and groups unlink_by_object_id()
 		// kept when it could not count the links left), capped per tick.
@@ -325,7 +405,27 @@ final class BootstrapMaintenance {
 				if ( $cache === null ) {
 					return;
 				}
+				// A return trip from 1.0.7.5 is found first; no sweep while rows may still be under the old
+				// rule (a scan touched their new hash only); the runner is queued again when its chain stopped.
+				\PerfLocale\Strings\StrIdentMigration::daily_check();
+
+				if ( ! \PerfLocale\Strings\StrIdentMigration::done() ) {
+					\PerfLocale\Strings\StrIdentMigration::maybe_dispatch();
+					return;
+				}
 				( new \PerfLocale\Database\Repository\StringRepository( $cache ) )->gc_stale_strings();
+			}
+		);
+
+		// Old URL slugs (term_h1..term_h5) of deleted terms that their delete hook missed, bounded per run.
+		Background\JobState::run_recurring_for_blog(
+			(int) $blog_id,
+			static function (): void {
+				if ( ! \PerfLocale\Database\SchemaWrites::ready() ) {
+					return;
+				}
+				$cache = Plugin::get_instance()->has( 'cache' ) ? Plugin::get_instance()->get( 'cache' ) : null;
+				\PerfLocale\Database\Repository\SlugTranslationWrites::gc_orphan_history( $cache instanceof Cache\CacheManager ? $cache : null );
 			}
 		);
 
@@ -431,5 +531,138 @@ final class BootstrapMaintenance {
 		$limited = Translation\MtRateLimiter::admit( get_current_user_id() );
 
 		return $limited instanceof \WP_Error ? $limited->get_error_message() : $proceed;
+	}
+
+	/**
+	 * Delivery cron event: attempt 1 of a webhook delivery.
+	 *
+	 * @param string               $webhook_id Webhook ID.
+	 * @param string               $event      Event name.
+	 * @param array<string, mixed> $data       Payload.
+	 * @param string               $timestamp  Event time.
+	 * @return void
+	 */
+	public static function deliver_webhook( string $webhook_id, string $event, array $data, string $timestamp ): void {
+		// Our files were replaced in this request: load nothing from them.
+		if ( defined( 'PERFLOCALE_FILES_REPLACED' ) ) {
+			return;
+		}
+
+		require_once __DIR__ . '/Webhook/Delivery.php';
+		Webhook\Delivery::deliver( $webhook_id, $event, $data, $timestamp, 1 );
+	}
+
+	/**
+	 * Drain cron event: the coalesced delivery queue, in bounded batches.
+	 *
+	 * @return void
+	 */
+	public static function drain_webhooks(): void {
+		// Our files were replaced in this request: load nothing from them.
+		if ( defined( 'PERFLOCALE_FILES_REPLACED' ) ) {
+			return;
+		}
+
+		require_once __DIR__ . '/Webhook/Delivery.php';
+		Webhook\Delivery::drain();
+	}
+
+	/**
+	 * Retry cron event: attempt 2+ or a breaker-deferred re-delivery.
+	 *
+	 * @param string               $webhook_id        Webhook ID.
+	 * @param string               $event             Event name.
+	 * @param array<string, mixed> $data              Payload.
+	 * @param string               $timestamp         Event time.
+	 * @param int                  $attempt           Attempt number.
+	 * @param string               $delivery_id       Delivery ID.
+	 * @param int                  $breaker_deferrals Breaker deferrals so far.
+	 * @return void
+	 */
+	public static function retry_webhook( string $webhook_id, string $event, array $data, string $timestamp, int $attempt, string $delivery_id = '', int $breaker_deferrals = 0 ): void {
+		// Our files were replaced in this request: load nothing from them.
+		if ( defined( 'PERFLOCALE_FILES_REPLACED' ) ) {
+			return;
+		}
+
+		require_once __DIR__ . '/Webhook/Delivery.php';
+		Webhook\Delivery::deliver( $webhook_id, $event, $data, $timestamp, $attempt, $delivery_id, $breaker_deferrals );
+	}
+
+	/**
+	 * Daily reaper of expired lock rows (Bootstrap::LOCK_CLEANUP_HOOK); reap_expired()'s return is dropped.
+	 *
+	 * @return void
+	 */
+	public static function lock_cleanup(): void {
+		Concurrency\Lock::reap_expired();
+	}
+
+	/**
+	 * Hourly stuck-job watchdog of a blog (perflocale_jobs_watchdog).
+	 *
+	 * @param mixed $blog_id Blog ID.
+	 * @return void
+	 */
+	public static function jobs_watchdog( $blog_id = 0 ): void {
+		Background\JobState::run_recurring_for_blog( (int) $blog_id, [ Background\JobState::class, 'watchdog' ] );
+	}
+
+	/**
+	 * One-shot resume after activation (perflocale_resume_jobs).
+	 *
+	 * @return void
+	 */
+	public static function resume_jobs(): void {
+		Background\Resumer::resume();
+	}
+
+	/**
+	 * First normal boot after a dormant one: retire the hreflang cache and drop the record.
+	 *
+	 * The group is retired at plugins_loaded:0. The record goes at the end of init, after Action
+	 * Scheduler init (the settings listeners pick the engine), under the settings lock on a fresh
+	 * read. See docs-ai/11-code-rationale.md, "Bootstrap: dormant boot".
+	 *
+	 * @param Plugin   $plugin   Plugin container.
+	 * @param Settings $settings Settings service.
+	 * @return void
+	 */
+	public static function resume_after_dormant_boot( Plugin $plugin, Settings $settings ): void {
+		add_action(
+			'plugins_loaded',
+			static function () use ( $plugin, $settings ): void {
+				$cache = $plugin->get( 'cache' );
+
+				if ( $cache instanceof Cache\CacheManager ) {
+					$cache->invalidate_group( 'perflocale_hreflang' );
+				}
+
+				add_action(
+					'init',
+					static function () use ( $settings ): void {
+						Concurrency\Lock::with(
+							'settings_update',
+							10,
+							static function () use ( $settings ): void {
+								wp_cache_delete( 'perflocale_settings', 'options' );
+								wp_cache_delete( 'alloptions', 'options' );
+
+								$stored = get_option( 'perflocale_settings' );
+
+								if ( is_array( $stored ) && array_key_exists( Bootstrap::DORMANT_KEY, $stored ) ) {
+									unset( $stored[ Bootstrap::DORMANT_KEY ] );
+									update_option( 'perflocale_settings', $stored );
+								}
+
+								$settings->reset_cache();
+							}
+						);
+					},
+					PHP_INT_MAX
+				);
+			},
+			0
+		);
 	}
 }

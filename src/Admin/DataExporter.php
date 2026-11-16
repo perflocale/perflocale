@@ -21,17 +21,34 @@ if ( ! defined( 'ABSPATH' ) ) {
  */
 final class DataExporter {
 
+	/** pending_changes columns before payload and after summary, in DataRegistry's order (ExportPendingChangesFetchTest holds them equal). */
+	private const PENDING_CHANGES_HEAD = 'id, area, object_type, object_id, source_id, language_id, origin, trigger_name, job_id, user_id, actor, decision, reason, status';
+
+	/** See PENDING_CHANGES_HEAD. */
+	private const PENDING_CHANGES_TAIL = 'base_hash, result_hash, result_status, result_modified, NULL AS previous, created_at, decided_at, decided_by';
+
+	/** Bytes of payload and summary one pending_changes page holds; a larger value is read alone, one row at a time. */
+	private const PENDING_PAGE_BYTES = 8388608;
+
 	/**
 	 * Rows per batch for large tables.
 	 */
 	private const BATCH_SIZE = 1000;
 
 	/**
-	 * Envelope format version: bump only for an incompatible shape change (not a new optional section).
+	 * Envelope format version written: bump only for an incompatible shape change (not a new optional section).
 	 *
-	 * DataImporter refuses a higher version than its own: after a bump, older installs cannot import new files.
+	 * 1: string hashes in 1.0.7.5's rule, so 1.0.7.5 imports them matched; DataImporter re-hashes every string row.
 	 */
 	public const FORMAT_VERSION = 1;
+
+	/** Highest format DataImporter reads; 2: a 1.0.8 pre-release file ("\x04" hashes, re-hashed on import). */
+	public const READ_VERSION = 2;
+
+	/**
+	 * The importer's default limit for one value, in bytes (DataImporter::find_data_quality_issues()).
+	 */
+	private const MAX_IMPORT_VALUE_BYTES = 1048576;
 
 	/**
 	 * Envelope keys an add-on section may not use, shared by exporter and importer.
@@ -51,6 +68,7 @@ final class DataExporter {
 		'roles',
 		'data',
 		'addon_groups',
+		'object_max_ids',
 	];
 
 	/**
@@ -206,6 +224,29 @@ final class DataExporter {
 	}
 
 	/**
+	 * Data no section carries, with the reason (a `*` name is a prefix): every Schema::REQUIRED_TABLES table no section
+	 * names (a unit test holds the lists together) and the ReSync and field-layer meta, options and transients.
+	 */
+	public const NOT_EXPORTED = [
+		'jobs'                               => 'Table. This site\'s background job rows (runs in progress, their results and logs).',
+		'migration_source_map'               => 'Table. The ids a WPML, Polylang or TranslatePress import on this site mapped to its translation groups; a re-run of that import reads it.',
+		'resync_base'                        => 'Table. Copies of post content keyed by post ids, rebuilt by the next resync; cleared with the translation links on a Replace (DataImporter).',
+		'resync_state'                       => 'Table. Per-translation sync state keyed by post ids, rebuilt by the next resync; cleared with the translation links on a Replace (DataImporter).',
+		'_perflocale_stub_title'             => 'Post meta of a translation PerfLocale created empty. The export carries no posts or post meta: it travels with its post (a WXR export or a database copy).',
+		'_perflocale_field_override'         => 'Post meta of a translation (the field keys it keeps apart from its source). The export carries no posts or post meta: it travels with its post (a WXR export or a database copy).',
+		'perflocale_scope_removals_*'        => 'Option. A string scope\'s deferred removals and pending copies, naming this site\'s string ids; a Replace of the strings deletes them and the next sync of the scope derives them again.',
+		'perflocale_resync_run_*'            => 'Option. A running ReSync job\'s cursor, bound to a job row of this site (jobs are not exported).',
+		'perflocale_resync_pending_pass'     => 'Option. Where this site\'s housekeeping pass over pending post payloads continues.',
+		'perflocale_resync_stale_after'      => 'Option. Where this site\'s next housekeeping run continues its repairs of stale intents.',
+		'perflocale_automation_housekeeping' => 'Option. Where this site\'s automation housekeeping continues its checks of old changes and ReSync records.',
+		'perflocale_resync_kept_*'           => 'Option. The index of kept machine-translation outputs (transients) of this site\'s runs; they expire.',
+		'perflocale_resync_units_*'          => 'Transient. A kept machine-translation output of a run, keyed by this site\'s post ids and versions; it expires, and the next machine run rebuilds it.',
+		'perflocale_resync_request_*'        => 'Transient (30 minutes). A run request between its estimate and its start.',
+		'perflocale_resync_result_*'         => 'Transient (5 minutes). A run\'s result for the next screen of its user.',
+		'perflocale_string_tables_engine'    => 'Option. This database\'s storage engine check of the string tables, read again per plugin version.',
+	];
+
+	/**
 	 * Deepest level redact_credentials() walks: an unserialized `R:` back-reference can make a settings array cyclic.
 	 *
 	 * A deeper subtree is dropped, not passed through: it could hold credentials the walk never checked.
@@ -227,6 +268,34 @@ final class DataExporter {
 	 * @var bool
 	 */
 	private static bool $shutdown_registered = false;
+
+	/**
+	 * Rows per table that the last estimate_bytes() counted.
+	 *
+	 * @var array<string, int>
+	 */
+	private array $counted = [];
+
+	/**
+	 * The format the running export writes: FORMAT_VERSION, or 2 when two of its strings share 1.0.7.5's hash.
+	 *
+	 * @var int
+	 */
+	private int $format = self::FORMAT_VERSION;
+
+	/**
+	 * Format 1: every emitted 1.0.7.5 hash, raw, in 16 php://temp buckets by its first nibble (bounded memory at any size).
+	 *
+	 * @var array<int, resource>
+	 */
+	private array $legacy_parts = [];
+
+	/**
+	 * Format 1: hashes written per bucket, so a short read of one is never taken for the whole record.
+	 *
+	 * @var array<int, int>
+	 */
+	private array $legacy_counts = [];
 
 	/**
 	 * Export selected sections as an HTTP JSON download, then exit; CLI and code callers use write_to_file().
@@ -642,7 +711,7 @@ final class DataExporter {
 	 * @return array<int, string>
 	 */
 	public static function grant_roles(): array {
-		/** This filter is documented in src/Admin/TranslatorRole.php */
+		/** This filter is documented in src/Database/SiteCleanup.php. */
 		$roles = (array) apply_filters( 'perflocale/roles/cap_roles', [ 'administrator', 'editor' ] );
 		$roles = array_merge( [ 'administrator', 'editor' ], array_map( static fn( $r ): string => sanitize_key( Typed::str( $r ) ), $roles ), [ 'shop_manager' ] );
 
@@ -747,6 +816,161 @@ final class DataExporter {
 	}
 
 	/**
+	 * Whether two strings may share 1.0.7.5's hash: the switch-over is not `done` (twins it has not counted yet), P1 kept
+	 * twin pairs, or a bar context's `d|c|t` is another bar context's or a bar-free tuple's identity (stored under it, or
+	 * under its pre-release form).
+	 *
+	 * @return bool True also when a read failed.
+	 */
+	private static function legacy_collision(): bool {
+		$wpdb  = Typed::wpdb();
+		$state = json_decode( Typed::str( get_option( \PerfLocale\Strings\StrIdentMigration::OPTION, '' ) ), true );
+
+		if ( ! is_array( $state ) || 'done' !== ( $state['phase'] ?? '' ) || ! empty( $state['held_n'] ) ) {
+			return true;
+		}
+
+		$table = Schema::table( 'strings' );
+		$seen  = [];
+		$after = 0;
+
+		do {
+			$rows = self::read_rows( (string) $wpdb->prepare( 'SELECT id, domain, context, original FROM %i WHERE id > %d AND context LIKE %s ORDER BY id LIMIT 500', $table, $after, '%' . $wpdb->esc_like( '|' ) . '%' ) );
+
+			if ( null === $rows ) {
+				return true;
+			}
+
+			$probe = [];
+
+			foreach ( $rows as $row ) {
+				$id                          = Typed::int( $row['id'] ?? null );
+				[ $domain, $context, $text ] = [ Typed::str( $row['domain'] ?? '' ), Typed::str( $row['context'] ?? '' ), Typed::str( $row['original'] ?? '' ) ];
+				$legacy                      = \PerfLocale\Strings\StringTranslation::identity_hash( $domain, $context, $text, true );
+				$bar                         = (int) strpos( $context, '|' );
+
+				if ( isset( $seen[ $legacy ] ) ) {
+					return true;
+				}
+
+				$seen[ $legacy ]  = true;
+				$probe[ $legacy ] = $id;
+				// The bar-free tuple whose identity is $legacy, under its pre-release form.
+				$probe[ \PerfLocale\Strings\StringTranslation::identity_hash( $domain, substr( $context, 0, $bar ), substr( $context, $bar + 1 ) . '|' . $text, true ) ] = 0;
+				$after = $id;
+			}
+
+			if ( [] === $probe ) {
+				break;
+			}
+
+			// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders -- One %s per hash.
+			$held = self::read_rows( (string) $wpdb->prepare( 'SELECT id, original_hash FROM %i WHERE original_hash IN (' . implode( ',', array_fill( 0, count( $probe ), '%s' ) ) . ')', $table, ...array_keys( $probe ) ) );
+
+			if ( null === $held ) {
+				return true;
+			}
+
+			foreach ( $held as $row ) {
+				// Only the row itself, still under its 1.0.7.5 hash, holds its own legacy hash.
+				if ( ( $probe[ Typed::str( $row['original_hash'] ?? '' ) ] ?? 0 ) !== Typed::int( $row['id'] ?? null ) ) {
+					return true;
+				}
+			}
+		} while ( 500 === count( $rows ) );
+
+		return false;
+	}
+
+	/**
+	 * Format 1: a batch of strings rows under 1.0.7.5's `domain|context|text` (the other form for a context with a bar),
+	 * each hash recorded for legacy_unique().
+	 *
+	 * @param array<mixed> $rows A batch of strings rows.
+	 * @return list<array<string, mixed>>
+	 * @throws \RuntimeException When a hash cannot be recorded.
+	 */
+	private function legacy_rows( array $rows ): array {
+		$out = [];
+
+		foreach ( Typed::rows( $rows ) as $row ) {
+			$context = Typed::str( $row['context'] ?? '' );
+			$legacy  = \PerfLocale\Strings\StringTranslation::identity_hash( Typed::str( $row['domain'] ?? '' ), $context, Typed::str( $row['original'] ?? '' ), str_contains( $context, '|' ) );
+			$raw     = (string) hex2bin( $legacy );
+			$part    = ord( $raw[0] ) >> 4;
+
+			if ( ! isset( $this->legacy_parts[ $part ] ) ) {
+				// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fopen -- A php://temp scratch stream.
+				$stream = fopen( 'php://temp/maxmemory:262144', 'w+b' );
+
+				if ( false === $stream ) {
+					throw new \RuntimeException( 'PerfLocale export: recording a string identity failed - refusing to emit a partial export.' );
+				}
+
+				$this->legacy_parts[ $part ] = $stream;
+			}
+
+			// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fwrite -- A php://temp scratch stream.
+			if ( 32 !== fwrite( $this->legacy_parts[ $part ], $raw ) ) {
+				throw new \RuntimeException( 'PerfLocale export: recording a string identity failed - refusing to emit a partial export.' );
+			}
+
+			$this->legacy_counts[ $part ] = ( $this->legacy_counts[ $part ] ?? 0 ) + 1;
+
+			$row['original_hash'] = $legacy;
+			$out[]                 = $row;
+		}
+
+		return $out;
+	}
+
+	/**
+	 * Format 1: no two emitted strings share a 1.0.7.5 hash (1.0.7.5 would keep one of them), also for rows added, or
+	 * deleted and added, while the export ran.
+	 *
+	 * One bucket is loaded at a time: measured 20 MB peak for a 1M-row strings table, the supported scale.
+	 *
+	 * @return void
+	 * @throws \RuntimeException On a shared hash or a read of the record that is not whole.
+	 */
+	private function legacy_unique(): void {
+		$parts               = $this->legacy_parts;
+		$counts              = $this->legacy_counts;
+		$this->legacy_parts  = [];
+		$this->legacy_counts = [];
+
+		foreach ( $parts as $i => $part ) {
+			$data = is_resource( $part ) && rewind( $part ) ? stream_get_contents( $part ) : false;
+			// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose -- A php://temp scratch stream.
+			is_resource( $part ) && fclose( $part );
+
+			if ( ! is_string( $data ) || strlen( $data ) !== 32 * ( $counts[ $i ] ?? 0 ) ) {
+				throw new \RuntimeException( 'PerfLocale export: reading the recorded string identities failed - refusing to emit a partial export.' );
+			}
+
+			$list = '' === $data ? [] : str_split( $data, 32 );
+
+			if ( count( $list ) !== count( array_unique( $list ) ) ) {
+				throw new \RuntimeException( 'PerfLocale export: two strings share a 1.0.7.5 identity - refusing to emit a file that would lose one.' );
+			}
+		}
+	}
+
+	/**
+	 * A read's rows (ARRAY_A), or null when it failed.
+	 *
+	 * @param string $sql Prepared statement.
+	 * @return list<array<string, mixed>>|null
+	 */
+	private static function read_rows( string $sql ): ?array {
+		$wpdb = Typed::wpdb();
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Prepared by the caller.
+		$rows = $wpdb->get_results( $sql, ARRAY_A );
+
+		return is_array( $rows ) && '' === $wpdb->last_error ? Typed::rows( $rows ) : null;
+	}
+
+	/**
 	 * Shared streaming logic used by download() and write_to_file().
 	 *
 	 * @param resource                $out      Output stream.
@@ -758,13 +982,25 @@ final class DataExporter {
 	private function write_to( $out, array $sections, ?array $groups = null ): void {
 		// phpcs:disable WordPress.WP.AlternativeFunctions.file_system_operations_fwrite -- Streaming to a JSON output stream; WP_Filesystem has no streaming API and download() targets php://output.
 
+		// A blog below database version 2 has no automation table: the file does not declare the section, so a
+		// Replace import of it leaves the target's automation history alone.
+		if ( ! \PerfLocale\Automation\ChangeService::available() ) {
+			$sections = array_values( array_diff( $sections, [ 'automation' ] ) );
+		}
+
+		// 1.0.7.5 would keep one of two strings sharing its hash: such a file is format 2, which 1.0.7.5 refuses before any write.
+		$this->format        = in_array( 'strings', self::tables_for( $sections )[0], true ) && self::legacy_collision() ? 2 : self::FORMAT_VERSION;
+		$this->legacy_parts  = [];
+		$this->legacy_counts = [];
+
 		self::write_chunk( $out, "{\n" );
 		self::write_chunk( $out, '"perflocale_export": true,' . "\n" );
 		self::write_chunk( $out, '"version": "' . PERFLOCALE_VERSION . '",' . "\n" );
-		self::write_chunk( $out, '"format_version": ' . (int) self::FORMAT_VERSION . ',' . "\n" );
+		self::write_chunk( $out, '"format_version": ' . $this->format . ',' . "\n" );
 		self::write_chunk( $out, '"exported_at": "' . gmdate( 'c' ) . '",' . "\n" );
 		self::write_chunk( $out, '"site_url": ' . self::encode_or_fail( self::site_address(), 'site_url' ) . ',' . "\n" );
 		self::write_chunk( $out, '"sections": ' . self::encode_or_fail( $sections, 'sections' ) . ',' . "\n" );
+		self::write_chunk( $out, '"object_max_ids": ' . self::encode_or_fail( ExportItems::object_max_ids(), 'object_max_ids' ) . ',' . "\n" );
 
 		// Each add-on part travels as its own row lists in `data`; group parts are named, with labels, next to `sections`.
 		$parts  = self::export_parts( $sections, $groups );
@@ -863,7 +1099,7 @@ final class DataExporter {
 			[],
 			[
 				'requested'      => $sections,
-				'format_version' => (int) self::FORMAT_VERSION,
+				'format_version' => $this->format,
 			]
 		);
 
@@ -979,12 +1215,18 @@ final class DataExporter {
 				: $wpdb->get_var( $wpdb->prepare( 'SELECT COUNT(*) FROM %i WHERE type = %s', $full_table, $scope ) );
 			$count = is_numeric( $count ) ? (int) $count : 0;
 
+			$this->counted[ $table_name ] = $count;
+
 			if ( $count <= 0 ) {
 				continue;
 			}
 
+			// pending_changes values are counted by their sizes, never read: one can be megabytes.
+			[ $select, $select_args ] = self::select_of( $table_name, 0 );
+
 			$sample = null === $scope
-				? $wpdb->get_results( $wpdb->prepare( 'SELECT * FROM %i LIMIT 200', $full_table ), ARRAY_A )
+				// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- select_of()'s fixed SQL.
+				? $wpdb->get_results( $wpdb->prepare( 'SELECT ' . $select . ' FROM %i LIMIT 200', array_merge( $select_args, [ $full_table ] ) ), ARRAY_A )
 				: $wpdb->get_results( $wpdb->prepare( 'SELECT * FROM %i WHERE type = %s LIMIT 200', $full_table, $scope ), ARRAY_A );
 			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 
@@ -995,13 +1237,28 @@ final class DataExporter {
 			$bytes = 0;
 
 			foreach ( $sample as $row ) {
-				$bytes += strlen( (string) wp_json_encode( $row ) ) + 2;
+				$bytes += strlen( (string) wp_json_encode( 'pending_changes' === $table_name ? self::automation_export_row( (array) $row ) : $row ) ) + 2;
+
+				foreach ( [ 'payload', 'summary' ] as $column ) {
+					$size   = \PerfLocale\Util\Scalar::int( ( (array) $row )[ $column . '_bytes' ] ?? 0 );
+					$bytes += $size <= self::MAX_IMPORT_VALUE_BYTES && ( 'summary' === $column || 'pending' === ( ( (array) $row )['status'] ?? '' ) ) ? $size : 0;
+				}
 			}
 
 			$total += (int) ceil( $bytes / count( $sample ) * $count );
 		}
 
 		return $total;
+	}
+
+	/**
+	 * Rows the last estimate_bytes() counted in a table (0 when it did not count it).
+	 *
+	 * @param string $table_name Table name without prefix.
+	 * @return int
+	 */
+	public function counted_rows( string $table_name ): int {
+		return $this->counted[ $table_name ] ?? 0;
 	}
 
 	/**
@@ -1065,6 +1322,106 @@ final class DataExporter {
 	}
 
 	/**
+	 * The select list of a table read and its arguments: `*`, or for pending_changes its columns with `previous`, a
+	 * decided row's `payload` and any value over `$inline` bytes left in the database (megabytes per row), plus their sizes.
+	 *
+	 * @param string $table_name Unprefixed table name.
+	 * @param int    $inline     Bytes up to which payload and summary are read in the row.
+	 * @return array{0: literal-string, 1: list<int>}
+	 */
+	private static function select_of( string $table_name, int $inline ): array {
+		if ( 'pending_changes' !== $table_name ) {
+			return [ '*', [] ];
+		}
+
+		$sqlite = defined( 'DB_ENGINE' ) && 'sqlite' === DB_ENGINE;
+		$p      = $sqlite ? 'LENGTH(HEX(payload)) / 2' : 'LENGTH(payload)';
+		$s      = $sqlite ? 'LENGTH(HEX(summary)) / 2' : 'LENGTH(summary)';
+
+		return [ self::PENDING_CHANGES_HEAD . ", CASE WHEN status = 'pending' AND {$p} <= %d THEN payload ELSE '' END AS payload, CASE WHEN {$s} <= %d THEN summary ELSE '' END AS summary, " . self::PENDING_CHANGES_TAIL . ", CASE WHEN status = 'pending' THEN {$p} ELSE 0 END AS payload_bytes, {$s} AS summary_bytes", [ $inline, $inline ] ];
+	}
+
+	/**
+	 * A pending_changes row with each value its page left out read alone (one at a time, so a page never holds them);
+	 * a value over the importer's limit stays out (automation_export_row() sees its size).
+	 *
+	 * @param array<mixed> $row    Row of a select_of() read.
+	 * @param int          $inline The bytes the page read inline.
+	 * @param string       $table  Full table name.
+	 * @return array<mixed>
+	 * @throws \RuntimeException When the read fails, so a value is never exported empty.
+	 */
+	private static function with_large_values( array $row, int $inline, string $table ): array {
+		$read = [];
+
+		foreach ( [ 'payload', 'summary' ] as $column ) {
+			$size = \PerfLocale\Util\Scalar::int( $row[ $column . '_bytes' ] ?? 0 );
+
+			if ( $size > $inline && $size <= self::MAX_IMPORT_VALUE_BYTES ) {
+				$read[] = $column;
+			}
+		}
+
+		if ( [] === $read ) {
+			return $row;
+		}
+
+		$wpdb = Typed::wpdb();
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Column names from the fixed list above.
+		$values = $wpdb->get_row( $wpdb->prepare( 'SELECT ' . implode( ', ', $read ) . ' FROM %i WHERE id = %d', $table, \PerfLocale\Util\Scalar::int( $row['id'] ?? 0 ) ), ARRAY_A );
+
+		if ( '' !== (string) $wpdb->last_error || ! is_array( $values ) ) {
+			throw new \RuntimeException( esc_html( sprintf( 'PerfLocale export: reading a value of table "%1$s" failed (%2$s) - refusing to emit a partial export.', $table, '' !== (string) $wpdb->last_error ? (string) $wpdb->last_error : 'row gone' ) ) );
+		}
+
+		foreach ( $read as $column ) {
+			$row[ $column ] = \PerfLocale\Util\Scalar::str( $values[ $column ] ?? '' );
+		}
+
+		return $row;
+	}
+
+	/**
+	 * The exported form of one automation change: never `previous`, `payload` only for a pending change, no intent.
+	 * A pending payload or summary over the importer's per-value limit travels as superseded (`export_too_large`),
+	 * so the rest of the file is never refused.
+	 *
+	 * @param array<mixed> $row Table row.
+	 * @return array<mixed>
+	 */
+	private static function automation_export_row( array $row ): array {
+		$row['previous'] = null;
+		$summary_large   = \PerfLocale\Util\Scalar::int( $row['summary_bytes'] ?? 0 ) > self::MAX_IMPORT_VALUE_BYTES || strlen( \PerfLocale\Util\Scalar::str( $row['summary'] ?? '' ) ) > self::MAX_IMPORT_VALUE_BYTES;
+		$payload_large   = \PerfLocale\Util\Scalar::int( $row['payload_bytes'] ?? 0 ) > self::MAX_IMPORT_VALUE_BYTES || strlen( \PerfLocale\Util\Scalar::str( $row['payload'] ?? '' ) ) > self::MAX_IMPORT_VALUE_BYTES;
+
+		unset( $row['payload_bytes'], $row['summary_bytes'] );
+
+		if ( $summary_large ) {
+			$row['summary'] = '{"export_too_large":true}';
+		}
+
+		if ( 'string' === ( $row['object_type'] ?? '' ) && in_array( $row['result_status'] ?? '', \PerfLocale\Database\Repository\PendingChangeRepository::INTENTS, true ) ) {
+			$row['result_status'] = '';
+		}
+
+		if ( 'pending' !== ( $row['status'] ?? '' ) ) {
+			$row['payload'] = '';
+
+			return $row;
+		}
+
+		if ( $summary_large || $payload_large ) {
+			$row['payload']    = '';
+			$row['status']     = 'superseded';
+			$row['reason']     = 'export_too_large';
+			$row['decided_at'] = gmdate( 'Y-m-d H:i:s' );
+		}
+
+		return $row;
+	}
+
+	/**
 	 * Export a single table in batches.
 	 *
 	 * @param resource    $out Output stream.
@@ -1101,6 +1458,9 @@ final class DataExporter {
 		$batch_size = (int) apply_filters( 'perflocale/export/batch_size', self::BATCH_SIZE, $table_name );
 		$batch_size = max( 50, min( 10000, $batch_size ) );
 		$fp_column  = self::fingerprint_columns()[ $table_name ] ?? null;
+		$inline     = intdiv( self::PENDING_PAGE_BYTES, 2 * $batch_size );
+
+		[ $select, $select_args ] = self::select_of( $table_name, $inline );
 
 		do {
 			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter
@@ -1119,11 +1479,11 @@ final class DataExporter {
 				);
 			} elseif ( $has_id ) {
 				$rows = $wpdb->get_results(
+					// phpcs:ignore WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- select_of()'s SQL brings its own placeholders; the array holds their values.
 					$wpdb->prepare(
-						'SELECT * FROM %i WHERE id > %d ORDER BY id ASC LIMIT %d',
-						$full_table,
-						$last_id,
-						$batch_size
+						// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- select_of()'s fixed SQL.
+						'SELECT ' . $select . ' FROM %i WHERE id > %d ORDER BY id ASC LIMIT %d',
+						array_merge( $select_args, [ $full_table, $last_id, $batch_size ] )
 					),
 					ARRAY_A
 				);
@@ -1164,7 +1524,15 @@ final class DataExporter {
 				$rows = self::with_fingerprints( Typed::rows( $rows ), $fp_column );
 			}
 
+			if ( 1 === $this->format && 'strings' === $table_name ) {
+				$rows = $this->legacy_rows( $rows );
+			}
+
 			foreach ( $rows as $row ) {
+				if ( 'pending_changes' === $table_name && is_array( $row ) ) {
+					$row = self::automation_export_row( self::with_large_values( $row, $inline, $full_table ) );
+				}
+
 				if ( ! $first_row ) {
 					self::write_chunk( $out, ',' . "\n" );
 				}
@@ -1187,6 +1555,10 @@ final class DataExporter {
 
 			$got_full_batch = ( count( $rows ) === $batch_size );
 		} while ( $got_full_batch );
+
+		if ( 1 === $this->format && 'strings' === $table_name ) {
+			$this->legacy_unique();
+		}
 
 		self::write_chunk( $out, "\n" . ']' . ( $is_last ? '' : ',' ) . "\n" );
 		// phpcs:enable WordPress.WP.AlternativeFunctions.file_system_operations_fwrite

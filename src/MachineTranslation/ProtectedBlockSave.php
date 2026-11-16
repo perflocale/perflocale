@@ -166,6 +166,29 @@ final class ProtectedBlockSave {
 	private static array $pending = [];
 
 	/**
+	 * Source id => [ author, last editor ] its kept bytes stay bound to (bind_writers()).
+	 *
+	 * @var array<int, array{int, int}>
+	 */
+	private static array $writers = [];
+
+	/**
+	 * Keep a source's blocks on save only while its author and last editor are still these (SourceTrust::writers());
+	 * null clears. For a caller whose check relied on the writers' trust (XLIFF import).
+	 *
+	 * @param int                $source_id Source post.
+	 * @param array{int, int}|null $writers Author and last editor (0: none), or null.
+	 * @return void
+	 */
+	public static function bind_writers( int $source_id, ?array $writers ): void {
+		if ( null === $writers ) {
+			unset( self::$writers[ $source_id ] );
+		} else {
+			self::$writers[ $source_id ] = $writers;
+		}
+	}
+
+	/**
 	 * Whether a save keeps the markup of its "Do not translate" blocks.
 	 *
 	 * @param string $path      Save path (see the filter).
@@ -253,8 +276,17 @@ final class ProtectedBlockSave {
 		// MySQL refuses a 4-byte character in the SQL comparison with those rows.
 		$source = self::stored_group_source( $post_id, self::encode_like_core( wp_unslash( $raw ) ) );
 
-		if ( null === $source || ! self::may_read_source( $source[0] ) ) {
+		if ( null === $source ) {
 			return $data;
+		}
+
+		// A saver who may not read the source keeps only the blocks the translation itself holds: no source bytes.
+		if ( ! self::may_read_source( $source[0] ) ) {
+			if ( null === $source[4] ) {
+				return $data;
+			}
+
+			$source = [ $post_id, $source[4], $source[2], $source[5] ];
 		}
 
 		// A restore: the note matches, or the save writes exactly one of the post's revisions (a restore with an
@@ -288,7 +320,7 @@ final class ProtectedBlockSave {
 				$revision ? 0 : $post_id,
 				self::encode_like_core( $restored[0] ),
 				wp_unslash( $saved ),
-				SourceBoundWrite::source_holds( $source[0], 'post_content', $source[1], $source[3], $post_id, true ),
+				( $source[0] === $post_id ? SourceBoundWrite::source_holds( $post_id, 'post_content', $source[1], $source[3] ) : SourceBoundWrite::source_holds( $source[0], 'post_content', $source[1], $source[3], $post_id, true ) . ( isset( self::$writers[ $source[0] ] ) ? ' AND ' . SourceBoundWrite::writers_hold( $source[0], ...self::$writers[ $source[0] ] ) : '' ) ),
 				$revision ? 0 : $post_id
 			);
 			$write->arm();
@@ -304,7 +336,7 @@ final class ProtectedBlockSave {
 
 
 	/**
-	 * Whether the saving user may have a source's bytes: one who may view it (host-aware), or a save without a user.
+	 * Whether the saving user may have a source's bytes: one who may read it (host-aware), or a save without a user.
 	 *
 	 * The answer depends on the status, so callers bind the status they read into the conditional write.
 	 *
@@ -312,7 +344,7 @@ final class ProtectedBlockSave {
 	 * @return bool
 	 */
 	public static function may_read_source( int $source_id ): bool {
-		return 0 === get_current_user_id() || \PerfLocale\Helper::user_can_view_object( $source_id );
+		return 0 === get_current_user_id() || \PerfLocale\Util\ObjectPermission::check( 'read', 'read_post', $source_id );
 	}
 
 	/**
@@ -366,7 +398,7 @@ final class ProtectedBlockSave {
 	 *
 	 * @param int    $post_id Translation post id.
 	 * @param string $content Content the save submits (unslashed, emoji encoded as stored).
-	 * @return array{0: int, 1: string, 2: bool, 3: string}|null [ source id, stored content, writes a revision, source status ].
+	 * @return array{0: int, 1: string, 2: bool, 3: string, 4: string|null, 5: string}|null [ source id, stored content, writes a revision, source status, translation's stored content, its status ].
 	 */
 	private static function stored_group_source( int $post_id, string $content ): ?array {
 		/**
@@ -381,7 +413,9 @@ final class ProtectedBlockSave {
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The stored source and link at write time.
 		$row = $wpdb->get_row(
 			$wpdb->prepare(
-				'SELECT p.ID, p.post_content, p.post_status, ( SELECT pfl_c.post_content FROM %i pfl_c WHERE pfl_c.ID = %d ) AS current_content, ( SELECT pfl_r.ID FROM %i pfl_r WHERE pfl_r.post_type = %s AND pfl_r.post_parent = %d AND pfl_r.post_content = %s AND MD5( pfl_r.post_content ) = %s LIMIT 1 ) AS revision_id FROM %i t INNER JOIN %i s ON s.group_id = t.group_id AND s.type = %s AND s.object_id <> t.object_id INNER JOIN %i l ON l.id = s.language_id AND l.is_default = 1 INNER JOIN %i p ON p.ID = s.object_id WHERE t.type = %s AND t.object_id = %d LIMIT 1',
+				'SELECT p.ID, p.post_content, p.post_status, ( SELECT pfl_c.post_content FROM %i pfl_c WHERE pfl_c.ID = %d ) AS current_content, ( SELECT pfl_cs.post_status FROM %i pfl_cs WHERE pfl_cs.ID = %d ) AS current_status, ( SELECT pfl_r.ID FROM %i pfl_r WHERE pfl_r.post_type = %s AND pfl_r.post_parent = %d AND pfl_r.post_content = %s AND MD5( pfl_r.post_content ) = %s LIMIT 1 ) AS revision_id FROM %i t INNER JOIN %i s ON s.group_id = t.group_id AND s.type = %s AND s.object_id <> t.object_id INNER JOIN %i l ON l.id = s.language_id AND l.is_default = 1 INNER JOIN %i p ON p.ID = s.object_id WHERE t.type = %s AND t.object_id = %d LIMIT 1',
+				$wpdb->posts,
+				$post_id,
 				$wpdb->posts,
 				$post_id,
 				$wpdb->posts,
@@ -404,7 +438,9 @@ final class ProtectedBlockSave {
 			return null;
 		}
 
-		return [ (int) $row['ID'], $row['post_content'], is_numeric( $row['revision_id'] ?? null ) && $content !== ( $row['current_content'] ?? null ), is_string( $row['post_status'] ?? null ) ? $row['post_status'] : '' ];
+		$current = is_string( $row['current_content'] ?? null ) ? $row['current_content'] : null;
+
+		return [ (int) $row['ID'], $row['post_content'], is_numeric( $row['revision_id'] ?? null ) && $content !== $current, is_string( $row['post_status'] ?? null ) ? $row['post_status'] : '', $current, is_string( $row['current_status'] ?? null ) ? $row['current_status'] : '' ];
 	}
 
 	/**

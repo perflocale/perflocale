@@ -46,6 +46,21 @@ final class BulkTranslateJob extends AbstractJob {
 	private const RELEASE_EVERY_PAIRS = TargetLanguageGuard::SETTLE_EVERY;
 
 	/**
+	 * Provider waits in a row (Retry-After or breaker cooldown, no answer between) after which the job stops.
+	 */
+	private const PACED_STOPS = 10;
+
+	/**
+	 * Notes about pairs an earlier stopped run left that a result keeps (`redo_notes`); the rest are counted.
+	 */
+	private const REDO_NOTES = 10;
+
+	/**
+	 * Bytes those notes may take: the result also carries a slice's kept answers within JobState::MAX_RESULT_BYTES.
+	 */
+	private const REDO_NOTES_BYTES = 8192;
+
+	/**
 	 * The run's guard against a target language deleted or deactivated while it runs (TargetLanguageGuard).
 	 *
 	 * @var TargetLanguageGuard|null
@@ -81,6 +96,70 @@ final class BulkTranslateJob extends AbstractJob {
 	 */
 	private ?array $pending = null;
 
+	/**
+	 * Provider answers kept for the pair a stop left unfinished: post id, language slug, packed answers and their count.
+	 *
+	 * @var array{post: int, lang: string, data: string, n: int}|null
+	 */
+	private ?array $pieces = null;
+
+	/**
+	 * Failure message for a deadline stop at the same call (JobResume::count_stop()); '' for the general one.
+	 *
+	 * @var string
+	 */
+	private string $stop_note = '';
+
+	/**
+	 * What a checkpoint write inside a provider call threw (a pause, a cancel, a refused write): thrown again once the
+	 * slice stopped, so it reaches the worker and not the pair's error handling.
+	 *
+	 * @var \Throwable|null
+	 */
+	private ?\Throwable $abort = null;
+
+	/**
+	 * The one pair this job may overwrite (the `overwrite` arg PiecesHandOff::overwrite_args() wrote), or null.
+	 *
+	 * @var array{post: int, lang: int, translation: int, modified: string, sum: string}|null
+	 */
+	private ?array $overwrite = null;
+
+	/**
+	 * The pair's answers no longer fit the job row's result cap: the next slice re-sends the ones not kept.
+	 *
+	 * @var bool
+	 */
+	private bool $kept_full = false;
+
+	/**
+	 * Provider waits in a row since the last answer or finished pair.
+	 *
+	 * @var int
+	 */
+	private int $paced = 0;
+
+	/**
+	 * Why the job stops for good at the current pair (checkpoint kept for Retry); '' for none.
+	 *
+	 * @var string
+	 */
+	private string $job_stop = '';
+
+	/**
+	 * This run's notes about pairs an earlier stopped run left (redo note, kept edit), in row order.
+	 *
+	 * @var list<string>
+	 */
+	private array $redo_notes = [];
+
+	/**
+	 * Notes not kept in $redo_notes (over REDO_NOTES or REDO_NOTES_BYTES).
+	 *
+	 * @var int
+	 */
+	private int $redo_more = 0;
+
 	/** {@inheritDoc} */
 	public function get_type(): string {
 		return 'bulk_translate';
@@ -103,6 +182,16 @@ final class BulkTranslateJob extends AbstractJob {
 	 */
 	public function get_default_threshold(): int {
 		return 25;
+	}
+
+	/**
+	 * {@inheritDoc}
+	 *
+	 * A hand-off of one post into one language (PiecesHandOff) needs what translating it in the request needs: every pair
+	 * is checked again as the requester when it runs (edit rights, copy and create rights, an overwrite's edit_post).
+	 */
+	public function required_capability_for( array $args ): string {
+		return \PerfLocale\Background\JobAccess::is_handoff( $this->get_type(), $args ) ? 'perflocale_use_mt' : $this->get_required_capability();
 	}
 
 	/** {@inheritDoc} */
@@ -132,7 +221,8 @@ final class BulkTranslateJob extends AbstractJob {
 	 * @param callable             $progress `function(int, int): void` - reports (processed, total).
 	 * @return array<string, mixed> `created`, `skipped` (of which `skipped_permission` were refused for permissions),
 	 *                               `failed`, `first_error`, `kept` (created rows left in the source language because a
-	 *                               "Do not translate" section was lost) and `first_warning` (the first such warning).
+	 *                               "Do not translate" section was lost), `first_warning` (the first such warning),
+	 *                               and `redo_notes` / `redo_notes_more` when pairs an earlier stopped run left need a check.
 	 * @throws \RuntimeException When machine translation is disabled for the site
 	 *                            after the job was queued.
 	 */
@@ -142,7 +232,12 @@ final class BulkTranslateJob extends AbstractJob {
 		$include_meta = ! empty( $args['include_meta'] );
 
 		// Which path dispatched the run; only these values are accepted.
-		$trigger = in_array( $args['trigger'] ?? null, [ 'site_translate', 'cli_all', 'rest' ], true ) ? (string) $args['trigger'] : 'bulk';
+		$trigger = in_array( $args['trigger'] ?? null, [ 'site_translate', 'cli_all', 'rest', 'auto_create' ], true ) ? (string) $args['trigger'] : 'bulk';
+
+		// The perflocale/mt/include_meta path per row; '' for a hand-off, whose path already decided.
+		$meta_path = empty( $args['handoff'] ) ? ( 'cli_all' === $trigger ? 'cli' : 'bulk' ) : '';
+
+		$this->overwrite = self::overwrite_arg( $args['overwrite'] ?? null );
 
 		$source_ids = array_values( array_filter( array_map( 'intval', (array) ( $args['source_ids'] ?? [] ) ) ) );
 		$target_ids = array_values( array_filter( array_map( 'intval', (array) ( $args['target_lang_ids'] ?? [] ) ) ) );
@@ -203,6 +298,7 @@ final class BulkTranslateJob extends AbstractJob {
 		$slice_seconds   = 0.0;
 		$slice_max_pairs = 0;
 		$deadline        = null;
+		$window_seconds  = null;
 		$release_every   = 0;
 		$run_guard       = new TargetLanguageGuard();
 		$slice           = is_array( $args['__perflocale_slice'] ?? null ) ? $args['__perflocale_slice'] : null;
@@ -237,7 +333,7 @@ final class BulkTranslateJob extends AbstractJob {
 
 			$cli = 'cli' === PHP_SAPI;
 
-			[ $slice_seconds, $slice_max_pairs, $deadline ] = self::slice_budget( $cli );
+			[ $slice_seconds, $slice_max_pairs, $deadline, $window_seconds ] = self::slice_budget( $cli );
 
 			$release_every = $cli ? self::RELEASE_EVERY_PAIRS : 0;
 			$window        = $slice_max_pairs > 0 ? $slice_max_pairs : $release_every;
@@ -334,25 +430,56 @@ final class BulkTranslateJob extends AbstractJob {
 		$this->continue_at  = 0;
 		$this->unit_stopped = false;
 		$this->pending     = null;
-		$this->cut          = null !== $point ? self::cut_at( $resume, $slice ?? [], $processed ) : -1;
-		$previous_deadline = null !== $deadline ? CallDeadline::set( $deadline ) : null;
+		$this->stop_note    = '';
+		$this->abort        = null;
+		$this->pieces       = null !== $point ? self::stored_pieces( $resume ) : null;
+		$this->paced        = null !== $point && is_int( $resume['__perflocale_paced'] ?? null ) ? max( 0, $resume['__perflocale_paced'] ) : 0;
+		$this->job_stop     = '';
 
-		// A worker slice reports its checkpoint before each pair it sends: that pair's position.
-		$save = null === $slice ? null : static function ( int $source_id, string $slug ) use ( &$processed, &$created, &$skipped, &$skipped_permission, &$failed, &$first_error, &$kept, &$first_warning, $progress, $total, $source_ids, $n_targets ): void {
+		[ $this->redo_notes, $this->redo_more ] = null !== $point ? self::stored_notes( $resume ) : [ [], 0 ];
+
+		// The latency rule reads this job's recent call times, or the one a hand-off measured (never its answers).
+		CallDeadline::times( $resume['__perflocale_latency'] ?? ( is_int( $args['latency'] ?? null ) ? [ $args['latency'] ] : [] ) );
+		$this->cut          = null !== $point ? self::cut_at( $resume, $slice ?? [], $processed ) : -1;
+		$previous_deadline = null !== $deadline ? CallDeadline::set( $deadline, $window_seconds ) : null;
+
+		// A worker slice reports its checkpoint before each pair it sends (that pair's position) and after each provider
+		// answer it keeps for the pair; one that would not fit the row's result cap is not written ($must false).
+		$job  = $this;
+		$save = null === $slice ? null : static function ( int $source_id, string $slug, ?array $pieces = null, bool $must = true ) use ( &$processed, &$created, &$skipped, &$skipped_permission, &$failed, &$first_error, &$kept, &$first_warning, $progress, $total, $source_ids, $n_targets, $job ): bool {
+			$point = self::with_pieces( self::checkpoint_of( $processed, $created, $skipped, $skipped_permission, $failed, $first_error, $kept, $first_warning, $source_ids, $n_targets ) + $job->notes() + $job->run_state(), $pieces );
+
+			if ( null === $point[0] && ! $must ) {
+				return false;
+			}
+
 			$progress(
 				$processed,
 				$total,
 				[
-					'checkpoint' => self::checkpoint_of( $processed, $created, $skipped, $skipped_permission, $failed, $first_error, $kept, $first_warning, $source_ids, $n_targets ),
+					'checkpoint' => $point[0] ?? $point[1],
 					/* translators: 1: post id, 2: target language slug. Names the item a background job was on. */
 					'unit'       => sprintf( __( 'post %1$d into %2$s', 'perflocale' ), $source_id, $slug ),
 				]
 			);
+
+			return null !== $point[0];
 		};
 
+		// Content ReSync's captures of the loop's translations are written in batches, one commit each (SyncRecorder).
+		$capture = \PerfLocale\Util\ResyncSwitch::on();
+
+		if ( $capture ) {
+			\PerfLocale\Resync\SyncRecorder::begin_capture_batch();
+		}
+
 		try {
-			$stopped = $this->run_rows( $source_ids, $target_ids, $lang_by_id, $manager, $service, $settings, $include_meta, $total, $tick, $processed, $created, $skipped, $failed, $first_error, is_callable( $yield ) ? $yield : null, $cursor, $skipped_permission, $kept, $first_warning, $start_source, $start_target, $before_pair, $trigger, $save );
+			$stopped = $this->run_rows( $source_ids, $target_ids, $lang_by_id, $manager, $service, $settings, $include_meta, $total, $tick, $processed, $created, $skipped, $failed, $first_error, is_callable( $yield ) ? $yield : null, $cursor, $skipped_permission, $kept, $first_warning, $start_source, $start_target, $before_pair, $trigger, $save, $meta_path );
 		} finally {
+			if ( $capture ) {
+				\PerfLocale\Resync\SyncRecorder::end_capture_batch();
+			}
+
 			if ( null !== $deadline ) {
 				CallDeadline::set( $previous_deadline );
 			}
@@ -361,6 +488,19 @@ final class BulkTranslateJob extends AbstractJob {
 			\PerfLocale\Plugin::get_instance()->get( 'group_repo' )->invalidate_eager_link_map();
 			$this->settle( $created, $failed, $first_error );
 			$this->guard = null;
+		}
+
+		if ( null !== $this->abort ) {
+			throw $this->abort;
+		}
+
+		// A hand-off's requester sees a failed or kept pair on the post's edit screen.
+		if ( ! $stopped && ! empty( $args['handoff'] ) && 1 === $total ) {
+			$item = $failed > 0 ? [ 'reason' => $first_error ] : [ 'reason' => $first_warning, 'warning' => true ];
+
+			$language = $lang_by_id[ $target_ids[0] ] ?? null;
+
+			self::notify( get_current_user_id(), $source_ids[0], is_object( $language ) ? $language : null, $item );
 		}
 
 		// Bound worker memory across slices (runtime cache and SAVEQUERIES log only; persistent cache untouched).
@@ -378,10 +518,24 @@ final class BulkTranslateJob extends AbstractJob {
 			'first_warning'      => $first_warning,
 			'cursor'             => $cursor,
 			'processed'          => $processed,
-		];
+		] + $this->notes();
+
+		// Stopped for good (provider key refused, too many waits, too slow for a run): failed with the checkpoint and the
+		// kept answers, so Retry continues at this pair; it starts without the waits and call times.
+		if ( $stopped && '' !== $this->job_stop ) {
+			$point  = self::with_pieces( $result + [ 'cut' => $processed ], $this->pieces );
+			$result = $point[0] ?? $point[1];
+
+			$result['run_failed']                 = true;
+			$result['__perflocale_checkpoint']    = true;
+			$result['__perflocale_failed_reason'] = $this->job_stop;
+
+			return $result;
+		}
 
 		if ( $stopped ) {
 			$result['__perflocale_continue'] = true;
+			$result                         += $this->run_state();
 
 			if ( $this->continue_at > 0 ) {
 				$result['__perflocale_continue_at'] = $this->continue_at;
@@ -392,13 +546,366 @@ final class BulkTranslateJob extends AbstractJob {
 				$result['__perflocale_unit_stop'] = true;
 			}
 
-			// The next slice redoes the pair the deadline stopped inside, under its own young mark.
+			// The next slice redoes the pair the deadline stopped inside, under its own young mark, with the answers kept.
 			if ( $this->cut === $processed ) {
 				$result['cut'] = $this->cut;
+				$result        = self::with_pieces( $result, $this->pieces )[0] ?? $result;
+			}
+
+			if ( $this->unit_stopped && '' !== $this->stop_note ) {
+				$result['__perflocale_stop_note'] = $this->stop_note;
 			}
 		}
 
 		return $result;
+	}
+
+	/**
+	 * [ $point with the kept answers, $point ]; the first is null when they would pass the row's result cap (with room
+	 * for the resume state), or there are none.
+	 *
+	 * @param array<string, mixed> $point  Checkpoint.
+	 * @param array<mixed>|null    $pieces Kept answers (answers()).
+	 * @return array{0: array<string, mixed>|null, 1: array<string, mixed>}
+	 */
+	private static function with_pieces( array $point, ?array $pieces ): array {
+		if ( null === $pieces ) {
+			return [ $point, $point ];
+		}
+
+		$with = $point + [
+			'pieces'                                    => $pieces,
+			\PerfLocale\Background\JobResume::PARTIAL_KEY => is_int( $pieces['n'] ?? null ) ? $pieces['n'] : 0,
+		];
+		$json = wp_json_encode( $with );
+
+		return [ is_string( $json ) && strlen( $json ) + 2048 <= \PerfLocale\Background\JobState::MAX_RESULT_BYTES ? $with : null, $point ];
+	}
+
+	/**
+	 * The result's `redo_notes`, and `redo_notes_more` when some were not kept (each only when there is one).
+	 *
+	 * @return array<string, mixed>
+	 */
+	private function notes(): array {
+		return array_filter(
+			[
+				'redo_notes'      => $this->redo_notes,
+				'redo_notes_more' => $this->redo_more,
+			]
+		);
+	}
+
+	/**
+	 * The notes a checkpoint carries: [ notes, count not kept ], within the caps.
+	 *
+	 * @param array<mixed> $resume The stored checkpoint.
+	 * @return array{0: list<string>, 1: int}
+	 */
+	private static function stored_notes( array $resume ): array {
+		$notes = array_values( array_filter( is_array( $resume['redo_notes'] ?? null ) ? $resume['redo_notes'] : [], 'is_string' ) );
+		$more  = is_int( $resume['redo_notes_more'] ?? null ) ? max( 0, $resume['redo_notes_more'] ) : 0;
+
+		return [ array_slice( $notes, 0, self::REDO_NOTES ), $more + max( 0, count( $notes ) - self::REDO_NOTES ) ];
+	}
+
+	/**
+	 * Keep a note about a pair an earlier stopped run left; one over the caps is counted only.
+	 *
+	 * @param string $note Note.
+	 * @return void
+	 */
+	private function note_redo( string $note ): void {
+		if ( count( $this->redo_notes ) < self::REDO_NOTES && strlen( (string) wp_json_encode( [ ...$this->redo_notes, $note ] ) ) <= self::REDO_NOTES_BYTES ) {
+			$this->redo_notes[] = $note;
+		} else {
+			++$this->redo_more;
+		}
+	}
+
+	/**
+	 * Run state the next slice reads: recent call times and provider waits in a row (only when there are any).
+	 *
+	 * @return array<string, mixed>
+	 */
+	private function run_state(): array {
+		return array_filter(
+			[
+				'__perflocale_latency' => CallDeadline::times(),
+				'__perflocale_paced'   => $this->paced,
+			]
+		);
+	}
+
+	/**
+	 * The kept answers a checkpoint carries, or null.
+	 *
+	 * @param array<mixed> $resume The stored checkpoint.
+	 * @return array{post: int, lang: string, data: string, n: int}|null
+	 */
+	private static function stored_pieces( array $resume ): ?array {
+		$p = $resume['pieces'] ?? null;
+
+		return is_array( $p ) && is_int( $p['post'] ?? null ) && is_string( $p['lang'] ?? null ) && is_string( $p['data'] ?? null ) && is_int( $p['n'] ?? null )
+			? [
+				'post' => $p['post'],
+				'lang' => $p['lang'],
+				'data' => $p['data'],
+				'n'    => $p['n'],
+			]
+			: null;
+	}
+
+	/**
+	 * The answers kept for a pair: the stored ones when they are this pair's (others are dropped), and each new one
+	 * written into the job's row by $checkpoint, while they fit.
+	 *
+	 * @param int      $source_id  Source post id.
+	 * @param string   $slug       Target language slug.
+	 * @param object   $settings   Plugin settings.
+	 * @param callable $checkpoint The slice's checkpoint writer.
+	 * @return \PerfLocale\MachineTranslation\PieceAnswers
+	 */
+	private function answers( int $source_id, string $slug, object $settings, callable $checkpoint ): \PerfLocale\MachineTranslation\PieceAnswers {
+		require_once __DIR__ . '/../../MachineTranslation/PieceAnswers.php';
+
+		$stored = null !== $this->pieces && $this->pieces['post'] === $source_id && $this->pieces['lang'] === $slug ? $this->pieces : null;
+		$why    = null === $stored ? '' : \PerfLocale\MachineTranslation\PieceAnswers::unreadable( $stored['data'], $stored['n'] );
+
+		if ( '' !== $why ) {
+			throw new \RuntimeException(
+				esc_html(
+					'zlib' === $why
+						? sprintf(
+							/* translators: %d: post ID */
+							__( 'Bulk translation stopped at post %d: the answers the earlier run saved for it cannot be read, as PHP on this server has no zlib extension. Ask your host to enable zlib, then resume the job (resuming without it would pay the provider again).', 'perflocale' ),
+							$source_id
+						)
+						: sprintf(
+							/* translators: %d: post ID */
+							__( 'Bulk translation stopped at post %d: the answers the earlier run saved for it are damaged and cannot be read. Cancel this job and start it again to translate the post anew (the provider is paid again for it).', 'perflocale' ),
+							$source_id
+						)
+				)
+			);
+		}
+
+		$this->pieces = $stored;
+		$this->kept_full = false;
+
+		return new \PerfLocale\MachineTranslation\PieceAnswers(
+			null === $stored ? [] : \PerfLocale\MachineTranslation\PieceAnswers::unpack( $stored['data'] ),
+			$settings,
+			function ( \PerfLocale\MachineTranslation\PieceAnswers $answers ) use ( $source_id, $slug, $checkpoint ): void {
+				$this->paced = 0;
+
+				if ( $this->kept_full ) {
+					return;
+				}
+
+				$entry = [
+					'post' => $source_id,
+					'lang' => $slug,
+					'data' => $answers->pack(),
+					'n'    => $answers->count(),
+				];
+
+				try {
+					$written = '' !== $entry['data'] && $checkpoint( $source_id, $slug, $entry, false );
+				} catch ( \Throwable $e ) {
+					// Stops the slice here; execute() throws it again.
+					$this->abort = $e;
+
+					throw new DeadlineReachedException();
+				}
+
+				// Once one does not fit, none does: the map only grows.
+				if ( $written ) {
+					$this->pieces = $entry;
+				} else {
+					$this->kept_full = true;
+				}
+			}
+		);
+	}
+
+	/**
+	 * Show a hand-off's failure or warning to its requester on the source's edit screen (MtCreateNotice).
+	 *
+	 * @param int                  $user_id   Requester.
+	 * @param int                  $source_id Source post id.
+	 * @param object|null          $language  Target language row.
+	 * @param array<string, mixed> $item      `reason` ('' for none), and `warning` for a saved or kept translation.
+	 * @return void
+	 */
+	private static function notify( int $user_id, int $source_id, ?object $language, array $item ): void {
+		if ( '' === ( $item['reason'] ?? '' ) ) {
+			return;
+		}
+
+		$vars = null !== $language ? get_object_vars( $language ) : [];
+		$name = $vars['name'] ?? ( $vars['slug'] ?? '' );
+
+		\PerfLocale\Admin\MtCreateNotice::remember_publish( $user_id, $source_id, [ $item + [ 'language' => is_string( $name ) ? $name : '' ] ] );
+	}
+
+	/**
+	 * End of a hand-off run that failed for good ({@see JobState} run_end): its requester is told on the post's screen.
+	 *
+	 * @param array<string, mixed> $row Job row.
+	 * @return void
+	 */
+	public static function run_ended( array $row ): void {
+		$args    = is_array( $row['args'] ?? null ) ? $row['args'] : [];
+		$sources = is_array( $args['source_ids'] ?? null ) ? $args['source_ids'] : [];
+		$targets = is_array( $args['target_lang_ids'] ?? null ) ? $args['target_lang_ids'] : [];
+
+		if ( 'failed' !== ( $row['status'] ?? null ) || empty( $args['handoff'] ) || 1 !== count( $sources ) || 1 !== count( $targets ) || ! is_numeric( $sources[0] ) || ! is_numeric( $targets[0] ) ) {
+			return;
+		}
+
+		$repo = \PerfLocale\Plugin::get_instance()->get( 'lang_repo' );
+		$lang = $repo instanceof \PerfLocale\Database\Repository\LanguageRepository ? $repo->find( (int) $targets[0] ) : null;
+
+		self::notify( is_int( $row['created_by'] ?? null ) ? $row['created_by'] : 0, (int) $sources[0], $lang, [ 'reason' => is_string( $row['error'] ?? null ) ? $row['error'] : '' ] );
+	}
+
+	/**
+	 * A valid `overwrite` arg, or null.
+	 *
+	 * @param mixed $arg The arg.
+	 * @return array{post: int, lang: int, translation: int, modified: string, sum: string}|null
+	 */
+	private static function overwrite_arg( mixed $arg ): ?array {
+		if ( ! is_array( $arg ) || ! is_int( $arg['post'] ?? null ) || ! is_int( $arg['lang'] ?? null ) || ! is_int( $arg['translation'] ?? null ) || ! is_string( $arg['modified'] ?? null ) || ! is_string( $arg['sum'] ?? null ) ) {
+			return null;
+		}
+
+		return [
+			'post'        => $arg['post'],
+			'lang'        => $arg['lang'],
+			'translation' => $arg['translation'],
+			'modified'    => $arg['modified'],
+			'sum'         => $arg['sum'],
+		];
+	}
+
+	/**
+	 * Whether a pair with a translation is overwritten: 'ok' for the `overwrite` pair while its translation is the one
+	 * queued, unchanged, and the requester (the job runs as them) may edit it; else 'denied', 'changed' or 'none' (any
+	 * other pair), with the reason.
+	 *
+	 * @param int         $source_id Source post id.
+	 * @param int         $lang_id   Target language id.
+	 * @param object      $manager   Post translation manager.
+	 * @param object|null $language  Language row.
+	 * @return array{0: string, 1: string}
+	 */
+	private function may_overwrite( int $source_id, int $lang_id, object $manager, ?object $language ): array {
+		$o = $this->overwrite;
+
+		if ( null === $o || $o['post'] !== $source_id || $o['lang'] !== $lang_id ) {
+			return [ 'none', '' ];
+		}
+
+		if ( ! current_user_can( 'edit_post', $o['translation'] ) ) {
+			return [ 'denied', __( 'You do not have permission to overwrite this translation.', 'perflocale' ) ];
+		}
+
+		require_once __DIR__ . '/../../MachineTranslation/PiecesHandOff.php';
+
+		$slug  = null !== $language ? TargetLanguageGuard::slug_of( $language ) : '';
+		$now   = '' !== $slug && method_exists( $manager, 'get_translation_id' ) ? $manager->get_translation_id( $source_id, $slug ) : null;
+		$state = \PerfLocale\MachineTranslation\PiecesHandOff::state( $o['translation'] );
+
+		if ( is_numeric( $now ) && (int) $now === $o['translation'] && [ 'modified' => $o['modified'], 'sum' => $o['sum'] ] === $state ) {
+			return [ 'ok', '' ];
+		}
+
+		return [
+			'changed',
+			sprintf(
+				/* translators: 1: ID of the translation post, 2: ID of the source post. */
+				__( 'The translation (post %1$d) of post %2$d changed after this job was queued, so it was kept as it is. Translate it again to replace it.', 'perflocale' ),
+				$o['translation'],
+				$source_id
+			),
+		];
+	}
+
+	/**
+	 * Count a provider wait; the job stop reason once PACED_STOPS come in a row, else ''.
+	 *
+	 * @param int $wait Seconds the provider asked to wait.
+	 * @return string
+	 */
+	private function paced_stop( int $wait ): string {
+		if ( ++$this->paced < self::PACED_STOPS ) {
+			return '';
+		}
+
+		return sprintf(
+			/* translators: 1: number of waits, 2: seconds of the last wait */
+			__( 'The provider asked to wait %1$d times in a row (rate limit; last wait %2$d seconds), so the job was stopped. Retry it later from the Jobs screen or with wp perflocale jobs retry.', 'perflocale' ),
+			self::PACED_STOPS,
+			$wait
+		);
+	}
+
+	/**
+	 * A provider state no pair can get past: a refused key stops the job (the reason), an open breaker is waited for
+	 * (continue_at set, counted as a provider wait); '' and no wait for any other failure.
+	 *
+	 * @param \Throwable $e The pair's failure.
+	 * @return string
+	 */
+	private function provider_stop( \Throwable $e ): string {
+		$auth = in_array( $e->getCode(), [ 401, 403 ], true ) && ! $e instanceof NotSavedException;
+
+		if ( $e instanceof \PerfLocale\Concurrency\BreakerOpenException ) {
+			$status = \PerfLocale\Concurrency\Breaker::status( $e->get_breaker_key() );
+			$auth   = 'auth' === ( $status['reason'] ?? '' );
+
+			if ( ! $auth ) {
+				$wait              = max( 1, is_int( $status['cooldown_remaining'] ?? null ) ? $status['cooldown_remaining'] : 1 );
+				$this->continue_at = time() + $wait;
+
+				return $this->paced_stop( $wait );
+			}
+		}
+
+		return $auth
+			? __( 'The provider refused the API key or access, so the job was stopped before sending more posts. Check the key under PerfLocale > Settings > Addons > Machine Translation (or Settings > Connectors for the WordPress AI client), then retry the job.', 'perflocale' )
+			: '';
+	}
+
+	/**
+	 * The failure message for stops at one provider call: the job row is full (more time does not help), or the ways
+	 * to give the call more time.
+	 *
+	 * @param int    $source_id Source post id.
+	 * @param string $slug      Target language slug.
+	 * @param string $call      The call, such as "content part 4 of 9".
+	 * @param bool   $full      The pair's answers no longer fit the job row.
+	 * @return string
+	 */
+	private static function stop_note( int $source_id, string $slug, string $call, bool $full = false ): string {
+		if ( $full ) {
+			return sprintf(
+				/* translators: 1: post id, 2: target language slug */
+				__( 'Post %1$d into %2$s: the job cannot keep more of this post\'s translated parts between background runs, so it was stopped. Run background jobs with WP-CLI (system cron, no time limit) or shorten the post; then retry the job.', 'perflocale' ),
+				$source_id,
+				$slug
+			);
+		}
+
+		return sprintf(
+			/* translators: 1: post id, 2: target language slug, 3: the provider call, such as "content part 4 of 9" */
+			__( 'Post %1$d into %2$s: %3$s was not translated within one background run, so the job was stopped. Run background jobs with WP-CLI (system cron, no time limit), allow longer runs with the perflocale/jobs/bulk_translate/slice_seconds filter (if your host allows longer requests), or send smaller parts with the perflocale/mt/piece_chars filter; then retry the job.', 'perflocale' ),
+			$source_id,
+			$slug,
+			$call
+		);
 	}
 
 	/**
@@ -422,7 +929,7 @@ final class BulkTranslateJob extends AbstractJob {
 	 * provider calls must end by; the seconds also end before the request's limit ({@see CallDeadline}).
 	 *
 	 * @param bool $cli Whether the run is under WP-CLI.
-	 * @return array{0: float, 1: int, 2: float|null}
+	 * @return array{0: float, 1: int, 2: float|null, 3: float|null}
 	 */
 	private static function slice_budget( bool $cli ): array {
 		/**
@@ -444,12 +951,13 @@ final class BulkTranslateJob extends AbstractJob {
 		$pairs = (int) apply_filters( 'perflocale/jobs/bulk_translate/slice_max_pairs', $cli ? 0 : self::SLICE_MAX_PAIRS );
 
 		$deadline = null;
+		$window   = null;
 
 		if ( ! $cli ) {
-			[ $seconds, $deadline ] = CallDeadline::for_slice( $seconds );
+			[ $seconds, $deadline, $window ] = CallDeadline::for_slice( $seconds );
 		}
 
-		return [ $seconds, $pairs, $deadline ];
+		return [ $seconds, $pairs, $deadline, $window ];
 	}
 
 	/**
@@ -610,13 +1118,17 @@ final class BulkTranslateJob extends AbstractJob {
 			delete_post_meta( $translation, TranslationService::PENDING_META_KEY );
 		}
 
+		$note = sprintf(
+			/* translators: 1: ID of the translation post, 2: ID of the source post. */
+			__( 'The translation (post %1$d) of post %2$d was edited after an earlier run stopped while writing it, so it was kept as it is; its custom fields may not be translated. Check it in its editor.', 'perflocale' ),
+			$translation,
+			$source_id
+		);
+
+		$this->note_redo( $note );
+
 		if ( '' === $first_warning ) {
-			$first_warning = sprintf(
-				/* translators: 1: ID of the translation post, 2: ID of the source post. */
-				__( 'The translation (post %1$d) of post %2$d was edited after an earlier run stopped while writing it, so it was kept as it is; its custom fields may not be translated. Check it in its editor.', 'perflocale' ),
-				$translation,
-				$source_id
-			);
+			$first_warning = $note;
 		}
 	}
 
@@ -706,16 +1218,21 @@ final class BulkTranslateJob extends AbstractJob {
 	 * @param callable|null     $before_pair   Called with the next pair's indexes; true stops the loop before it.
 	 * @param string            $trigger       The dispatching path; a password-protected source it may not send
 	 *                                         (TranslationService::may_send_post()) counts as skipped.
-	 * @param callable|null      $checkpoint    Called with the source id and target slug before a pair is sent.
+	 * @param callable|null      $checkpoint    Writes the slice's checkpoint: called with the source id and target slug
+	 *                                         before a pair is sent, and with the kept answers after each one.
+	 * @param string             $meta_path     Path for TranslationService::include_meta(); '' keeps $include_meta.
 	 * @return bool True when $before_pair, or a provider wait past the slice's deadline, stopped the loop.
 	 * @throws DeadlineReachedException In a run without $before_pair (not a slice): the deadline is its caller's.
 	 * @phpstan-impure
 	 */
-	private function run_rows( array $source_ids, array $target_ids, array $lang_by_id, object $manager, TranslationService $service, object $settings, bool $include_meta, int $total, callable $tick, int &$processed, int &$created, int &$skipped, int &$failed, string &$first_error, ?callable $yield = null, int &$cursor = 0, int &$skipped_permission = 0, int &$kept = 0, string &$first_warning = '', int $start_source = 0, int $start_target = 0, ?callable $before_pair = null, string $trigger = 'bulk', ?callable $checkpoint = null ): bool {
+	private function run_rows( array $source_ids, array $target_ids, array $lang_by_id, object $manager, TranslationService $service, object $settings, bool $include_meta, int $total, callable $tick, int &$processed, int &$created, int &$skipped, int &$failed, string &$first_error, ?callable $yield = null, int &$cursor = 0, int &$skipped_permission = 0, int &$kept = 0, string &$first_warning = '', int $start_source = 0, int $start_target = 0, ?callable $before_pair = null, string $trigger = 'bulk', ?callable $checkpoint = null, string $meta_path = '' ): bool {
 		// `perflocale_use_mt` authorizes spending the provider; WorkerRunner re-checks only
 		// `perflocale_manage_translations`. Read once here (the user cannot change in the loop) and folded into the
 		// per-row gate, so a revoked capability counts as skipped, as an unauthorized post does.
 		$can_use_mt = current_user_can( 'perflocale_use_mt' );
+
+		// Drafts kept from stopped runs stay listed on the Jobs page: this result shows only the first.
+		\PerfLocale\Translation\CreationMark::hold_reports();
 		$gone_ids   = [];
 
 		// Say why the run did nothing: all "skipped" with no error reads as "nothing to translate", not as a lost
@@ -730,11 +1247,8 @@ final class BulkTranslateJob extends AbstractJob {
 				? array_slice( $target_ids, $start_target, null, true )
 				: $target_ids;
 
-			// Re-check the per-row capability inside the worker. The
-			// dispatch-side capability gate is `perflocale_manage_translations`;
-			// individual posts still respect edit rights (host-aware) so a user can't
-			// trigger MT for content they couldn't otherwise edit.
-			if ( ! $can_use_mt || ! \PerfLocale\Helper::user_can_edit_object( (int) $source_id ) ) {
+			// Checked here, at execution (rights may change after queueing): the post sent needs edit and read, host-aware.
+			if ( ! $can_use_mt || ! \PerfLocale\Helper::user_can_copy_translation_source( (int) $source_id ) ) {
 				if ( null !== $before_pair && $before_pair( $source_index, (int) array_key_first( $targets ) ) ) {
 					return true;
 				}
@@ -760,6 +1274,7 @@ final class BulkTranslateJob extends AbstractJob {
 			// $source_id, so it holds.
 			$copy_allowed  = null;
 			$create_denied = false;
+			$copy_hidden   = false;
 
 			// Whether this run may send this source, resolved at its first row to translate (free when every row
 			// exists).
@@ -770,16 +1285,58 @@ final class BulkTranslateJob extends AbstractJob {
 					return true;
 				}
 
-				// Never overwrite an existing translation; checked by the target's id before the checkpoint, so a skip
-				// costs no query.
-				$found = null;
+				// The pair a stopped worker was inside: its draft (CreationMark) is recovered, also when the pair was linked since.
+				if ( $processed === $this->cut && '' !== TargetLanguageGuard::slug_of( $lang_by_id[ $target_lang_id ] ?? null ) ) {
+					foreach ( \PerfLocale\Translation\CreationMark::recover_pair( (int) $source_id, TargetLanguageGuard::slug_of( $lang_by_id[ $target_lang_id ] ?? null ) ) as $draft => $outcome ) {
+						if ( '' === $first_warning ) {
+							$first_warning = \PerfLocale\Translation\CreationMark::message( (int) $draft, (int) $source_id, $outcome );
+						}
+					}
+				}
+
+				// Never overwrite an existing translation, except the one pair of an `overwrite` arg while it is as queued;
+				// checked by the target's id before the checkpoint, so a skip costs no query.
+				$found       = null;
+				$overwriting = false;
 
 				if ( ! isset( $gone_ids[ (int) $target_lang_id ] ) && $this->has_translation( $manager, (int) $source_id, $lang_by_id[ $target_lang_id ] ?? null, $processed === $this->cut, $found ) ) {
-					$this->kept_edit( $found, (int) $source_id, $first_warning );
-					++$skipped;
-					++$processed;
-					$tick( $processed );
-					continue;
+					[ $over, $why ] = $this->may_overwrite( (int) $source_id, (int) $target_lang_id, $manager, $lang_by_id[ $target_lang_id ] ?? null );
+
+					// One the dispatching user may not view: refused as the create routes refuse it, never named or "skipped".
+					$slug = TargetLanguageGuard::slug_of( $lang_by_id[ $target_lang_id ] ?? null );
+
+					if ( null === $found && '' !== $slug && method_exists( $manager, 'get_translation_id' ) ) {
+						$looked = $manager->get_translation_id( (int) $source_id, $slug );
+						$found  = is_numeric( $looked ) ? \PerfLocale\Util\Scalar::int( $looked ) : null;
+					}
+
+					$hidden = get_current_user_id() > 0 && \PerfLocale\Api\TranslationsController::hidden_translation( (int) $source_id, $found );
+
+					if ( $hidden ) {
+						$over = 'denied';
+						$why  = \PerfLocale\Api\TranslationsController::unavailable_message( $slug );
+					}
+
+					if ( 'ok' !== $over ) {
+						if ( ! $hidden ) {
+							$this->kept_edit( $found, (int) $source_id, $first_warning );
+						}
+
+						++$skipped;
+						++$processed;
+						$tick( $processed );
+
+						if ( 'denied' === $over ) {
+							++$skipped_permission;
+							$first_error = '' === $first_error ? $why : $first_error;
+						} elseif ( '' === $first_warning ) {
+							$first_warning = $why;
+						}
+
+						continue;
+					}
+
+					$overwriting = true;
 				}
 
 				// Before every pair that calls the provider or writes: after a change by another process the pair reads
@@ -841,7 +1398,7 @@ final class BulkTranslateJob extends AbstractJob {
 				// marked pending is redone, as above.
 				$now = $refreshed ? $manager->get_translation_id( $source_id, $target_lang->slug ) : null;
 
-				if ( null !== $now && ! $this->unfinished( $now, $processed === $this->cut ) ) {
+				if ( null !== $now && ! $this->unfinished( $now, $processed === $this->cut ) && ! ( $overwriting && is_numeric( $now ) && (int) $now === ( $this->overwrite['translation'] ?? 0 ) ) ) {
 					$this->kept_edit( is_numeric( $now ) ? (int) $now : null, (int) $source_id, $first_warning );
 					++$skipped;
 					++$processed;
@@ -856,7 +1413,8 @@ final class BulkTranslateJob extends AbstractJob {
 					$copy_from = $manager->get_copy_source_id( (int) $source_id, (string) $target_lang->slug );
 
 					if ( $copy_from > 0 ) {
-						$copy_allowed  = $copy_from === (int) $source_id || \PerfLocale\Helper::user_can_copy_translation_source( $copy_from );
+						$copy_allowed  = \PerfLocale\Helper::user_can_copy_translation_source( $copy_from );
+						$copy_hidden   = ! $copy_allowed && ! \PerfLocale\Helper::user_can_view_object( \PerfLocale\Util\Scalar::int( $copy_from ) );
 						$create_denied = $copy_allowed && ( ! is_int( $copy_from ) || ! \PerfLocale\Helper::user_can_create_like( $copy_from ) );
 
 						if ( $create_denied ) {
@@ -872,9 +1430,10 @@ final class BulkTranslateJob extends AbstractJob {
 					$tick( $processed );
 
 					if ( $first_error === '' ) {
+						// A copy source the user may not open: the refusal of a hidden translation, naming none.
 						$first_error = $create_denied
 							? __( 'You do not have permission to create translations of this content.', 'perflocale' )
-							: __( 'You cannot edit the original this translation is copied from.', 'perflocale' );
+							: ( $copy_hidden ? \PerfLocale\Api\TranslationsController::source_unavailable_message( TargetLanguageGuard::slug_of( $target_lang ) ) : __( 'You need read and edit rights on the original this translation is copied from.', 'perflocale' ) );
 					}
 
 					continue;
@@ -955,14 +1514,22 @@ final class BulkTranslateJob extends AbstractJob {
 				// The translation found unfinished: written only while its row is the one its mark fingerprints.
 				$redo = $refreshed ? ( is_numeric( $now ) ? (int) $now : null ) : $found;
 
+				$answers = null;
+
 				if ( null !== $checkpoint ) {
-					$checkpoint( (int) $source_id, TargetLanguageGuard::slug_of( $target_lang ) );
+					$slug    = TargetLanguageGuard::slug_of( $target_lang );
+					$answers = $this->answers( (int) $source_id, $slug, $settings, $checkpoint );
+					$checkpoint( (int) $source_id, $slug, $this->pieces );
 				}
+
+				$service->keep_answers( $answers );
 
 				try {
 					// fast_fail=false lets the provider's retry loop catch transient errors (rate limit, network blip).
 					$inserted   = false;
-					$row_result = $service->translate_post( $source_id, TargetLanguageGuard::slug_of( $target_lang ), '', false, $include_meta, $inserted, null !== $redo );
+					$row_slug   = TargetLanguageGuard::slug_of( $target_lang );
+					$row_meta   = '' === $meta_path ? $include_meta : TranslationService::include_meta( $include_meta, $meta_path, (int) $source_id, $row_slug );
+					$row_result = $service->translate_post( $source_id, $row_slug, '', false, $row_meta, $inserted, null !== $redo );
 
 					if ( ! empty( $row_result['post_id'] ) ) {
 						++$created;
@@ -971,6 +1538,15 @@ final class BulkTranslateJob extends AbstractJob {
 						// removed.
 						if ( $inserted && null !== $this->guard ) {
 							$this->guard->written( is_numeric( $row_result['post_id'] ) ? (int) $row_result['post_id'] : 0, (int) $target_lang_id );
+						}
+
+						// A stopped creation's copy steps that failed again or were left out (an edit since): the row's own field.
+						if ( is_string( $row_result['redo_note'] ?? null ) ) {
+							$this->note_redo( $row_result['redo_note'] );
+
+							if ( $first_warning === '' ) {
+								$first_warning = $row_result['redo_note'];
+							}
 						}
 
 						// A lost "Do not translate" section or a builder layout keeps the source content; the row
@@ -992,6 +1568,11 @@ final class BulkTranslateJob extends AbstractJob {
 						} elseif ( $first_warning === '' && is_string( $row_result['length_warning'] ?? null ) ) {
 							$first_warning = $row_result['length_warning'];
 						}
+
+						// A stopped run's draft of this pair, trashed or kept (CreationMark).
+						if ( $first_warning === '' && is_string( $row_result['creation_note'] ?? null ) ) {
+							$first_warning = $row_result['creation_note'];
+						}
 					} else {
 						++$failed;
 						$row_error = __( 'Provider returned no post ID', 'perflocale' );
@@ -1001,17 +1582,39 @@ final class BulkTranslateJob extends AbstractJob {
 						}
 					}
 				} catch ( DeadlineReachedException $e ) {
-					// Not the pair's failure: the next slice translates it again.
+					// Not the pair's failure: the next slice translates it again, or the job stops at it.
 					if ( null === $before_pair ) {
 						throw $e;
+					}
+
+					$this->job_stop = '' !== $e->job_stop() ? $e->job_stop() : ( $e->paced() ? $this->paced_stop( $e->wait() ) : '' );
+
+					if ( '' !== $this->job_stop ) {
+						$this->cut = $processed;
+						$service->keep_answers( null );
+
+						return true;
 					}
 
 					$this->continue_at  = $e->retry_at();
 					$this->unit_stopped = ! $e->paced();
 					$this->cut          = $processed;
+					$this->stop_note    = null === $answers || '' === $answers->in_flight ? '' : self::stop_note( (int) $source_id, TargetLanguageGuard::slug_of( $target_lang ), $answers->in_flight, $this->kept_full );
+					$service->keep_answers( null );
 
 					return true;
 				} catch ( \Throwable $e ) {
+					// An open breaker is waited for, a refused key stops the job: no pair fails for either.
+					$this->job_stop = null === $before_pair ? '' : $this->provider_stop( $e );
+
+					if ( '' !== $this->job_stop || $this->continue_at > 0 ) {
+						$this->cut          = $processed;
+						$this->unit_stopped = false;
+						$service->keep_answers( null );
+
+						return true;
+					}
+
 					$row_error = $e->getMessage();
 
 					// Edited or finished since this run read its mark: skipped. Kept and reported only for a mark no live call
@@ -1033,6 +1636,11 @@ final class BulkTranslateJob extends AbstractJob {
 						}
 					}
 				}
+
+				// The pair is done: its kept answers go with the next checkpoint.
+				$service->keep_answers( null );
+				$this->pieces = null;
+				$this->paced  = 0;
 
 				/**
 				 * Fires after each (source post, target language) row: translated, failed or short-circuited by

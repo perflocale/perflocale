@@ -288,7 +288,10 @@ final class TermListColumns {
 		}
 
 		if ( $column === 'perflocale_language' ) {
-			return $this->render_language_column( $term_id );
+			// Quick Edit answers with the row: what the rename's URL slug follow reported shows in it.
+			$notes = class_exists( \PerfLocale\Translation\TermSlugFollow::class, false ) ? \PerfLocale\Translation\TermSlugFollow::messages( $term_id ) : [];
+
+			return $this->render_language_column( $term_id ) . implode( '', array_map( static fn( string $m ): string => '<div class="notice notice-warning inline"><p>' . esc_html( $m ) . '</p></div>', $notes ) );
 		}
 
 		return $this->render_translations_column( $term_id );
@@ -695,10 +698,11 @@ final class TermListColumns {
 	 * / `edit-{id}`) and hooks core's `inlineEditTax.edit` instead of
 	 * `inlineEditPost.edit`.
 	 *
+	 * @param mixed $hook_suffix Hook suffix; not a string outside a normal admin page render (iframe_header()).
 	 * @return void
 	 */
-	public function quick_edit_js(): void {
-		$screen = get_current_screen();
+	public function quick_edit_js( mixed $hook_suffix = '' ): void {
+		$screen = is_string( $hook_suffix ) ? get_current_screen() : null;
 
 		if ( ! $screen || $screen->base !== 'edit-tags' ) {
 			return;

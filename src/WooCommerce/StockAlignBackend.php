@@ -22,8 +22,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 interface StockAlignBackend {
 
 	/**
-	 * Take, for every id (ascending), the "aligning" lock and the mirror's lock.
-	 * Never waits: when one is busy, release the ones taken and return false.
+	 * Take the stock change locks of the members' translation groups (StockChangeLock::hold()), then for every id
+	 * (ascending) the "aligning" lock and the mirror's lock, then check the groups' fence rows. Never waits: when
+	 * one is busy, or a fenced change is in flight, release the ones taken and return false.
 	 *
 	 * @param list<int> $ids Member ids, ascending.
 	 * @return bool
@@ -31,7 +32,8 @@ interface StockAlignBackend {
 	public function lock( array $ids ): bool;
 
 	/**
-	 * Renew every lock lock() took (a mirror lock only while held) and confirm this process still owns each.
+	 * Renew every lock lock() took (a mirror lock only while held), confirm this process still owns each and that no
+	 * change was fenced since lock().
 	 *
 	 * @param list<int> $ids Member ids.
 	 * @return bool False when one was lost (expired and taken by another process).
@@ -80,7 +82,7 @@ interface StockAlignBackend {
 	 * @param int   $id     Product or variation id.
 	 * @param float $delta  Signed change (never 0).
 	 * @param float $expect Its stock as last read.
-	 * @return float|null The stock WooCommerce returned; null when the stock was not $expect (nothing written).
+	 * @return float|null The stock its own statement set; null when the stock was not $expect (nothing written).
 	 * @throws StockWriteFailed When the write failed or the product is gone.
 	 * @throws StockLeaseLost When the group's locks could not be renewed right before the statement (nothing written).
 	 */
@@ -126,11 +128,21 @@ interface StockAlignBackend {
 	 *
 	 * @param int   $product_id Product or variation written.
 	 * @param float $old        Stock read under the lock before the write.
-	 * @param float $new        Stock WooCommerce returned.
+	 * @param float $new        Stock the write's own statement set.
 	 * @param int   $group_id   The group's anchor id.
 	 * @return void
 	 */
 	public function aligned( int $product_id, float $old, float $new, int $group_id ): void;
+
+	/**
+	 * Before release(): how this group's alignment ended, for a stock change a reconnect hid from it (StockChangeLock).
+	 *
+	 * @param int       $reference The member whose stock every member was set to (0: a callable or a filtered value).
+	 * @param string    $state     'all' (every member holds it), 'none' (no write sent) or 'part' (a write sent: a lost reply may have landed it).
+	 * @param list<int> $ids       The group's members.
+	 * @return void
+	 */
+	public function settle( int $reference, string $state, array $ids ): void;
 
 	/**
 	 * Log an error the screen must not show (a callable's or hook's message), under WP_DEBUG only.

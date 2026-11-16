@@ -132,7 +132,7 @@ final class XliffController extends RestController {
 			}
 
 			foreach ( $chunk as $pid ) {
-				if ( $pid > 0 && ! current_user_can( 'edit_post', $pid ) ) {
+				if ( $pid > 0 && ! \PerfLocale\Util\ObjectPermission::edit_narrowed( $pid ) ) {
 					return new \WP_Error(
 						'rest_forbidden',
 						__( 'You do not have permission to export one or more of the specified posts.', 'perflocale' ),
@@ -170,7 +170,7 @@ final class XliffController extends RestController {
 
 		// Verify the user can edit each post before exporting its content.
 		foreach ( $post_ids as $pid ) {
-			if ( ! current_user_can( 'edit_post', $pid ) ) {
+			if ( ! \PerfLocale\Util\ObjectPermission::edit_narrowed( $pid ) ) {
 				return $this->error( 'rest_forbidden', __( 'You do not have permission to export one or more of the specified posts.', 'perflocale' ), 403 );
 			}
 		}

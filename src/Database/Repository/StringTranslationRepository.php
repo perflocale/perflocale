@@ -297,21 +297,24 @@ final class StringTranslationRepository {
 	 * Delete every translation of a language. Throws on failure, so LanguageRepository::delete()'s transaction rolls
 	 * back instead of committing without this table.
 	 *
-	 * @param int $language_id Language ID.
+	 * @param int    $language_id Language ID.
+	 * @param string $guarded     ' AND <connection marker>' inside the caller's own transaction, else ''.
 	 * @return int Number of rows deleted.
 	 * @throws \RuntimeException When the underlying DELETE fails.
 	 */
-	public function delete_for_language( int $language_id ): int {
+	public function delete_for_language( int $language_id, string $guarded = '' ): int {
 		if ( $language_id <= 0 ) {
 			return 0;
 		}
 
 		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
-		$result = $this->wpdb->delete(
-			$this->table(),
-			[ 'language_id' => $language_id ],
-			[ '%d' ]
-		);
+		$result = '' === $guarded
+			? $this->wpdb->delete(
+				$this->table(),
+				[ 'language_id' => $language_id ],
+				[ '%d' ]
+			)
+			: $this->wpdb->query( $this->wpdb->prepare( 'DELETE FROM %i WHERE language_id = %d', $this->table(), $language_id ) . $guarded );
 		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
 
 		if ( $result === false ) {
@@ -324,20 +327,17 @@ final class StringTranslationRepository {
 	/**
 	 * Delete every translation of a string.
 	 *
-	 * @param int $string_id String ID.
+	 * @param int    $string_id String ID.
+	 * @param string $guarded   ' AND <connection marker>' inside the caller's own transaction, else ''.
 	 * @return int Number of rows deleted.
 	 */
-	public function delete_for_string( int $string_id ): int {
+	public function delete_for_string( int $string_id, string $guarded = '' ): int {
 		if ( $string_id <= 0 ) {
 			return 0;
 		}
 
 		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
-		$result = $this->wpdb->delete(
-			$this->table(),
-			[ 'string_id' => $string_id ],
-			[ '%d' ]
-		);
+		$result = $this->wpdb->query( $this->wpdb->prepare( 'DELETE FROM %i WHERE string_id = %d', $this->table(), $string_id ) . $guarded );
 		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
 
 		return $result === false ? 0 : (int) $result;
@@ -347,13 +347,14 @@ final class StringTranslationRepository {
 	 * Move every translation of one string to another (stale-string migration); the source rows are deleted only after
 	 * the UPDATE reported success.
 	 *
-	 * @param int $from_id Source string ID.
-	 * @param int $to_id Destination string ID.
+	 * @param int    $from_id Source string ID.
+	 * @param int    $to_id   Destination string ID.
+	 * @param string $guarded ' AND <connection marker>' inside the caller's own transaction, else ''.
 	 * @return int Rows moved, 0 when there was nothing to move, or -1 when the
 	 *             UPDATE failed - in which case nothing was deleted and every
 	 *             row is still attached to $from_id.
 	 */
-	public function move_translations( int $from_id, int $to_id ): int {
+	public function move_translations( int $from_id, int $to_id, string $guarded = '' ): int {
 		if ( $from_id <= 0 || $to_id <= 0 || $from_id === $to_id ) {
 			return 0;
 		}
@@ -364,7 +365,7 @@ final class StringTranslationRepository {
 			$this->wpdb->prepare(
 				'UPDATE IGNORE %i SET string_id = %d' . $touch . ' WHERE string_id = %d',
 				array_merge( [ $this->table(), $to_id ], '' === $touch ? [] : [ $to_id ], [ $from_id ] )
-			)
+			) . $guarded
 		);
 		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber
 
@@ -375,8 +376,7 @@ final class StringTranslationRepository {
 		}
 
 		// Rows the unique key kept from moving (the target had one): the destination wins.
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-		$this->wpdb->delete( $this->table(), [ 'string_id' => $from_id ], [ '%d' ] );
+		$this->delete_for_string( $from_id, $guarded );
 
 		return (int) $result;
 	}

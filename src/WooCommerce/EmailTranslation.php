@@ -9,7 +9,6 @@ declare( strict_types=1 );
 
 namespace PerfLocale\WooCommerce;
 
-use PerfLocale\Database\Repository\StringRepository;
 use PerfLocale\Database\Schema;
 use PerfLocale\Plugin;
 
@@ -28,6 +27,19 @@ final class EmailTranslation {
 	 * Order meta key that stores the language slug.
 	 */
 	private const ORDER_LANG_META = '_perflocale_language';
+
+	/**
+	 * The string repository's compute_hash() for the `woocommerce` domain, without loading the repository.
+	 *
+	 * @since 1.0.8
+	 *
+	 * @param string $context String context (email_<field>_<email id>).
+	 * @param string $text    Original text.
+	 * @return string 64-character hex hash.
+	 */
+	public static function string_hash( string $context, string $text ): string {
+		return \PerfLocale\Strings\StringIdentity::identity_hash( 'woocommerce', $context, $text );
+	}
 
 	/**
 	 * Whether the locale has been switched for the current email.
@@ -327,7 +339,7 @@ final class EmailTranslation {
 		}
 
 		$context = "email_{$field}_{$email->id}";
-		$hash    = StringRepository::compute_hash( 'woocommerce', $context, $raw_value );
+		$hash    = self::string_hash( $context, $raw_value );
 
 		// Preload all email translations for this language in one query.
 		$this->preload_email_translations( $language_id );
@@ -646,11 +658,14 @@ final class EmailTranslation {
 		$st_table      = Schema::table( 'string_translations' );
 
 		// All email string translations of this language; string_translations joins on its
-		// (string_id, language_id) primary key.
+		// (string_id, language_id) primary key. During the identity switch-over rows are keyed as the string map keys them.
+		$bridge = \PerfLocale\Strings\StringIdentity::bridging();
+
 		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter
 		$results = $wpdb->get_results(
 			$wpdb->prepare(
-				"SELECT s.original_hash, st.translation AS translated_text
+				"SELECT s.original_hash, st.translation AS translated_text, s.domain,
+				CASE WHEN %d = 1 THEN s.context END AS b_ctx, CASE WHEN %d = 1 THEN s.original END AS b_text
 				FROM %i s
 				INNER JOIN %i g
 					ON g.id = s.group_id AND g.type = 'string'
@@ -661,6 +676,8 @@ final class EmailTranslation {
 				WHERE s.domain = 'woocommerce'
 					AND s.context LIKE %s
 					AND st.translation != ''",
+				$bridge,
+				$bridge,
 				$strings_table,
 				$groups_table,
 				$links_table,
@@ -674,7 +691,9 @@ final class EmailTranslation {
 
 		if ( is_array( $results ) ) {
 			foreach ( $results as $row ) {
-				$this->email_translations[ $language_id ][ $row->original_hash ] = $row->translated_text;
+				if ( $row instanceof \stdClass && is_string( $row->translated_text ?? null ) ) {
+					$this->email_translations[ $language_id ][ \PerfLocale\Strings\StringIdentity::row_key( $row ) ] = $row->translated_text;
+				}
 			}
 		}
 	}

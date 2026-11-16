@@ -239,10 +239,15 @@ final class PerfLocaleCommand {
 		);
 		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter
 
-		if ( $slug_in_use > 0 ) {
-			\WP_CLI::error(
-				"Slug '{$slug}' (the first two letters of {$locale}) is already in use by another language. Slugs must be unique; remove the conflicting language first, or add this one through the admin UI where the slug can be customised."
-			);
+		require_once dirname( __DIR__ ) . '/Translation/LanguageCodeSlugs.php';
+
+		// A code another language has, or whose root path a post holds.
+		$refused = $slug_in_use > 0
+			? "Slug '{$slug}' (the first two letters of {$locale}) is already in use by another language. Slugs must be unique; remove the conflicting language first, or add this one through the admin UI where the slug can be customised."
+			: \PerfLocale\Translation\LanguageCodeSlugs::clash( \PerfLocale\Translation\LanguageCodeSlugs::paths( $slug, $locale, \PerfLocale\Plugin::get_instance()->settings() ), \PerfLocale\Plugin::get_instance()->settings() )[1];
+
+		if ( '' !== $refused ) {
+			\WP_CLI::error( $refused );
 		}
 
 		$id = $repo->insert(
@@ -334,9 +339,10 @@ final class PerfLocaleCommand {
 
 		\WP_CLI::confirm( "Delete language '{$slug}' ({$lang->name})?", $assoc_args );
 
-		// delete() returns false after its ROLLBACK: the language and its rows are still there.
+		// delete() returns false after its ROLLBACK (the language and its rows are still there), or when not confirmed.
 		if ( ! $repo->delete( (int) $lang->id ) ) {
-			\WP_CLI::error( 'The language could not be deleted; nothing was changed.' );
+			$why = \PerfLocale\Database\Repository\LanguageWrites::refused();
+			\WP_CLI::error( in_array( $why, [ 'delete_data', 'delete_unknown' ], true ) ? \PerfLocale\Database\Repository\LanguageWrites::refusal( $why ) : 'The language could not be deleted; nothing was changed.' );
 		}
 
 		\WP_CLI::success( "Language '{$slug}' deleted." );
@@ -383,9 +389,15 @@ final class PerfLocaleCommand {
 	 * [--include-meta]
 	 * : Also machine-translate registered meta fields (SEO titles etc.).
 	 *
+	 * [--meta-only]
+	 * : Existing translations only: machine-translate the registered meta fields that still hold the source's value
+	 *   byte for byte (for example SEO focus keywords copied before they were translated). Titles, content, excerpts
+	 *   and any changed or empty field are left as they are; posts without a translation are skipped.
+	 *
 	 * ## EXAMPLES
 	 *
 	 * wp perflocale translate 42 --to=fr
+	 * wp perflocale translate --all --to=de --meta-only
 	 * wp perflocale translate --all --to=de --post-type=post --skip-existing
 	 * wp perflocale translate --post-ids=1,2,3 --to=fr
 	 *
@@ -397,8 +409,16 @@ final class PerfLocaleCommand {
 		$target_lang = $assoc_args['to'] ?? '';
 		$provider    = $assoc_args['provider'] ?? '';
 
-		if ( $target_lang === '' ) {
-			\WP_CLI::error( 'Target language is required: --to=<lang>' );
+		// --meta-only takes none of the flags that create, skip, estimate or dispatch.
+		$meta_only = isset( $assoc_args['meta-only'] );
+		$refusal   = '' === $target_lang ? 'Target language is required: --to=<lang>' : '';
+
+		foreach ( $meta_only && '' === $refusal ? [ 'include-meta', 'skip-existing', 'dry-run', 'async' ] : [] as $flag ) {
+			$refusal = '' === $refusal && isset( $assoc_args[ $flag ] ) ? "--meta-only cannot be combined with --{$flag}." : $refusal;
+		}
+
+		if ( '' !== $refusal ) {
+			\WP_CLI::error( $refusal );
 		}
 
 		$settings = $this->plugin->get( 'settings' );
@@ -441,7 +461,7 @@ final class PerfLocaleCommand {
 				]
 			);
 
-			if ( ( $outcome['mode'] ?? '' ) === 'denied' || ( $outcome['mode'] ?? '' ) === 'error' ) {
+			if ( 'denied' === $outcome['mode'] || 'error' === $outcome['mode'] ) {
 				\WP_CLI::error( (string) ( $outcome['error'] ?? 'Dispatch failed.' ) );
 			}
 
@@ -449,8 +469,8 @@ final class PerfLocaleCommand {
 			return;
 		}
 
-		// One post.
-		if ( ! empty( $args[0] ) ) {
+		// One post (--meta-only takes the bulk path below).
+		if ( ! empty( $args[0] ) && ! $meta_only ) {
 			$this->translate_single( absint( $args[0] ), $target_lang, $provider, $settings, $cache, $include_meta );
 			return;
 		}
@@ -459,7 +479,10 @@ final class PerfLocaleCommand {
 		$pages = [];
 		$total = 0;
 
-		if ( isset( $assoc_args['post-ids'] ) ) {
+		if ( ! empty( $args[0] ) ) {
+			$pages = [ [ absint( $args[0] ) ] ];
+			$total = 1;
+		} elseif ( isset( $assoc_args['post-ids'] ) ) {
 			$pages = array_chunk( array_values( array_filter( array_map( 'absint', explode( ',', $assoc_args['post-ids'] ) ) ) ), 500 );
 			$total = array_sum( array_map( 'count', $pages ) );
 		} elseif ( isset( $assoc_args['all'] ) ) {
@@ -486,6 +509,9 @@ final class PerfLocaleCommand {
 		$trigger       = isset( $assoc_args['post-ids'] ) ? 'cli_ids' : 'cli_all';
 		$manager       = new PostTranslationManager( $cache, $settings );
 		$service       = new TranslationService( $settings, $cache );
+		$meta          = $meta_only ? new \PerfLocale\MachineTranslation\MetaTranslator( \PerfLocale\Plugin::get_instance()->settings(), $service ) : null;
+		$meta_target   = 0;
+		$meta_source   = '';
 		$progress      = \WP_CLI\Utils\make_progress_bar( "Translating to {$target_lang}", $total );
 		$translated    = 0;
 		$warned        = 0;
@@ -578,6 +604,14 @@ final class PerfLocaleCommand {
 					$skip = $skip_existing && $manager->get_translation_id( $pid, $target_lang ) !== null;
 				}
 
+				// --meta-only: an existing translation of a post in another language, else skipped.
+				if ( ! $skip && null !== $meta ) {
+					$meta_target = (int) $manager->get_translation_id( $pid, $target_lang );
+					$language    = $manager->detect_post_language( $pid );
+					$meta_source = is_object( $language ) && isset( $language->slug ) && is_string( $language->slug ) ? $language->slug : '';
+					$skip        = $meta_target <= 0 || $meta_target === $pid || '' === $meta_source || $meta_source === $target_lang;
+				}
+
 				if ( $skip ) {
 					++$skipped;
 					$progress->tick();
@@ -586,8 +620,16 @@ final class PerfLocaleCommand {
 
 				try {
 					$inserted = false;
-					$result   = $service->translate_post( $pid, $target_lang, $provider, false, $include_meta, $inserted );
-					++$translated;
+					$fields   = null === $meta ? null : $meta->translate_post_meta( $pid, $meta_target, $meta_source, $target_lang, $provider, true );
+
+					$result = null === $fields ? $service->translate_post( $pid, $target_lang, $provider, false, TranslationService::include_meta( $include_meta, 'cli', $pid, $target_lang ), $inserted ) : [ 'warnings' => $fields['errors'] ];
+
+					// --meta-only: a translation with nothing left to translate counts as skipped.
+					if ( null !== $fields && 0 === $fields['translated'] + $fields['failed'] ) {
+						++$skipped;
+					} else {
+						++$translated;
+					}
 
 					// Only a translation this run inserted: an updated one existed before and is never removed.
 					if ( $inserted && $target_id > 0 && isset( $result['post_id'] ) && is_numeric( $result['post_id'] ) ) {
@@ -602,7 +644,7 @@ final class PerfLocaleCommand {
 
 					$warned += empty( $result['warnings'] ) ? 0 : 1;
 				} catch ( \Throwable $e ) {
-					\WP_CLI::warning( "Post {$pid}: " . $e->getMessage() );
+					\WP_CLI::warning( "Post {$pid}: " . wp_specialchars_decode( $e->getMessage(), ENT_QUOTES ) );
 					++$failed;
 				}
 
@@ -718,7 +760,7 @@ final class PerfLocaleCommand {
 		try {
 			\WP_CLI::log( "Translating post {$post_id} to {$target_lang}..." );
 
-			$result = $service->translate_post( $post_id, $target_lang, $provider, false, $include_meta );
+			$result = $service->translate_post( $post_id, $target_lang, $provider, false, TranslationService::include_meta( $include_meta, 'cli', $post_id, $target_lang ) );
 
 			foreach ( (array) ( $result['warnings'] ?? [] ) as $warning ) {
 				if ( is_string( $warning ) ) {
@@ -728,7 +770,7 @@ final class PerfLocaleCommand {
 
 			\WP_CLI::success( sprintf( empty( $result['warnings'] ) ? 'Translated! New post ID: %d' : 'Translated, with the warning above. New post ID: %d', $result['post_id'] ) );
 		} catch ( \Throwable $e ) {
-			\WP_CLI::error( 'Translation failed: ' . $e->getMessage() );
+			\WP_CLI::error( 'Translation failed: ' . wp_specialchars_decode( $e->getMessage(), ENT_QUOTES ) );
 		}
 	}
 
@@ -859,7 +901,13 @@ final class PerfLocaleCommand {
 	 * : Language slug (delete, set-language).
 	 *
 	 * [--yes]
-	 * : Skip the confirmation prompt when deleting.
+	 * : Skip the confirmation prompt when deleting or unlinking.
+	 *
+	 * [--dry-run]
+	 * : With delete: list what would be deleted or unlinked; change nothing.
+	 *
+	 * [--unlink-only]
+	 * : With delete: remove the post from its translation group and keep it, in its language.
 	 *
 	 * [--format=<format>]
 	 * : Output format for `list`. Accepted: table, json, csv, yaml, count, ids.
@@ -880,6 +928,8 @@ final class PerfLocaleCommand {
 	 *     wp perflocale translations list 42 --format=json
 	 *     wp perflocale translations create 42 --to=de
 	 *     wp perflocale translations delete 42 --lang=de --yes
+	 *     wp perflocale translations delete 42 --lang=de --dry-run
+	 *     wp perflocale translations delete 42 --lang=de --unlink-only --yes
 	 *     wp perflocale translations set-language 42 --lang=en
 	 *
 	 * @param array<int, string>    $args Positional args.
@@ -967,10 +1017,7 @@ final class PerfLocaleCommand {
 					\WP_CLI::error( "No {$lang} translation found for post {$post_id}." );
 				}
 
-				\WP_CLI::confirm( "Delete {$lang} translation (post {$translated_id})?", $assoc_args );
-
-				wp_delete_post( $translated_id, true );
-				\WP_CLI::success( "Translation deleted (post {$translated_id})." );
+				$this->translations_delete( $manager, $post_id, $lang, (int) $translated_id, $assoc_args );
 				break;
 
 			case 'set-language':
@@ -991,6 +1038,138 @@ final class PerfLocaleCommand {
 
 			default:
 				\WP_CLI::error( 'Unknown subcommand. Available: list, create, delete, set-language' );
+		}
+	}
+
+	/**
+	 * Delete one translation, or with --unlink-only take it out of its group and keep it; --dry-run changes nothing.
+	 *
+	 * @param PostTranslationManager $manager       Post translation manager.
+	 * @param int                    $post_id       Post named on the command line.
+	 * @param string                 $lang          Language slug.
+	 * @param int                    $translated_id That language's post in the group.
+	 * @param array<string, string>  $assoc_args    Named args.
+	 * @return void
+	 */
+	private function translations_delete( PostTranslationManager $manager, int $post_id, string $lang, int $translated_id, array $assoc_args ): void {
+		$unlink = ! empty( $assoc_args['unlink-only'] );
+		$post   = get_post( $translated_id );
+		$groups = $this->plugin->group_repo();
+		$link   = null;
+		$what   = "{$lang} translation of post {$post_id}: post {$translated_id}" . ( $post ? " \"{$post->post_title}\" ({$post->post_status})" : ' (deleted)' );
+
+		if ( ! $unlink ) {
+			$plan     = 'Would delete permanently: ' . $what;
+			$question = "Delete {$lang} translation (post {$translated_id})?";
+		} elseif ( ! $post ) {
+			// A link whose post is gone: only the link is removed.
+			$plan     = "Would remove the link of post {$translated_id} (the post no longer exists).";
+			$question = "Remove the link of post {$translated_id}, which no longer exists?";
+		} else {
+			$siblings = count( $manager->get_translations( $translated_id ) ) - 1;
+			$link     = $groups->find_link_for_object( $translated_id, \PerfLocale\Enum\ObjectType::Post );
+
+			if ( $siblings < 1 || null === $link ) {
+				self::say( 'error', "Post {$translated_id} has no other translations; nothing to unlink." );
+				return;
+			}
+
+			$default = $this->plugin->lang_repo()->get_default();
+
+			if ( is_object( $default ) && ( $default->slug ?? '' ) === $lang ) {
+				self::say( 'warning', "Post {$translated_id} is in the default language: its {$siblings} other translation(s) stay linked to each other without it as their source." );
+			}
+
+			$plan     = 'Would unlink (post kept): ' . $what;
+			$question = "Unlink {$lang} translation (post {$translated_id}) from its translations? The post is kept.";
+		}
+
+		if ( ! empty( $assoc_args['dry-run'] ) ) {
+			self::say( 'log', $plan );
+			self::say( 'success', 'Dry run: nothing changed.' );
+			return;
+		}
+
+		\WP_CLI::confirm( $question, $assoc_args );
+
+		if ( ! $unlink ) {
+			if ( ! wp_delete_post( $translated_id, true ) ) {
+				self::say( 'error', "Post {$translated_id} was not deleted; it is still linked." );
+				return;
+			}
+
+			self::say( 'success', "Translation deleted (post {$translated_id})." );
+			return;
+		}
+
+		if ( null === $link ) {
+			if ( ! $groups->unlink_by_object_id( $translated_id, 'post' ) ) {
+				self::say( 'error', "The link of post {$translated_id} was not removed." );
+				return;
+			}
+
+			PostTranslationManager::forget_post_language( $translated_id );
+			self::say( 'success', "Link removed (post {$translated_id} no longer exists)." );
+			return;
+		}
+
+		// Hreflang first, while the link still names the siblings.
+		if ( $this->plugin->has( 'cache_invalidator' ) ) {
+			$invalidator = $this->plugin->get( 'cache_invalidator' );
+
+			if ( $invalidator instanceof \PerfLocale\Cache\CacheInvalidator ) {
+				$invalidator->clear_hreflang_before_unlink( $translated_id );
+			}
+		}
+
+		if ( ! $groups->unlink_by_object_id( $translated_id, 'post' ) ) {
+			self::say( 'error', "Post {$translated_id} was not unlinked." );
+			return;
+		}
+
+		PostTranslationManager::forget_post_language( $translated_id );
+
+		// A post without a link shows in every language: it gets a group of its own in its language, or its link back.
+		if ( ! $manager->set_post_language( $translated_id, $lang ) ) {
+			$group_id = is_numeric( $link->group_id ?? null ) ? (int) $link->group_id : 0;
+			$lang_id  = is_numeric( $link->language_id ?? null ) ? (int) $link->language_id : 0;
+			$status   = is_string( $link->status ?? null ) ? $link->status : 'translated';
+			$source   = is_string( $link->source ?? null ) ? \PerfLocale\Enum\SourceType::tryFrom( $link->source ) : null;
+			$restored = $group_id > 0 && $lang_id > 0 && false !== $groups->upsert_link( $group_id, $translated_id, $lang_id, $status, $source ?? \PerfLocale\Enum\SourceType::Cli );
+
+			PostTranslationManager::forget_post_language( $translated_id );
+
+			self::say(
+				'error',
+				$restored
+					? "Post {$translated_id} was not unlinked: its own group could not be created. Its link is restored."
+					: "Post {$translated_id} was unlinked but has no language now. Run: wp perflocale translations set-language {$translated_id} --lang={$lang}"
+			);
+			return;
+		}
+
+		self::say( 'success', "Translation unlinked (post {$translated_id} kept, language {$lang})." );
+	}
+
+	/**
+	 * One output line of translations delete; 'error' exits 1.
+	 *
+	 * @param string $level   error, warning, log or success.
+	 * @param string $message Line.
+	 * @return void
+	 */
+	private static function say( string $level, string $message ): void {
+		if ( 'error' === $level ) {
+			// @phpstan-ignore class.notFound (WP-CLI defines WP_CLI at run time; there are no WP-CLI stubs)
+			\WP_CLI::error( $message );
+		} elseif ( 'warning' === $level ) {
+			// @phpstan-ignore class.notFound (WP-CLI defines WP_CLI at run time; there are no WP-CLI stubs)
+			\WP_CLI::warning( $message );
+		} elseif ( 'log' === $level ) {
+			// @phpstan-ignore class.notFound (WP-CLI defines WP_CLI at run time; there are no WP-CLI stubs)
+			\WP_CLI::log( $message );
+		} else {
+			\WP_CLI::success( $message );
 		}
 	}
 
@@ -1132,6 +1311,52 @@ final class PerfLocaleCommand {
 		} else {
 			\WP_CLI::warning( "{$total} terms are missing slug translations. Run 'wp perflocale slugs backfill' to fix." );
 		}
+	}
+
+	// =========================================================================
+	// Terms
+	// =========================================================================
+
+	/**
+	 * Set a term's URL slug in its own language; the old slug keeps redirecting.
+	 *
+	 * ## OPTIONS
+	 *
+	 * <subcommand>
+	 * : Subcommand (url-slug).
+	 *
+	 * <term_id>
+	 * : Term ID.
+	 *
+	 * <slug>
+	 * : URL slug.
+	 *
+	 * ## EXAMPLES
+	 *
+	 *     wp perflocale term url-slug 42 nachrichten
+	 *
+	 * @param array<int, string>    $args       Positional args.
+	 * @param array<string, string> $assoc_args Named args.
+	 * @return void
+	 */
+	public function term( array $args, array $assoc_args ): void {
+		unset( $assoc_args );
+
+		if ( 'url-slug' !== ( $args[0] ?? '' ) || ! isset( $args[1], $args[2] ) || 1 !== preg_match( '/^[0-9]+$/', $args[1] ) ) {
+			\WP_CLI::error( 'Usage: wp perflocale term url-slug <term_id> <slug>' );
+		}
+
+		$result = \PerfLocale\Admin\TermUrlSlugField::write( (int) $args[1], $args[2] );
+
+		foreach ( $result['notes'] as $note ) {
+			\WP_CLI::log( $note );
+		}
+
+		if ( ! $result['ok'] ) {
+			\WP_CLI::error( $result['message'] );
+		}
+
+		\WP_CLI::success( $result['message'] );
 	}
 
 	// =========================================================================
@@ -1322,13 +1547,13 @@ final class PerfLocaleCommand {
 				]
 			);
 		} catch ( \RuntimeException $e ) {
-			\WP_CLI::error( 'Import failed: ' . $e->getMessage() );
+			\WP_CLI::error( 'Import failed: ' . wp_specialchars_decode( $e->getMessage(), ENT_QUOTES ) );
 			return;
 		}
 
 		// A warning, not a log line: a script expecting the file's configuration to apply must see that merge left it alone.
 		if ( ! empty( $result['not_applied'] ) ) {
-			\WP_CLI::warning( $this->merge_not_applied_message() );
+			\WP_CLI::warning( $this->merge_not_applied_message( array_map( 'strval', (array) $result['not_applied'] ) ) );
 		}
 
 		// WP-CLI may change a network-supplied provider address; set only when a filter or rule refused one.
@@ -1429,12 +1654,23 @@ final class PerfLocaleCommand {
 	}
 
 	/**
-	 * The warning printed when a merge left the file's configuration unapplied.
+	 * The warning printed when a merge left parts of the file unapplied: the configuration, the automation history, or both.
 	 *
+	 * @param array<int, string> $not_applied The import result's `not_applied`.
 	 * @return string
 	 */
-	private function merge_not_applied_message(): string {
-		return 'Settings, add-on settings, the add-on list and roles in the file were not applied: merge mode keeps this site\'s configuration. Run the import with --mode=replace to apply them (a file that carries only those sections deletes no rows).';
+	private function merge_not_applied_message( array $not_applied ): string {
+		$lines = [];
+
+		if ( [] !== array_diff( $not_applied, [ 'automation' ] ) ) {
+			$lines[] = 'Settings, add-on settings, the add-on list and roles in the file were not applied: merge mode keeps this site\'s configuration. Run the import with --mode=replace to apply them (a file that carries only those sections deletes no rows).';
+		}
+
+		if ( in_array( 'automation', $not_applied, true ) ) {
+			$lines[] = 'The automation history in the file was not applied: merge mode leaves it out. Run the import with --mode=replace to restore it.';
+		}
+
+		return implode( ' ', $lines );
 	}
 
 
@@ -1711,7 +1947,7 @@ final class PerfLocaleCommand {
 			$reader->close();
 			$over_a_limit = in_array( $e->getCode(), [ \PerfLocale\Admin\ImportReader::ERR_TOO_MUCH_KEPT, \PerfLocale\Admin\ImportReader::ERR_TOO_MANY_MEMBERS, \PerfLocale\Admin\ImportReader::ERR_TOO_MANY_DATA_MEMBERS ], true );
 
-			\WP_CLI::error( $over_a_limit ? \PerfLocale\Admin\DataImporter::read_error_message( $e, $limits ) : 'File is not a valid network-export envelope: ' . $e->getMessage() . '.' );
+			\WP_CLI::error( $over_a_limit ? \PerfLocale\Admin\DataImporter::read_error_message( $e, $limits ) : 'File is not a valid network-export envelope: ' . wp_specialchars_decode( $e->getMessage(), ENT_QUOTES ) . '.' );
 			return;
 		}
 
@@ -1832,7 +2068,7 @@ final class PerfLocaleCommand {
 					$result = $importer->import( $tmp, $replace, false, [ 'allow_foreign_ids' => $forced ] );
 				} catch ( \RuntimeException $e ) {
 					wp_delete_file( $tmp );
-					\WP_CLI::warning( "Site {$source_site_id}: " . $e->getMessage() );
+					\WP_CLI::warning( "Site {$source_site_id}: " . wp_specialchars_decode( $e->getMessage(), ENT_QUOTES ) );
 					++$total_errors;
 					continue;
 				}
@@ -1846,7 +2082,7 @@ final class PerfLocaleCommand {
 				}
 
 				if ( ! empty( $result['not_applied'] ) ) {
-					\WP_CLI::warning( "Site {$source_site_id}: " . $this->merge_not_applied_message() );
+					\WP_CLI::warning( "Site {$source_site_id}: " . $this->merge_not_applied_message( array_map( 'strval', (array) $result['not_applied'] ) ) );
 				}
 
 				if ( ! empty( $result['address_notice'] ) ) {
@@ -2162,7 +2398,8 @@ final class PerfLocaleCommand {
 		// Items the import read and left out, per reason, with examples.
 		$skipped_lines = \PerfLocale\Migration\MigrationRunner::skipped_lines( $source, $result );
 
-		foreach ( $skipped_lines as $line ) {
+		// Then the root posts a language prefix takes.
+		foreach ( array_merge( $skipped_lines, \PerfLocale\Migration\MigrationRunner::clash_lines( $result ) ) as $line ) {
 			\WP_CLI::warning( $line );
 		}
 
@@ -2570,13 +2807,14 @@ final class PerfLocaleCommand {
 		foreach ( (array) $string_rows as $row ) {
 			$stored = (string) $row->original_hash;
 
-			if ( \PerfLocale\Database\Repository\StringRepository::compute_hash( (string) $row->domain, (string) $row->context, (string) $row->original ) === $stored ) {
+			// Either identity form: a row the identity switch-over has not moved yet agrees with its other-form hash.
+			if ( in_array( $stored, \PerfLocale\Database\Repository\StringRepository::identity_hashes( (string) $row->domain, (string) $row->context, (string) $row->original ), true ) ) {
 				continue;
 			}
 
 			$decoded = html_entity_decode( (string) $row->original, ENT_QUOTES | ENT_HTML5, 'UTF-8' );
 
-			if ( \PerfLocale\Database\Repository\StringRepository::compute_hash( (string) $row->domain, (string) $row->context, $decoded ) === $stored ) {
+			if ( in_array( $stored, \PerfLocale\Database\Repository\StringRepository::identity_hashes( (string) $row->domain, (string) $row->context, $decoded ), true ) ) {
 				$repairable[ (int) $row->id ] = $decoded;
 			} else {
 				++$damaged;
@@ -2687,10 +2925,10 @@ final class PerfLocaleCommand {
 			if ( $done['fixed'] > 0 ) {
 				$this->refresh_after_fix( $done['moved'] + $done['linked'] > 0 );
 
-				\WP_CLI::error( sprintf( 'Health check stopped: %1$s. Before it stopped, %2$d string(s) got their own translation group (%3$d link(s) moved, %4$d link(s) added). Run the check again.', rtrim( $e->getMessage(), '.' ), $done['fixed'], $done['moved'], $done['linked'] ) );
+				\WP_CLI::error( sprintf( 'Health check stopped: %1$s. Before it stopped, %2$d string(s) got their own translation group (%3$d link(s) moved, %4$d link(s) added). Run the check again.', rtrim( wp_specialchars_decode( $e->getMessage(), ENT_QUOTES ), '.' ), $done['fixed'], $done['moved'], $done['linked'] ) );
 			}
 
-			\WP_CLI::error( 'Health check stopped: ' . $e->getMessage() );
+			\WP_CLI::error( 'Health check stopped: ' . wp_specialchars_decode( $e->getMessage(), ENT_QUOTES ) );
 
 			return false;
 		}
@@ -2875,7 +3113,7 @@ final class PerfLocaleCommand {
 		try {
 			$listed = $this->print_rows( $format, $rows, [ 'post_id', 'language', 'source_id', 'issue', 'spot' ], 'No translation has damaged block markup.' );
 		} catch ( \InvalidArgumentException | \RuntimeException $e ) {
-			\WP_CLI::error( $e->getMessage() );
+			\WP_CLI::error( wp_specialchars_decode( $e->getMessage(), ENT_QUOTES ) );
 			return;
 		}
 
@@ -2966,7 +3204,7 @@ final class PerfLocaleCommand {
 	// =========================================================================
 
 	/**
-	 * List language copies of a product whose stock differs.
+	 * List language copies of a product whose stock differs, and align them.
 	 *
 	 * Inventory Sync keeps the language copies of a product as one stock. This
 	 * reads every product translation group and lists the groups whose copies
@@ -2974,6 +3212,10 @@ final class PerfLocaleCommand {
 	 * and each variation with its matching variation in every other language.
 	 * Copies that do not manage their stock or are excluded from the sync are
 	 * left out. Changes no content, settings or stock; reads in batches.
+	 *
+	 * With --fix, copies are changed through WooCommerce, so stock status and
+	 * other plugins' stock hooks run as on any stock change. Exit status 2
+	 * also when a dry run plans changes or a group is left as it was.
 	 *
 	 * Exit status: 0 when no copies differ, 2 when copies differ (listed),
 	 * 1 when the command cannot run.
@@ -2984,13 +3226,13 @@ final class PerfLocaleCommand {
 	 * : Only these products: ids of any language copy, comma-separated, up to 500.
 	 *
 	 * [--fix]
-	 * : Aligning stock is not available in this version.
+	 * : Set each differing copy to the stock of the reference copy. Prints the plan; writes only with --yes.
 	 *
 	 * [--from=<from>]
-	 * : Used with --fix only.
+	 * : The reference: default (the default-language copy) or an active language slug.
 	 *
 	 * [--yes]
-	 * : Used with --fix only.
+	 * : Write the planned changes.
 	 *
 	 * [--batch-size=<number>]
 	 * : Translation groups read per query (1-500).
@@ -3016,6 +3258,12 @@ final class PerfLocaleCommand {
 	 *     # As JSON, for a script (exit status 2 when something differs)
 	 *     wp perflocale stock-drift --format=json
 	 *
+	 *     # The plan to set every copy to the German copy's stock (writes nothing)
+	 *     wp perflocale stock-drift --fix --from=de
+	 *
+	 *     # Write it, for two products only
+	 *     wp perflocale stock-drift --fix --from=de --yes --product=123,456
+	 *
 	 * @subcommand stock-drift
 	 *
 	 * @param array<int, string>    $args       Positional args.
@@ -3029,13 +3277,6 @@ final class PerfLocaleCommand {
 
 		if ( ! in_array( $format, [ 'table', 'csv', 'json' ], true ) ) {
 			\WP_CLI::error( 'Unknown --format. Use table, csv or json.' );
-		}
-
-		$off = \PerfLocale\WooCommerce\Api::align_off();
-
-		if ( $fix && null !== $off ) {
-			\WP_CLI::error( $off->get_error_message() );
-			return;
 		}
 
 		if ( ! $fix && ( isset( $assoc_args['yes'] ) || isset( $assoc_args['from'] ) ) ) {
@@ -3063,6 +3304,13 @@ final class PerfLocaleCommand {
 
 		if ( null === $sync || ! $sync->sync_enabled() ) {
 			\WP_CLI::error( 'Inventory Sync is not active on this site (WooCommerce, the WooCommerce add-on and its stock sync setting).' );
+			return;
+		}
+
+		$no_locks = $fix ? \PerfLocale\WooCommerce\Api::lock_unavailable() : null;
+
+		if ( null !== $no_locks ) {
+			\WP_CLI::error( $no_locks->get_error_message() );
 			return;
 		}
 
@@ -3099,6 +3347,7 @@ final class PerfLocaleCommand {
 		$default = null !== $default ? get_object_vars( $default ) : [];
 		$default = isset( $default['id'] ) && is_numeric( $default['id'] ) ? (int) $default['id'] : 0;
 		$groups  = 0;
+		$started = time();
 
 		// Page by page; every language, inactive too, read from the table (the repository's all-languages list is a
 		// transient, a write without a persistent cache).
@@ -3124,11 +3373,17 @@ final class PerfLocaleCommand {
 		try {
 			$listed = $this->print_rows( $format, $rows, [ 'group', 'product_id', 'parent_id', 'language', 'stock' ], 'No copy group has stock that differs.' );
 		} catch ( \InvalidArgumentException | \RuntimeException $e ) {
-			\WP_CLI::error( $e->getMessage() );
+			\WP_CLI::error( wp_specialchars_decode( $e->getMessage(), ENT_QUOTES ) );
 			return;
 		}
 
 		if ( 0 === $listed ) {
+			// A whole-site check without drift: a Site Health flag of copies that gave up is stale.
+			if ( null === $group_ids ) {
+				require_once dirname( __DIR__ ) . '/WooCommerce/StockDriftFlag.php';
+				\PerfLocale\WooCommerce\StockDriftFlag::clear( null, [], $started );
+			}
+
 			return;
 		}
 
@@ -3218,7 +3473,7 @@ final class PerfLocaleCommand {
 		try {
 			$this->print_rows( $format, $rows, [ 'group', 'product_id', 'parent_id', 'language', 'old', 'new', 'status', 'reason' ], 'No copy group has stock that differs.' );
 		} catch ( \InvalidArgumentException | \RuntimeException $e ) {
-			\WP_CLI::error( $e->getMessage() );
+			\WP_CLI::error( wp_specialchars_decode( $e->getMessage(), ENT_QUOTES ) );
 			return;
 		}
 
@@ -3565,19 +3820,32 @@ final class PerfLocaleCommand {
 	 * Idempotent - safe to run multiple times. Useful for CI/CD pipelines
 	 * or headless environments where wp-admin is never visited.
 	 *
+	 * Also runs the string identity update of the site to the end and prints one line per site: site id,
+	 * phase, rows checked of the last string id, unverified and held rows. With unverified rows and --user set to an
+	 * administrator, it also queues a full string scan.
+	 *
+	 * ## OPTIONS
+	 *
+	 * [--network]
+	 * : On multisite, run the string identity update of each site in turn (the schema steps run for the current site).
+	 *
 	 * ## EXAMPLES
 	 *
 	 * wp perflocale db-migrate
+	 * wp perflocale db-migrate --network
 	 *
 	 * @subcommand db-migrate
 	 * @when after_wp_load
+	 *
+	 * @param array<int, string>    $args       Positional args.
+	 * @param array<string, string> $assoc_args Named args.
 	 */
-	public function db_migrate(): void {
+	public function db_migrate( array $args = [], array $assoc_args = [] ): void {
 		try {
 			// Every pending step at once, ignoring the retry backoff, and a re-check of the tables.
 			$result = \PerfLocale\Database\UpgradeRunner::retry();
 		} catch ( \Throwable $e ) {
-			\WP_CLI::error( 'Migration failed: ' . $e->getMessage() );
+			\WP_CLI::error( 'Migration failed: ' . wp_specialchars_decode( $e->getMessage(), ENT_QUOTES ) );
 			return;
 		}
 
@@ -3603,11 +3871,123 @@ final class PerfLocaleCommand {
 			// SQLite only, the engine read before the repair class is named (nothing loaded on MySQL or MariaDB).
 			$note = defined( 'DB_ENGINE' ) && 'sqlite' === constant( 'DB_ENGINE' ) ? $this->sqlite_group_repair() : '';
 		} catch ( \Throwable $e ) {
-			\WP_CLI::error( 'Migration failed: ' . $e->getMessage() );
+			\WP_CLI::error( 'Migration failed: ' . wp_specialchars_decode( $e->getMessage(), ENT_QUOTES ) );
+			return;
+		}
+
+		// Retry replaces any other key of another shape; a PRIMARY key with other columns needs a hand fix.
+		foreach ( \PerfLocale\Database\UpgradeRunner::schema_report()['differ'] ?? [] as $name => [ $got, $expected ] ) {
+			\WP_CLI::warning( sprintf( '%1$s has %2$s, expected %3$s. Change it in the database to the expected columns, for example drop it and run this command again to create it.', $name, $got, $expected ) );
+		}
+
+		// --network drives each site in turn; else the current site (--url). A failure exits non-zero.
+		$failed = $this->str_ident_sites( isset( $assoc_args['network'] ) && is_multisite() ? array_map( 'intval', (array) get_sites( [ 'fields' => 'ids', 'number' => 0 ] ) ) : [ get_current_blog_id() ] );
+
+		if ( [] !== $failed ) {
+			\WP_CLI::error( sprintf( 'The string identity update did not finish on site(s) %s (see the warnings above). Run this command again.', implode( ', ', $failed ) ) );
 			return;
 		}
 
 		\WP_CLI::success( 'PerfLocale database migrations completed successfully.' . $note );
+	}
+
+	/**
+	 * Run the identity switch-over of each site in turn and print its line; a site without PerfLocale's strings table
+	 * is skipped with no state written there, and a failed site does not stop the others.
+	 *
+	 * @param array<int> $sites Blog ids.
+	 * @return list<int> The sites where it did not finish.
+	 */
+	private function str_ident_sites( array $sites ): array {
+		global $wpdb;
+
+		$failed = [];
+
+		if ( ! $wpdb instanceof \wpdb ) {
+			return array_values( $sites );
+		}
+
+		foreach ( $sites as $site ) {
+			$switched = $site !== get_current_blog_id();
+
+			if ( $switched ) {
+				switch_to_blog( $site );
+			}
+
+			try {
+				$table = \PerfLocale\Database\Schema::table( 'strings' );
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				$found = $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $table ) ) );
+				// With lower_case_table_names=1 the server answers in lower case.
+				$here  = is_string( $found ) && 0 === strcasecmp( $found, $table );
+				$ident = $here ? $this->str_ident_migrate() : sprintf( 'String identities, site %d: skipped (PerfLocale is not set up on this site).', $site );
+			} finally {
+				if ( $switched ) {
+					restore_current_blog();
+				}
+			}
+
+			if ( '' === $ident ) {
+				$failed[] = $site;
+				continue;
+			}
+
+			\WP_CLI::log( $ident );
+		}
+
+		return $failed;
+	}
+
+	/**
+	 * Run this site's string identity switch-over to `done` in the foreground, under the lock the background chain
+	 * takes (another holder: retry for up to 20 s, then an error).
+	 *
+	 * @return string The site's result line; '' after a warning was printed.
+	 */
+	private function str_ident_migrate(): string {
+		$waited = 0;
+
+		// First: a return from 1.0.7.5 sends the site back to P1 before this run.
+		\PerfLocale\Strings\StrIdentMigration::daily_check();
+
+		// Runs of 10 s, as the chain's: each holds the shared lock well inside its TTL.
+		do {
+			$outcome = \PerfLocale\Strings\StrIdentMigration::drive( 10 );
+
+			if ( 'busy' !== $outcome ) {
+				$waited = 0;
+			} elseif ( ++$waited > 20 ) {
+				break;
+			} else {
+				sleep( 1 );
+			}
+		} while ( in_array( $outcome, [ 'more', 'busy' ], true ) );
+
+		if ( 'done' !== $outcome ) {
+			\WP_CLI::warning( sprintf( 'Site %d: ', get_current_blog_id() ) . ( 'busy' === $outcome ? 'the string identity update is running in another process (the background runner or another WP-CLI run).' : 'the string identity update stopped on a database error; nothing of the failed batch was kept.' ) );
+
+			return '';
+		}
+
+		$status = \PerfLocale\Strings\StrIdentMigration::status();
+
+		return sprintf( 'String identities, site %d: phase %s, rows %d of %d, unverified %d, held %d.', get_current_blog_id(), $status['phase'], $status['checked_id'], $status['last_id'], $status['unverified_n'], $status['held_n'] )
+			. ( $status['unverified_n'] > 0 ? ' ' . $this->unverified_scan() : '' )
+			. ( $status['held_n'] > 0 ? ' Held rows have a twin with its own translations: review them on the Strings screen.' : '' );
+	}
+
+	/**
+	 * Queue the full string scan for the unverified rows; a job needs a manage_options user (--user).
+	 *
+	 * @return string The sentence for the site line.
+	 */
+	private function unverified_scan(): string {
+		$job = \PerfLocale\Strings\StrIdentMigration::queue_scan_for_unverified();
+
+		return 'In database mode unverified rows are not translated until they are stored again, for example by a string scan or an import. '
+			. ( '' !== $job
+				? sprintf( 'A full string scan was queued (job %s): wp perflocale jobs list.', $job )
+				: ( current_user_can( 'manage_options' ) ? 'The string scan could not be queued: ' : 'No string scan was queued: run this command with --user=<administrator login>, or ' ) . 'use Scan for Strings on the Strings screen.' );
 	}
 
 	/**
@@ -3724,7 +4104,7 @@ final class PerfLocaleCommand {
 				\PerfLocale\Bootstrap::ensure_recurring_schedules();
 			} catch ( \Throwable $e ) {
 				// Seeding failed: warn and go on, so jobs can still be inspected and canceled.
-				\WP_CLI::warning( 'ensure_recurring_schedules failed: ' . $e->getMessage() );
+				\WP_CLI::warning( 'ensure_recurring_schedules failed: ' . wp_specialchars_decode( $e->getMessage(), ENT_QUOTES ) );
 			}
 		}
 
@@ -3833,9 +4213,9 @@ final class PerfLocaleCommand {
 			\WP_CLI::error( "Job not found: {$job_id}" );
 		}
 
-		// A bulk translation's `cut`: the pair its next slice redoes, internal.
+		// A bulk translation's `cut` (the pair its next slice redoes), the answers kept for it and its run state: internal.
 		if ( 'bulk_translate' === ( $state['type'] ?? null ) && is_array( $state['result'] ?? null ) ) {
-			unset( $state['result']['cut'] );
+			unset( $state['result']['cut'], $state['result']['pieces'], $state['result'][ \PerfLocale\Background\JobResume::PARTIAL_KEY ], $state['result']['__perflocale_latency'], $state['result']['__perflocale_paced'] );
 		}
 
 		$format = isset( $assoc_args['format'] ) ? (string) $assoc_args['format'] : 'yaml';
@@ -3866,15 +4246,29 @@ final class PerfLocaleCommand {
 			\WP_CLI::error( 'Job ID required.' );
 		}
 
-		$state = \PerfLocale\Background\JobState::get( $job_id );
-
-		if ( ! $state ) {
+		// As the REST cancel: a Retry cannot land between the status write and the cleanup.
+		if ( ! \PerfLocale\Background\JobState::get( $job_id ) ) {
 			\WP_CLI::error( "Job not found: {$job_id}" );
 		}
 
+		self::jobs_said( $job_id, \PerfLocale\Background\JobState::control( $job_id, static fn(): array => self::jobs_cancel_held( $job_id ) ) );
+	}
+
+	/**
+	 * Cancel under the job's control lock.
+	 *
+	 * @param string $job_id
+	 * @return array{0: string, 1: string} [ success|warning|error, message ]
+	 */
+	private static function jobs_cancel_held( string $job_id ): array {
+		$state = \PerfLocale\Background\JobState::get( $job_id );
+
+		if ( ! $state ) {
+			return [ 'error', "Job not found: {$job_id}" ];
+		}
+
 		if ( ! in_array( (string) $state['status'], [ 'queued', 'running' ], true ) ) {
-			\WP_CLI::warning( "Job is in status '{$state['status']}' - only queued/running jobs can be canceled." );
-			return;
+			return [ 'warning', "Job is in status '{$state['status']}' - only queued/running jobs can be canceled." ];
 		}
 
 		// The cancel is recorded before the event and locks go, as the REST cancel.
@@ -3884,11 +4278,10 @@ final class PerfLocaleCommand {
 
 			if ( 'canceled' !== $status ) {
 				if ( \PerfLocale\Background\JobState::is_terminal( $status ) ) {
-					\WP_CLI::warning( "Job is in status '{$status}' - only queued/running jobs can be canceled." );
-					return;
+					return [ 'warning', "Job is in status '{$status}' - only queued/running jobs can be canceled." ];
 				}
 
-				\WP_CLI::error( "Could not cancel job {$job_id}: the database refused the status change. Nothing was changed." );
+				return [ 'error', "Could not cancel job {$job_id}: the database refused the status change. Nothing was changed." ];
 			}
 		}
 
@@ -3906,7 +4299,7 @@ final class PerfLocaleCommand {
 		\PerfLocale\Background\JobLock::release( $job_id );
 		\PerfLocale\Background\JobLock::release_type( (string) $state['type'] );
 
-		\WP_CLI::success( "Canceled job {$job_id}" );
+		return [ 'success', "Canceled job {$job_id}" ];
 	}
 
 	/**
@@ -3920,15 +4313,29 @@ final class PerfLocaleCommand {
 			\WP_CLI::error( 'Job ID required.' );
 		}
 
-		$state = \PerfLocale\Background\JobState::get( $job_id );
-
-		if ( ! $state ) {
+		// Reset and enqueue as one step against a Cancel.
+		if ( ! \PerfLocale\Background\JobState::get( $job_id ) ) {
 			\WP_CLI::error( "Job not found: {$job_id}" );
 		}
 
+		self::jobs_said( $job_id, \PerfLocale\Background\JobState::control( $job_id, static fn(): array => self::jobs_retry_held( $job_id ) ) );
+	}
+
+	/**
+	 * Retry under the job's control lock.
+	 *
+	 * @param string $job_id
+	 * @return array{0: string, 1: string} [ success|warning|error, message ]
+	 */
+	private static function jobs_retry_held( string $job_id ): array {
+		$state = \PerfLocale\Background\JobState::get( $job_id );
+
+		if ( ! $state ) {
+			return [ 'error', "Job not found: {$job_id}" ];
+		}
+
 		if ( ! in_array( (string) $state['status'], [ 'failed', 'canceled' ], true ) ) {
-			\WP_CLI::warning( "Job is in status '{$state['status']}' - only failed/canceled jobs can be retried." );
-			return;
+			return [ 'warning', "Job is in status '{$state['status']}' - only failed/canceled jobs can be retried." ];
 		}
 
 		// The blog-id sentinel, so the worker reads the right blog's row (as the REST retry).
@@ -3941,7 +4348,8 @@ final class PerfLocaleCommand {
 		// Only the row version checked above is reset, as the REST retry does.
 		$version = $state['version'] ?? null;
 		if ( ! is_int( $version ) || ! \PerfLocale\Background\JobState::reset_for_retry( $job_id, true, -1, -1, $version ) ) {
-			\WP_CLI::error( "Could not reset job {$job_id} for retry (its state changed concurrently)." );
+			$why = \PerfLocale\Background\JobState::retry_refused();
+			return [ 'error', '' !== $why ? $why : "Could not reset job {$job_id} for retry (its state changed concurrently)." ];
 		}
 
 		// Record the engine that re-queued (as WorkerRunner::schedule_recording_engine()), so cancel and is_scheduled probe
@@ -3961,11 +4369,30 @@ final class PerfLocaleCommand {
 				\PerfLocale\Util\PathRedactor::redact( $e->getMessage() )
 			);
 			\PerfLocale\Background\JobState::fail_queued( $job_id, $message );
-			\WP_CLI::error( "Could not retry job {$job_id}. {$message}" );
+			return [ 'error', wp_specialchars_decode( "Could not retry job {$job_id}. {$message}", ENT_QUOTES ) ];
 		}
 		\PerfLocale\Background\JobState::set_engine( $job_id, $runner->get_engine_name() );
 
-		\WP_CLI::success( "Retried job {$job_id}" );
+		return [ 'success', "Retried job {$job_id}" ];
+	}
+
+	/**
+	 * Print a held cancel's or retry's answer; null: another request holds the job's control lock.
+	 *
+	 * @param string                           $job_id
+	 * @param array{0: string, 1: string}|null $said   [ success|warning|error, message ].
+	 * @return void
+	 */
+	private static function jobs_said( string $job_id, ?array $said ): void {
+		[ $kind, $message ] = $said ?? [ 'error', "Job {$job_id} is being changed by another request. Try again in a moment." ];
+
+		if ( 'success' === $kind ) {
+			\WP_CLI::success( $message );
+		} elseif ( 'warning' === $kind ) {
+			\WP_CLI::warning( $message );
+		} else {
+			\WP_CLI::error( $message );
+		}
 	}
 
 	/**
@@ -3987,7 +4414,7 @@ final class PerfLocaleCommand {
 		);
 
 		if ( ! $completed ) {
-			\WP_CLI::error( $message );
+			\WP_CLI::error( wp_specialchars_decode( $message, ENT_QUOTES ) );
 		}
 
 		\WP_CLI::success( $message );
@@ -4286,5 +4713,58 @@ final class PerfLocaleCommand {
 		}
 
 		\WP_CLI::success( "Reset {$count} breaker(s)." );
+	}
+
+	/**
+	 * Manage translated URL bases (for example /de/produkte/ for /de/product/).
+	 *
+	 * ## OPTIONS
+	 *
+	 * <subcommand>
+	 * : Subcommand to run.
+	 * ---
+	 * options:
+	 *   - list
+	 *   - set
+	 *   - compile
+	 *   - forget
+	 * ---
+	 *
+	 * [<args>...]
+	 * : set: <key> <language> <value> (an empty value clears it), or <target> with --enabled. forget: an optional key.
+	 *
+	 * [--enabled=<state>]
+	 * : set: on or off for <target>: global, redirect, group:<id> or a key.
+	 *
+	 * [--format=<format>]
+	 * : Output format for list.
+	 * ---
+	 * default: table
+	 * options:
+	 *   - table
+	 *   - json
+	 *   - csv
+	 *   - yaml
+	 * ---
+	 *
+	 * [--yes]
+	 * : Skip the confirmation of forget.
+	 *
+	 * ## EXAMPLES
+	 *
+	 *     wp perflocale url-bases list
+	 *     wp perflocale url-bases set pt:product de produkte
+	 *     wp perflocale url-bases set group:woocommerce --enabled=off
+	 *     wp perflocale url-bases compile
+	 *     wp perflocale url-bases forget --yes
+	 *
+	 * @subcommand url-bases
+	 *
+	 * @param array<int, string>    $args       Positional args.
+	 * @param array<string, string> $assoc_args Named args.
+	 * @return void
+	 */
+	public function url_bases( array $args, array $assoc_args ): void {
+		( new UrlBasesCommand() )->run( $args, $assoc_args );
 	}
 }

@@ -2,9 +2,9 @@
 /**
  * PerfLocale - Background Jobs admin page.
  *
- *   1. Polls /wp-json/perflocale/v1/jobs every 5 seconds while any row is
- *      in 'queued' or 'running' state and re-renders the table body in
- *      place. Stops as soon as no row is in-flight.
+ *   1. Polls /wp-json/perflocale/v1/jobs every 5 seconds for the rows in
+ *      'queued' or 'running' state (include[]) and updates them in place.
+ *      Stops as soon as no row is in-flight; pauses in a hidden tab.
  *
  *   2. Wires per-row [data-perflocale-jobs-action] buttons (cancel /
  *      retry / delete) to the REST API. One delegated click handler at
@@ -141,9 +141,39 @@
 		}
 
 		var pollFailures = 0;
+		var paused = false;
+
+		// The in-flight rows on the page: the server reads and checks only these.
+		var pollTarget = function () {
+			var ids = [];
+			tbody.querySelectorAll('[data-perflocale-job-row]').forEach(function (row) {
+				if (row.querySelector('.perflocale-jobs-status.running, .perflocale-jobs-status.queued')) {
+					ids.push('include[]=' + encodeURIComponent(row.getAttribute('data-perflocale-job-row')));
+				}
+			});
+			return pollUrl + (pollUrl.indexOf('?') === -1 ? '?' : '&') + ids.join('&');
+		};
+
+		// As core's Heartbeat: no request while the tab is hidden, one at once when it is shown again.
+		var later = function () {
+			setTimeout(function () {
+				if (document.hidden) {
+					paused = true;
+					return;
+				}
+				poll();
+			}, 5000);
+		};
+
+		document.addEventListener('visibilitychange', function () {
+			if (!document.hidden && paused) {
+				paused = false;
+				poll();
+			}
+		});
 
 		var poll = function () {
-			fetch(pollUrl, { headers: { 'X-WP-Nonce': nonce } })
+			fetch(pollTarget(), { headers: { 'X-WP-Nonce': nonce } })
 				.then(function (r) {
 					// A non-2xx (expired REST nonce 403, transient 502/503
 					// exactly while jobs hammer the server) must take the
@@ -266,7 +296,7 @@
 					}
 					if (stillRunning) {
 						pollFailures = 0; // a successful poll clears the transient-error budget
-						setTimeout(poll, 5000);
+						later();
 					}
 				})
 				.catch(function () {
@@ -274,7 +304,7 @@
 					// or throw an unhandled rejection; re-arm with a bounded retry
 					// so a permanently-down endpoint eventually stops polling.
 					if (pollFailures++ < 5) {
-						setTimeout(poll, 5000);
+						later();
 						return;
 					}
 					// Budget exhausted: say so instead of leaving stale
@@ -293,7 +323,7 @@
 				});
 		};
 
-		setTimeout(poll, 5000);
+		later();
 	};
 
 	// Render the lazy-loaded detail panel for one job. Pulls args / log /
@@ -367,6 +397,17 @@
 		return '<dl class="perflocale-jobs-detail">' + rows.join('') + '</dl>';
 	};
 
+	// A refused request's reason: the REST error's message as plain text (alert() renders no HTML), else its status.
+	var failureText = function (r) {
+		var status = 'HTTP ' + r.status;
+		return Promise.resolve()
+			.then(function () { return r.json(); })
+			.then(function (body) {
+				var msg = body && typeof body.message === 'string' ? body.message.replace(/<[^>]*>/g, '').trim() : '';
+				return msg ? msg.slice(0, 300) : status;
+			}, function () { return status; });
+	};
+
 	// 2. Delegated click handler for cancel / retry / delete / details buttons.
 	var wireButtons = function () {
 		document.addEventListener('click', function (e) {
@@ -435,10 +476,12 @@
 				.then(function (r) {
 					if (r.ok) {
 						location.reload();
-					} else {
-						btn.disabled = false;
-						window.alert(t('requestFailed', 'Failed: %1$s').replace('%1$s', 'HTTP ' + r.status));
+						return;
 					}
+					btn.disabled = false;
+					return failureText(r).then(function (text) {
+						window.alert(format(t('requestFailed', 'Failed: %1$s'), [text]));
+					});
 				})
 				.catch(function (err) {
 					btn.disabled = false;

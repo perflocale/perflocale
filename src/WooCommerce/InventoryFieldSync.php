@@ -607,7 +607,7 @@ final class InventoryFieldSync {
 			$this->forget_record( get_current_blog_id(), $product_id );
 		}
 
-		if ( ! $this->sync->sync_enabled() || $this->sync->is_sync_opted_out( $product_id ) ) {
+		if ( ! $this->sync->sync_enabled() ) {
 			return;
 		}
 
@@ -658,6 +658,14 @@ final class InventoryFieldSync {
 				return;
 			}
 
+			// The saved product's and the copies' flags as stored now, right before the writes (never a kept one).
+			require_once __DIR__ . '/OptOutMemo.php';
+			$stored = OptOutMemo::read( is_array( $translations ) ? array_column( $translations, 'object_id' ) : [] );
+
+			if ( null === $stored || $this->sync->is_sync_opted_out( $product_id, 0, $stored ) ) {
+				return;
+			}
+
 			// Collect meta values from the canonical (saved) product once.
 			$values = $this->read_source_values( $product_id, $fields, $derive );
 
@@ -666,7 +674,7 @@ final class InventoryFieldSync {
 			foreach ( $translations as $link ) {
 				$sibling_id = (int) $link->object_id;
 
-				if ( $sibling_id === $product_id || $this->sync->is_sync_opted_out( $sibling_id ) ) {
+				if ( $sibling_id === $product_id || $this->sync->is_sync_opted_out( $sibling_id, 0, $stored ) ) {
 					continue;
 				}
 
@@ -923,7 +931,7 @@ final class InventoryFieldSync {
 			return [];
 		}
 
-		if ( ! $this->sync->sync_enabled() || $this->sync->is_sync_opted_out( $variation_id ) ) {
+		if ( ! $this->sync->sync_enabled() ) {
 			return [];
 		}
 
@@ -968,18 +976,27 @@ final class InventoryFieldSync {
 			$src_attrs       = $this->sync->normalise_variation_attrs( $variation->get_attributes(), (int) $parent_id );
 			$synced_ids      = [];
 			$touched_parents = [];
+			$copy_parents    = [];
 
 			foreach ( $parent_sibs as $link ) {
 				$sib_parent_id = (int) $link->object_id;
 
-				if ( $sib_parent_id === $parent_id || $this->sync->is_sync_opted_out( $sib_parent_id ) ) {
-					continue;
+				if ( $sib_parent_id !== $parent_id ) {
+					$copy_parents[] = $sib_parent_id;
 				}
+			}
 
-				$sib_variation_id = $this->sync->match_sibling_variation( $sib_parent_id, $src_attrs );
+			// As in sync_variation_stock(): the copy parents matched and the flags as stored now. A variation opt-out
+			// blocks incoming writes too.
+			require_once __DIR__ . '/OptOutMemo.php';
+			[ $stored, $matched ] = OptOutMemo::match( $this->sync, $copy_parents, $src_attrs, [], [ $variation_id, $parent_id ] );
 
-				// A variation opt-out blocks incoming writes too; read after the match, so only real candidates pay for it.
-				if ( $sib_variation_id <= 0 || $sib_variation_id === $variation_id || $this->sync->is_sync_opted_out( $sib_variation_id ) ) {
+			if ( null === $stored || $this->sync->is_sync_opted_out( $variation_id, is_int( $parent_id ) ? $parent_id : null, $stored ) ) {
+				return [];
+			}
+
+			foreach ( $matched as $sib_parent_id => $sib_variation_id ) {
+				if ( $sib_variation_id <= 0 || $sib_variation_id === $variation_id || $this->sync->is_sync_opted_out( $sib_parent_id, 0, $stored ) || $this->sync->is_sync_opted_out( $sib_variation_id, $sib_parent_id, $stored ) ) {
 					continue;
 				}
 

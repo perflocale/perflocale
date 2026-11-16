@@ -14,6 +14,8 @@ use PerfLocale\Database\Schema;
 use PerfLocale\Enum\SourceType;
 use PerfLocale\Frontend\OptionStrings;
 use PerfLocale\Translation\MenuManager;
+use PerfLocale\Util\Scalar;
+use PerfLocale\Util\WorkBudget;
 
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
@@ -41,6 +43,12 @@ final class PolylangSiteData {
 	 * Variations whose post meta is loaded per statement.
 	 */
 	private const VARIATION_CHUNK = 500;
+
+	/** Peak memory unserialize() takes per serialized byte: measured worst 21x on PHP 8.1 to 8.5 (one-element arrays). */
+	private const DECODE_PEAK_PER_BYTE = 24;
+
+	/** Memory a language's strings leave free past their decode. */
+	private const DECODE_RESERVE = 16777216;
 
 	/**
 	 * Constructor.
@@ -176,13 +184,18 @@ final class PolylangSiteData {
 	 * @param array<int, string> $notices  Import notices, appended to.
 	 * @param array<int, string> $failed   Items whose write failed, e.g. "Site Title (fi)", appended to.
 	 * @param string             $db_error The last failed write's database error, for the debug log only.
+	 * @param array<int, string> $too_large Languages whose strings need more memory to read than the limit leaves, appended to.
 	 * @return int|null Translations stored (option strings and language formats); null when the read failed.
 	 */
-	public function import_strings( array &$notices, array &$failed = [], string &$db_error = '' ): ?int {
+	public function import_strings( array &$notices, array &$failed = [], string &$db_error = '', array &$too_large = [] ): ?int {
+		// Sizes first, each value read alone after its memory check (SQLite's LENGTH() counts characters).
+		$bytes = defined( 'DB_ENGINE' ) && 'sqlite' === DB_ENGINE ? 'LENGTH(HEX(tm.meta_value)) / 2' : 'LENGTH(tm.meta_value)';
+
 		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared -- Values are bound through prepare(); table names through %i.
+		// phpcs:ignore PluginCheck.Security.DirectDB.UnescapedDBParameter -- $bytes is one of two fixed expressions.
 		$rows = $this->wpdb->get_results(
 			$this->wpdb->prepare(
-				'SELECT t.slug, tm.meta_value FROM %i t
+				'SELECT t.slug, tm.meta_id, ' . $bytes . ' AS bytes FROM %i t
 				INNER JOIN %i tt ON tt.term_id = t.term_id AND tt.taxonomy = %s
 				INNER JOIN %i tm ON tm.term_id = t.term_id AND tm.meta_key = %s',
 				$this->wpdb->terms,
@@ -219,19 +232,47 @@ final class PolylangSiteData {
 				continue;
 			}
 
+			$language = $this->languages->find( (int) $lang_id );
+			$slug     = $language !== null ? (string) $language->slug : (string) $row->slug;
+			$limit    = WorkBudget::memory_limit();
+			$room     = null === $limit ? PHP_INT_MAX : intdiv( max( 0, $limit - memory_get_usage( true ) - max( self::DECODE_RESERVE, WorkBudget::options_reserve() ) ), self::DECODE_PEAK_PER_BYTE );
+
+			if ( Scalar::int( $row->bytes ) > $room ) {
+				$too_large[] = $slug;
+				continue;
+			}
+
+			// The value only within the room: another request may have grown the row since its size was read.
+			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared -- One value at a time, uncached; values bound through prepare(), the table through %i.
+			// phpcs:ignore PluginCheck.Security.DirectDB.UnescapedDBParameter -- $bytes is one of two fixed expressions.
+			$read = $this->wpdb->get_row( $this->wpdb->prepare( 'SELECT CASE WHEN ' . $bytes . ' <= %d THEN tm.meta_value END AS v, ' . $bytes . ' AS bytes FROM %i tm WHERE tm.meta_id = %d', $room, $this->wpdb->termmeta, Scalar::int( $row->meta_id ) ) );
+			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared
+
+			if ( null === $read && $this->wpdb->last_error !== '' ) {
+				return null;
+			}
+
+			// No row without an error: deleted since the size read, nothing left to import.
+			$value = is_object( $read ) ? ( $read->v ?? null ) : null;
+
+			if ( is_object( $read ) && ( Scalar::int( $read->bytes ?? null ) > $room || ( is_string( $value ) && strlen( $value ) > $room ) ) ) {
+				$too_large[] = $slug;
+				continue;
+			}
+
 			// Term meta is user-written data: no object is created from it.
 			// phpcs:disable WordPress.PHP.DiscouragedPHPFunctions.serialize_unserialize, WordPress.PHP.NoSilencedErrors.Discouraged -- allowed_classes=false is the mitigation the rule asks for; @ hides the notice for a class it refuses.
-			$pairs = is_serialized( (string) $row->meta_value )
-				? @unserialize( (string) $row->meta_value, [ 'allowed_classes' => false ] )
+			$pairs = is_string( $value ) && is_serialized( $value )
+				? @unserialize( $value, [ 'allowed_classes' => false ] )
 				: null;
 			// phpcs:enable WordPress.PHP.DiscouragedPHPFunctions.serialize_unserialize, WordPress.PHP.NoSilencedErrors.Discouraged
+
+			unset( $read, $value );
 
 			if ( ! is_array( $pairs ) ) {
 				continue;
 			}
 
-			$language  = $this->languages->find( (int) $lang_id );
-			$slug      = $language !== null ? (string) $language->slug : (string) $row->slug;
 			$unplaced  = 0;
 			$lang_data = [];
 

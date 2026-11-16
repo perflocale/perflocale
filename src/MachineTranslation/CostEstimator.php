@@ -58,9 +58,10 @@ final class CostEstimator {
 	 * @param bool  $include_meta    Include MT-able meta characters (keys from
 	 *                               the perflocale/mt/translatable_meta_keys
 	 *                               registry, resolved per post type).
+	 * @param bool  $as_user         For the current user: a translation it may not view counts as missing, not skipped.
 	 * @return array<string, mixed> See summarize() for the envelope shape.
 	 */
-	public function estimate_posts( array $post_ids, array $target_lang_ids, bool $include_meta = false ): array {
+	public function estimate_posts( array $post_ids, array $target_lang_ids, bool $include_meta = false, bool $as_user = false ): array {
 		global $wpdb;
 
 		$post_ids        = array_values( array_unique( array_filter( array_map( 'intval', $post_ids ), static fn( int $i ): bool => $i > 0 ) ) );
@@ -68,6 +69,107 @@ final class CostEstimator {
 
 		if ( $post_ids === [] || $target_lang_ids === [] ) {
 			return $this->summarize( 0, 0, 0 ) + self::builder_fields( 0 );
+		}
+
+		$chars_by_post = $this->chars_by_post( $post_ids, $include_meta );
+		$ph            = implode( ',', array_fill( 0, count( $post_ids ), '%d' ) );
+
+		// Pairs that exist (the job skips them): one join over each source group's sibling languages.
+		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter
+		$links_table  = Schema::table( 'translation_links' );
+		$groups_table = Schema::table( 'translation_groups' );
+		$pairs        = $wpdb->get_results(
+			// phpcs:ignore WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- Replacements are assembled with array_merge()/unpacking, which WPCS cannot count; the %i table names lead, then the values in placeholder order.
+			$wpdb->prepare(
+				"SELECT l1.object_id AS source_id, l2.language_id, l2.object_id AS translation_id
+				 FROM %i l1
+				 INNER JOIN %i g ON g.id = l1.group_id AND g.type = 'post'
+				 INNER JOIN %i l2 ON l2.group_id = l1.group_id
+				 WHERE l1.object_id IN ({$ph})",
+				array_merge( [ $links_table, $groups_table, $links_table ], $post_ids )
+			),
+			ARRAY_A
+		);
+		// phpcs:enable
+
+		$existing = [];
+		$hidden   = $as_user ? self::hidden_translations( array_values( array_filter( (array) $pairs, 'is_array' ) ) ) : [];
+		foreach ( (array) $pairs as $p ) {
+			if ( ! isset( $hidden[ \PerfLocale\Util\Scalar::int( is_array( $p ) ? ( $p['translation_id'] ?? 0 ) : 0 ) ] ) ) {
+				$existing[ (int) $p['source_id'] ][ (int) $p['language_id'] ] = true;
+			}
+		}
+
+		$chars    = 0;
+		$items    = 0;
+		$skipped  = 0;
+		$layouts  = 0;
+		$builders = BuilderLayout::names_by_post( array_keys( $chars_by_post ) );
+
+		foreach ( $chars_by_post as $pid => $post_chars ) {
+			foreach ( $target_lang_ids as $lang_id ) {
+				if ( isset( $existing[ $pid ][ $lang_id ] ) ) {
+					++$skipped;
+					continue;
+				}
+				$chars += $post_chars;
+				++$items;
+				$layouts += isset( $builders[ $pid ] ) ? 1 : 0;
+			}
+		}
+
+		return $this->summarize( $chars, $items, $skipped ) + self::builder_fields( $layouts );
+	}
+
+	/**
+	 * The linked translations of $pairs the current user may not view, as id => true (the sources are viewable).
+	 *
+	 * @param array<int, array<mixed>> $pairs Rows with source_id and translation_id.
+	 * @return array<int, true>
+	 */
+	private static function hidden_translations( array $pairs ): array {
+		$ids = [];
+
+		foreach ( $pairs as $row ) {
+			$id = \PerfLocale\Util\Scalar::int( $row['translation_id'] ?? 0 );
+
+			if ( $id > 0 && $id !== \PerfLocale\Util\Scalar::int( $row['source_id'] ?? 0 ) ) {
+				$ids[ $id ] = $id;
+			}
+		}
+
+		$out = [];
+
+		foreach ( array_chunk( array_values( $ids ), 200 ) as $chunk ) {
+			_prime_post_caches( $chunk, false, false );
+
+			foreach ( $chunk as $id ) {
+				if ( ! \PerfLocale\Helper::user_can_view_object( $id ) ) {
+					$out[ $id ] = true;
+				}
+			}
+
+			\PerfLocale\Cache\CacheManager::release_runtime_posts( $chunk );
+		}
+
+		return $out;
+	}
+
+	/**
+	 * The characters machine translation sends per post: title, content and excerpt, plus with $include_meta the
+	 * values MetaTranslator sends for the registry's keys; a missing post counts nothing.
+	 *
+	 * @since 1.0.8
+	 *
+	 * @param int[] $post_ids     Post IDs (positive, unique).
+	 * @param bool  $include_meta Include MT-able meta characters.
+	 * @return array<int, int> Characters by post ID.
+	 */
+	public function chars_by_post( array $post_ids, bool $include_meta = false ): array {
+		global $wpdb;
+
+		if ( $post_ids === [] ) {
+			return [];
 		}
 
 		$ph = implode( ',', array_fill( 0, count( $post_ids ), '%d' ) );
@@ -116,47 +218,9 @@ final class CostEstimator {
 			}
 		}
 
-		// Pairs that exist (the job skips them): one join over each source group's sibling languages.
-		$links_table  = Schema::table( 'translation_links' );
-		$groups_table = Schema::table( 'translation_groups' );
-		$pairs        = $wpdb->get_results(
-			// phpcs:ignore WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- Replacements are assembled with array_merge()/unpacking, which WPCS cannot count; the %i table names lead, then the values in placeholder order.
-			$wpdb->prepare(
-				"SELECT l1.object_id AS source_id, l2.language_id
-				 FROM %i l1
-				 INNER JOIN %i g ON g.id = l1.group_id AND g.type = 'post'
-				 INNER JOIN %i l2 ON l2.group_id = l1.group_id
-				 WHERE l1.object_id IN ({$ph})",
-				array_merge( [ $links_table, $groups_table, $links_table ], $post_ids )
-			),
-			ARRAY_A
-		);
 		// phpcs:enable
 
-		$existing = [];
-		foreach ( (array) $pairs as $p ) {
-			$existing[ (int) $p['source_id'] ][ (int) $p['language_id'] ] = true;
-		}
-
-		$chars    = 0;
-		$items    = 0;
-		$skipped  = 0;
-		$layouts  = 0;
-		$builders = BuilderLayout::names_by_post( array_keys( $chars_by_post ) );
-
-		foreach ( $chars_by_post as $pid => $post_chars ) {
-			foreach ( $target_lang_ids as $lang_id ) {
-				if ( isset( $existing[ $pid ][ $lang_id ] ) ) {
-					++$skipped;
-					continue;
-				}
-				$chars += $post_chars;
-				++$items;
-				$layouts += isset( $builders[ $pid ] ) ? 1 : 0;
-			}
-		}
-
-		return $this->summarize( $chars, $items, $skipped ) + self::builder_fields( $layouts );
+		return $chars_by_post;
 	}
 
 	/**
@@ -328,7 +392,7 @@ final class CostEstimator {
 		// phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_unserialize -- a serialized scalar string, classes refused.
 		$value = unserialize( $raw, [ 'allowed_classes' => false ] );
 
-		return is_string( $value ) && trim( $value ) !== '' ? mb_strlen( $value ) : 0;
+		return is_string( $value ) && trim( $value ) !== '' ? \PerfLocale\Util\Utf8::length( $value ) : 0;
 	}
 
 	/**
@@ -510,10 +574,10 @@ final class CostEstimator {
 
 				$sent = 0;
 				foreach ( $forms as $form ) {
-					$sent += mb_strlen( $form['text'] );
+					$sent += \PerfLocale\Util\Utf8::length( $form['text'] );
 				}
 
-				$chars += $sent - mb_strlen( $row['original'] );
+				$chars += $sent - \PerfLocale\Util\Utf8::length( $row['original'] );
 			}
 		}
 

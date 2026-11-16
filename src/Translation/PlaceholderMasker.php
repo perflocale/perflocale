@@ -76,9 +76,11 @@ final class PlaceholderMasker {
 			return sprintf( self::TOKEN_FORMAT, $counter++ );
 		};
 
+		// Each element outside the MT allowlist (script, style, iframe, embed ...) whole: its code is never sent.
+		$masked = 1 === preg_match( '/<[a-zA-Z]/', $text ) ? self::hold_units( $text, $callback ) : $text;
+
 		// Order matters: HTML first so a brace inside an attribute stays part of
 		// its tag; SEO variables before printf, whose `%%` rule would split them.
-		$masked = $text;
 		foreach ( [ self::HTML_RE, self::BRACE_RE, self::SEO_VAR_DOUBLE_RE, self::SEO_VAR_SINGLE_RE, self::PRINTF_RE ] as $pattern ) {
 			$before_count = count( $placeholders );
 			$step         = preg_replace_callback( $pattern, $callback, $masked );
@@ -95,6 +97,19 @@ final class PlaceholderMasker {
 		}
 
 		return [ $masked, $placeholders ];
+	}
+
+	/**
+	 * The text with each element HeldMarkup holds back whole replaced through $callback.
+	 *
+	 * @param string                                $text     Text.
+	 * @param callable(array<int, string>): string $callback mask()'s placeholder callback (takes a match array).
+	 * @return string
+	 */
+	private static function hold_units( string $text, callable $callback ): string {
+		require_once __DIR__ . '/../MachineTranslation/HeldMarkup.php';
+
+		return \PerfLocale\MachineTranslation\HeldMarkup::hold( $text, static fn( string $unit ): string => $callback( [ $unit ] ) );
 	}
 
 	/**

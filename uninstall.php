@@ -12,7 +12,8 @@ if ( ! defined( 'WP_UNINSTALL_PLUGIN' ) ) {
 	exit;
 }
 
-// No autoloader during uninstall: every class the purge path reaches must be listed (UninstallIncludeClosureTest).
+// No autoloader during uninstall: every class the purge path reaches, error branches too, must be listed
+// (UninstallIncludeClosureTest, UninstallReachableClassesTest).
 // is_file(): a host may have removed part of the plugin; SiteCleanup checks class_exists() before optional steps.
 $perflocale_includes = [
 	__DIR__ . '/src/Admin/TranslatorRole.php',
@@ -25,10 +26,18 @@ $perflocale_includes = [
 	__DIR__ . '/src/Database/NotOptions.php',
 	// The uninstall lists SiteCleanup reads.
 	__DIR__ . '/src/Database/DataRegistry.php',
+	// SiteCleanup's three-state reads (a failed read is never absent).
+	__DIR__ . '/src/Database/OptionRead.php',
+	// OptionRead's locking read takes its suffix from it.
+	__DIR__ . '/src/Database/ConnectionGuard.php',
 	__DIR__ . '/src/Database/SiteCleanup.php',
 	__DIR__ . '/src/Addon/AddonInterface.php',
 	// The whole closure of AddonUninstaller::purge(), dependencies first: a missing class throws inside SiteCleanup's
 	// catch and silently leaves addon data behind.
+	__DIR__ . '/src/Admin/Typed.php',
+	__DIR__ . '/src/Util/DbErrorCode.php',
+	// Its OWN_ERROR and describe() name the cause on the add-on purge's refusal and error branches.
+	__DIR__ . '/src/Database/UpgradeRunner.php',
 	__DIR__ . '/src/Addon/AddonMigrationErrors.php',
 	__DIR__ . '/src/Addon/AddonId.php',
 	__DIR__ . '/src/Addon/AddonSchemaManager.php',
@@ -72,11 +81,8 @@ if ( is_multisite() ) {
 	// It is not a network-wide pass (none is possible): never drop the per-blog clear for it.
 	\PerfLocale\Database\SiteCleanup::network_clear_action_scheduler();
 
-	// Network options (wp_sitemeta) only after a complete sweep: they include the resume marker.
-	if ( $perflocale_sweep['complete'] ) {
-		// Every network of the installation, not only the calling one.
-		\PerfLocale\Database\SiteCleanup::purge_network_scope();
-	} else {
+	// purge_network() removed the network options of every network when the pass is complete.
+	if ( ! $perflocale_sweep['complete'] ) {
 		// Always logged: the plugin files are about to go, so no screen can show it.
 		// A failure wins over running out of budget: it needs its cause fixed before another pass.
 		if ( $perflocale_sweep['list_error'] ) {
@@ -86,8 +92,11 @@ if ( is_multisite() ) {
 			$perflocale_cause = sprintf( 'could not purge %d site(s)', $perflocale_sweep['failed'] );
 			$perflocale_next  = 'The lines above name each site and the error. Fix the cause, then re-install the plugin and delete it again WITHOUT activating it - the next pass starts at the first site that failed.';
 		} elseif ( $perflocale_sweep['meta_error'] ) {
-			$perflocale_cause = 'could not delete PerfLocale user preferences';
+			$perflocale_cause = 'could not delete PerfLocale user preferences or add-on network targets';
 			$perflocale_next  = 'Every site is purged; the line above has the database error. Once the database is healthy, re-install the plugin and delete it again WITHOUT activating it - the next pass retries only that step.';
+		} elseif ( $perflocale_sweep['namespace_error'] ) {
+			$perflocale_cause = 'could not read or delete the PerfLocale network options';
+			$perflocale_next  = 'Every site is purged; the line above has the database error. Once the database is healthy, re-install the plugin and delete it again WITHOUT activating it - the next pass retries only the network steps.';
 		} else {
 			$perflocale_cause = 'ran out of execution budget';
 			$perflocale_next  = 'Re-install the plugin and delete it again WITHOUT activating it - the next pass resumes from there. From WP-CLI, `wp plugin uninstall perflocale` finishes it in one pass, because WP-CLI has no execution limit.';

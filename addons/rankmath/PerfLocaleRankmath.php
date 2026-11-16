@@ -119,6 +119,8 @@ final class PerfLocaleRankmath implements \PerfLocale\Addon\AddonInterface {
 		// post's seed-cleared marker, which machine translation and the seed honour.
 		\PerfLocale\Translation\SyncMeta::track_seed_clears( $this->add_meta_keys( [], '' ) );
 
+		add_action( 'perflocale/translation/created', [ $this, 'map_social_images' ], 10, 4 );
+
 		// og:locale needs no handling: PerfLocale filters WordPress's `locale`,
 		// so Rank Math's own og:locale already reflects the current language.
 
@@ -147,6 +149,22 @@ final class PerfLocaleRankmath implements \PerfLocale\Addon\AddonInterface {
 		// add_schema (10) and connect_schema_entities (99), on the assembled graph.
 		if ( $plugin->has( 'settings' ) && $plugin->get( 'settings' )->seo_schema_enrichment_enabled() ) {
 			add_filter( 'rank_math/json_ld', [ $this, 'filter_schema_graph' ], 100, 1 );
+		}
+	}
+
+	/**
+	 * Point a new post translation's social images at the target language's attachment copies.
+	 *
+	 * @param mixed $new_id      New object ID.
+	 * @param mixed $object_type 'post' or 'term'.
+	 * @param mixed $target_slug Target language slug.
+	 * @param mixed $source_id   Source object ID.
+	 * @return void
+	 */
+	public function map_social_images( $new_id, $object_type = '', $target_slug = '', $source_id = 0 ): void {
+		if ( 'post' === $object_type && is_numeric( $new_id ) && is_string( $target_slug ) && '' !== $target_slug ) {
+			require_once __DIR__ . '/PerfLocaleRankmathImages.php';
+			\PerfLocaleRankmathImages::map( (int) $new_id, $target_slug, is_numeric( $source_id ) ? (int) $source_id : 0 );
 		}
 	}
 
@@ -214,16 +232,7 @@ final class PerfLocaleRankmath implements \PerfLocale\Addon\AddonInterface {
 	}
 
 	/**
-	 * Machine-translatable SEO meta (titles, descriptions, social), gated by mt_meta_seo.
-	 *
-	 * The focus keyword is left out on purpose: keyword targeting is a human decision.
-	 *
-	 * @param array<int, string> $keys      Meta keys.
-	 * @param string             $post_type Post type.
-	 * @return array<int, string>
-	 */
-	/**
-	 * Rank Math meta keys this addon machine-translates, all plain text (text mode).
+	 * Rank Math meta keys this addon machine-translates as plain text (text mode).
 	 */
 	private const MT_TEXT_KEYS = [
 		'rank_math_title',
@@ -234,6 +243,16 @@ final class PerfLocaleRankmath implements \PerfLocale\Addon\AddonInterface {
 		'rank_math_twitter_description',
 	];
 
+	/** The focus keywords: a "kw1,kw2" list, translated one keyword at a time. */
+	private const MT_KEYWORD_KEY = 'rank_math_focus_keyword';
+
+	/**
+	 * Machine-translatable SEO meta (titles, descriptions, social), gated by mt_meta_seo; the focus keywords also by mt_meta_seo_keywords.
+	 *
+	 * @param array<int, string> $keys      Meta keys.
+	 * @param string             $post_type Post type.
+	 * @return array<int, string>
+	 */
 	public function add_mt_meta_keys( array $keys, string $post_type ): array {
 		$settings = \PerfLocale\Plugin::get_instance()->get( 'settings' );
 
@@ -241,7 +260,7 @@ final class PerfLocaleRankmath implements \PerfLocale\Addon\AddonInterface {
 			return $keys;
 		}
 
-		return array_merge( $keys, self::MT_TEXT_KEYS );
+		return array_merge( $keys, self::MT_TEXT_KEYS, (bool) $settings->get( 'mt_meta_seo_keywords', false ) ? [ self::MT_KEYWORD_KEY ] : [] );
 	}
 
 	/**
@@ -251,9 +270,17 @@ final class PerfLocaleRankmath implements \PerfLocale\Addon\AddonInterface {
 	 * @param string $format    Inherited format ('html' default).
 	 * @param string $key       Meta key.
 	 * @param string $post_type Source post type.
-	 * @return string 'text' for this addon's SEO keys, else $format.
+	 * @return string 'text' for this addon's SEO keys, 'keywords' for the focus keywords, else $format.
 	 */
 	public function mt_meta_key_format( string $format, string $key, string $post_type ): string {
+		if ( 'copy' === $format ) {
+			return $format;
+		}
+
+		if ( self::MT_KEYWORD_KEY === $key ) {
+			return \PerfLocale\MachineTranslation\KeywordList::FORMAT;
+		}
+
 		return in_array( $key, self::MT_TEXT_KEYS, true ) ? 'text' : $format;
 	}
 
