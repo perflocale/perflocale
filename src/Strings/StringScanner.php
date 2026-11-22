@@ -508,7 +508,10 @@ final class StringScanner {
 				}
 
 				if ( $m[1][0] === 'u' ) {
-					return self::codepoint_to_utf8( (int) hexdec( substr( $m[1], 2, -1 ) ) );
+					$hex = ltrim( substr( $m[1], 2, -1 ), '0' );
+
+					// Over 6 digits is above U+10FFFF; hexdec() would overflow to a float.
+					return self::codepoint_to_utf8( strlen( $hex ) > 6 ? -1 : (int) hexdec( $hex ) );
 				}
 
 				return chr( octdec( $m[1] ) ); // 1-3 octal digits.

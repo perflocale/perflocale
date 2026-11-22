@@ -614,7 +614,7 @@ final class ReferenceMapper {
 		try {
 			return serialize( $value ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_serialize -- A comparable form, never stored.
 		} catch ( \Throwable $e ) {
-			return is_object( $value ) ? spl_object_hash( $value ) : gettype( $value );
+			return is_object( $value ) ? 'object#' . spl_object_id( $value ) : gettype( $value );
 		}
 	}
 }

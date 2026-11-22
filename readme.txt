@@ -4,7 +4,7 @@ Tags: multilingual, translation, i18n, language, localization
 Requires at least: 6.4
 Tested up to: 7.1
 Requires PHP: 8.1
-Stable tag: 1.0.8
+Stable tag: 1.0.8.0.1
 License: GPL-2.0+
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -145,6 +145,10 @@ To restrict access (private staging sites, IP allowlists, Application-Password a
 
 PerfLocale has no token or header scheme of its own. Use WordPress' own methods (Application Passwords for server-to-server requests, cookie and nonce for browser sessions, or a JWT/OAuth plugin) and check them in this filter, so the endpoint uses the same authentication as the rest of your site's REST API.
 
+= Where do I report security bugs found in this plugin? =
+
+Please report security bugs found in the source code of the PerfLocale plugin through the [Patchstack Vulnerability Disclosure Program](https://patchstack.com/database/vdp/740904a3-97e0-4cd7-b961-0aaa15c04eed). The Patchstack team will assist you with verification, CVE assignment, and notify the developers of this plugin.
+
 == Screenshots ==
 
 1. Front-end language switcher - block, shortcode, or template tag, plus an optional append to classic theme menus
@@ -217,6 +221,10 @@ PerfLocale can also publish a read-only public REST endpoint for edge runtimes (
 == Changelog ==
 
 Full release notes for every version: [perflocale.com/changelog](https://perflocale.com/changelog/)
+
+= 1.0.8.0.1 =
+* PerfLocale now works with PHP 8.6.
+* Security hardening.
 
 = 1.0.8 =
 * Security hardening.
@@ -294,6 +302,9 @@ Full release notes for every version: [perflocale.com/changelog](https://perfloc
 * Many fixes, including previews of draft translations, synced patterns and menus, and the WPForms builder.
 
 == Upgrade Notice ==
+
+= 1.0.8.0.1 =
+Security hardening. PerfLocale now works with PHP 8.6.
 
 = 1.0.8 =
 Security hardening. Translated URL bases, Content ReSync, machine translation of long posts in parts, less code per page. The Contact Form 7 integration needs CF7 5.8 or later and pauses with an older CF7. To go back, restore the pre-update database backup and wp-content/uploads/perflocale/.

@@ -2,14 +2,14 @@
 # This file is distributed under the GPL v2 or later.
 msgid ""
 msgstr ""
-"Project-Id-Version: PerfLocale 1.0.8\n"
+"Project-Id-Version: PerfLocale 1.0.8.0.1\n"
 "Report-Msgid-Bugs-To: https://wordpress.org/support/plugin/perflocale\n"
 "Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
 "Language-Team: LANGUAGE <LL@li.org>\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
-"POT-Creation-Date: 2026-11-15T12:03:26+00:00\n"
+"POT-Creation-Date: 2026-11-21T22:43:28+00:00\n"
 "PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
 "X-Generator: WP-CLI 2.12.0\n"
 "X-Domain: perflocale\n"
@@ -12611,7 +12611,7 @@ msgid "The post is password-protected, and machine translation does not send pas
 msgstr ""
 
 #. translators: 1: post id, 2: target language slug. Names the item a background job was on.
-#: src/Background/Jobs/AutoTranslateJob.php:480
+#: src/Background/Jobs/AutoTranslateJob.php:481
 #: src/Background/Jobs/BulkTranslateJob.php:462
 #: src/Background/Jobs/XliffImportJob.php:480
 #, php-format
@@ -12619,13 +12619,13 @@ msgid "post %1$d into %2$s"
 msgstr ""
 
 #. translators: 1: number of waits, 2: seconds of the last wait
-#: src/Background/Jobs/AutoTranslateJob.php:552
+#: src/Background/Jobs/AutoTranslateJob.php:553
 #, php-format
 msgid "The provider asked to wait %1$d times in a row (rate limit; last wait %2$d seconds), so the remaining languages were not translated. Translate them again later."
 msgstr ""
 
 #. translators: %d: number of background runs in a row whose time limit the provider's answer did not fit in.
-#: src/Background/Jobs/AutoTranslateJob.php:578
+#: src/Background/Jobs/AutoTranslateJob.php:579
 #, php-format
 msgid "The translation provider did not answer in time in %d run in a row, so this language was not translated."
 msgid_plural "The translation provider did not answer in time in %d runs in a row, so this language was not translated."
@@ -12633,7 +12633,7 @@ msgstr[0] ""
 msgstr[1] ""
 
 #. translators: Stored as the error of a background job whose PHP process ended while the job was running, without a PHP error.
-#: src/Background/Jobs/AutoTranslateJob.php:765
+#: src/Background/Jobs/AutoTranslateJob.php:766
 #: src/Background/JobState.php:596
 #: src/Background/WorkerRunner.php:1123
 #: src/Background/WorkerRunner.php:1132
@@ -15499,7 +15499,7 @@ msgid "The string identity switch-over could not be queued: %s"
 msgstr ""
 
 #. translators: %s is the offending return type.
-#: src/Strings/StringScanner.php:655
+#: src/Strings/StringScanner.php:658
 #, php-format
 msgid "A hook on perflocale/strings/scanner/excluded_paths returned %s - must be an array of path-prefix strings. Falling back to the default exclusion list."
 msgstr ""
@@ -15861,6 +15861,16 @@ msgstr ""
 
 #: src/WooCommerce/ExchangeRateSync.php:920
 msgid "Exchange rates updated successfully."
+msgstr ""
+
+#. translators: 1: order number, 2: currency code.
+#: src/WooCommerce/OrderCouponRate.php:60
+#, php-format
+msgid "Order %1$d: its coupons were not recalculated: no single exchange rate for %2$s could be determined."
+msgstr ""
+
+#: src/WooCommerce/OrderPayFrame.php:1009
+msgid "This order cannot be paid for. Please contact us if you need assistance."
 msgstr ""
 
 #: src/WooCommerce/RateSchedules.php:36

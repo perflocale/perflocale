@@ -248,7 +248,9 @@ final class MarkupRemoval {
 					return html_entity_decode( $m[0], ENT_QUOTES | ENT_HTML5, 'UTF-8' );
 				}
 
-				$code = null !== $m[2] ? hexdec( ltrim( $m[2], '0' ) ) : (int) ltrim( $m[1] ?? '', '0' );
+				$hex  = null !== $m[2] ? ltrim( $m[2], '0' ) : '';
+				// Over 6 digits is above U+10FFFF; hexdec() would overflow (a notice on PHP 8.6).
+				$code = null !== $m[2] ? ( strlen( $hex ) > 6 ? -1 : hexdec( $hex ) ) : (int) ltrim( $m[1] ?? '', '0' );
 
 				if ( ! is_int( $code ) || $code <= 0 || $code > 0x10FFFF || ( $code >= 0xD800 && $code <= 0xDFFF ) ) {
 					return "\u{FFFD}";

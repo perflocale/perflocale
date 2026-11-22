@@ -28,13 +28,19 @@ final class MultiCurrency {
 	private ?array $currencies = null;
 
 	/**
-	 * Cached exchange rate for the current language.
+	 * Exchange rate memo by the language slug it was read for; nothing before a language is decided.
 	 *
-	 * Dropped when a rendering window changes the language (forget_rate()).
-	 *
-	 * @var float|null
+	 * @var array<string, float>
 	 */
-	private ?float $cached_rate = null;
+	private array $rates = [];
+
+	/**
+	 * Pay frames: while WooCommerce pays an existing order (OrderPayFrame); format shared with the 1.0.8.1 guard.
+	 *
+	 * @internal
+	 * @var array<int, array{kind: string, blog: int, code: ?string, lossless: bool, obj: int, ref: ?\WeakReference<object>, req: ?object, bind: bool, used: bool, ob: ?int}>
+	 */
+	public static array $pay_frames = [];
 
 	/**
 	 * Register WooCommerce hooks.
@@ -66,6 +72,17 @@ final class MultiCurrency {
 		add_filter( 'woocommerce_cart_shipping_packages', [ $this, 'add_currency_to_shipping_packages' ] );
 		add_filter( 'woocommerce_coupon_get_amount', [ $this, 'convert_coupon_amount' ], 10, 2 );
 
+		// Coupons re-applied to an existing order use the order's rate; late, to bind the object WooCommerce applies.
+		add_filter(
+			'woocommerce_order_recalculate_coupons_coupon_object',
+			static function ( $coupon, $code = '', $item = null, $order = null ) {
+				require_once __DIR__ . '/OrderCouponRate.php';
+				return OrderCouponRate::bind( $coupon, $code, $item, $order );
+			},
+			1000,
+			4
+		);
+
 		// WC_Discounts compares spend limits, stored in the base currency, with the converted cart total.
 		add_filter( 'woocommerce_coupon_get_minimum_amount', [ $this, 'convert_coupon_threshold' ], 10, 2 );
 		add_filter( 'woocommerce_coupon_get_maximum_amount', [ $this, 'convert_coupon_threshold' ], 10, 2 );
@@ -84,6 +101,69 @@ final class MultiCurrency {
 
 		// The rate memo is per language; a rendering window (order email, with_language()) fires this on open and close.
 		add_action( 'perflocale/language/overridden', [ $this, 'forget_rate' ], 10, 0 );
+
+		// Paying an existing order: currency and decimals follow that order, armed before WooCommerce's first load.
+		add_action( 'before_woocommerce_pay', static fn() => self::pay_frame()::open_get(), PHP_INT_MIN, 0 );
+		add_filter(
+			'rest_request_before_callbacks',
+			static function ( $response, $handler = [], $request = null ) {
+				$cb  = is_array( $handler ) ? ( $handler['callback'] ?? null ) : null;
+				$obj = is_array( $cb ) ? ( $cb[0] ?? null ) : null;
+
+				// is_a() on an object never autoloads: other REST requests load nothing.
+				if ( is_object( $obj ) && is_a( $obj, 'Automattic\\WooCommerce\\StoreApi\\Routes\\V1\\CheckoutOrder' ) ) {
+					self::pay_frame()::arm_rest( $request );
+				} elseif ( is_object( $obj ) && is_a( $obj, 'WC_REST_Paypal_Buttons_Controller' ) && 'create_order' === ( $cb[1] ?? null ) ) {
+					self::pay_frame()::arm_paypal_buttons( $request );
+				}
+
+				return $response;
+			},
+			10,
+			3
+		);
+		add_action(
+			'woocommerce_api_request',
+			static function ( $api ) {
+				if ( 'wc_gateway_paypal' === $api ) {
+					self::pay_frame()::arm_ipn();
+				}
+			},
+			PHP_INT_MIN
+		);
+
+		// phpcs:disable WordPress.Security.NonceVerification -- Route signals only; WooCommerce checks the nonce and key.
+		if ( isset( $_POST['woocommerce_pay'] ) ) {
+			// WooCommerce's pay_action runs on wp 20 and exits on success.
+			add_action( 'wp', static fn() => self::pay_frame()::open_post(), 19, 0 );
+			add_action( 'wp', static fn() => self::pay_frame()::close_post(), 21, 0 );
+		}
+
+		if ( isset( $_GET['key'] ) ) {
+			// Order-received page: the order shows at its own currency's decimals (static callables: the class loads only when they fire).
+			add_action( 'woocommerce_before_template_part', [ OrderPayFrame::class, 'on_template' ], PHP_INT_MIN, 4 );
+			add_action( 'woocommerce_after_template_part', [ OrderPayFrame::class, 'after_thankyou' ], PHP_INT_MAX, 1 );
+			add_filter( 'pre_render_block', [ OrderPayFrame::class, 'on_block' ], PHP_INT_MAX, 2 );
+			add_filter( 'render_block', [ OrderPayFrame::class, 'after_block' ], PHP_INT_MIN, 2 );
+		}
+
+		if ( isset( $_GET['key'], $_REQUEST['tx'] ) ) {
+			// PayPal PDT's amount check (pdt-handler :45, :165): lossless around that handler only, fired by thankyou.php:96.
+			add_action( 'woocommerce_thankyou_paypal', [ OrderPayFrame::class, 'open_thanks' ], PHP_INT_MIN, 1 );
+			add_action( 'woocommerce_thankyou_paypal', [ OrderPayFrame::class, 'close_thanks' ], PHP_INT_MAX, 1 );
+		}
+		// phpcs:enable WordPress.Security.NonceVerification
+	}
+
+	/**
+	 * Load the pay-frame class (cold: pay routes only).
+	 *
+	 * @return class-string<OrderPayFrame>
+	 */
+	private static function pay_frame(): string {
+		require_once __DIR__ . '/OrderPayFrame.php';
+
+		return OrderPayFrame::class;
 	}
 
 	/**
@@ -92,8 +172,8 @@ final class MultiCurrency {
 	 * @return void
 	 */
 	public function reset_caches(): void {
-		$this->currencies  = null;
-		$this->cached_rate = null;
+		$this->currencies = null;
+		$this->rates      = [];
 	}
 
 	/**
@@ -104,7 +184,7 @@ final class MultiCurrency {
 	 * @return void
 	 */
 	public function forget_rate(): void {
-		$this->cached_rate = null;
+		$this->rates = [];
 	}
 
 	/**
@@ -115,6 +195,13 @@ final class MultiCurrency {
 	 */
 	public function filter_currency( mixed $currency ): string {
 		$currency = is_string( $currency ) ? $currency : '';
+
+		// Before the admin bypass: an order being paid keeps its own currency everywhere.
+		$frame = [] !== self::$pay_frames ? OrderPayFrame::top() : null;
+
+		if ( null !== $frame && null !== $frame['code'] ) {
+			return $frame['code'];
+		}
 
 		// Admin shows the base currency: product prices are entered in it.
 		if ( is_admin() && ! wp_doing_ajax() ) {
@@ -195,6 +282,13 @@ final class MultiCurrency {
 	public function filter_price_decimals( $decimals ): int {
 		$decimals = is_numeric( $decimals ) ? (int) $decimals : 2;
 
+		// Bound: the order currency's decimals. Armed but unbound: the store setting, so a load never drops a digit.
+		$frame = [] !== self::$pay_frames ? OrderPayFrame::top() : null;
+
+		if ( null !== $frame && ( null !== $frame['code'] || $frame['lossless'] ) ) {
+			return null !== $frame['code'] && self::is_zero_decimal_currency( $frame['code'] ) ? 0 : $decimals;
+		}
+
 		if ( is_admin() && ! wp_doing_ajax() ) {
 			return $decimals;
 		}
@@ -211,10 +305,11 @@ final class MultiCurrency {
 	/**
 	 * Whether a currency code has zero minor units (no decimal subunit).
 	 *
+	 * @internal Also read by OrderCouponRate.
 	 * @param string $code ISO-4217 currency code.
 	 * @return bool
 	 */
-	private static function is_zero_decimal_currency( string $code ): bool {
+	public static function is_zero_decimal_currency( string $code ): bool {
 		// ISO 4217 currencies with no minor unit, as WooCommerce treats them.
 		static $zero = [
 			'BIF',
@@ -356,11 +451,20 @@ final class MultiCurrency {
 	 * @return mixed
 	 */
 	public function convert_coupon_amount( $amount, $coupon ) {
-		if ( ( is_admin() && ! wp_doing_ajax() ) || ! $coupon instanceof \WC_Coupon ) {
+		if ( ! $coupon instanceof \WC_Coupon || ! in_array( $coupon->get_discount_type(), [ 'fixed_cart', 'fixed_product' ], true ) ) {
 			return $amount;
 		}
 
-		if ( ! in_array( $coupon->get_discount_type(), [ 'fixed_cart', 'fixed_product' ], true ) ) {
+		$bound = class_exists( OrderCouponRate::class, false ) ? OrderCouponRate::rate_for( $coupon ) : null;
+
+		if ( null !== $bound ) {
+			// WooCommerce reads a filtered amount through wc_format_decimal() ('10,00', '$10'): normalize the same way first.
+			$num = is_string( $amount ) && ! is_numeric( $amount ) && function_exists( 'wc_format_decimal' ) ? wc_format_decimal( $amount ) : $amount;
+
+			return 1.0 === $bound[0] || ! is_numeric( $num ) ? $amount : round( (float) $num * $bound[0], $bound[1] );
+		}
+
+		if ( is_admin() && ! wp_doing_ajax() ) {
 			return $amount;
 		}
 
@@ -383,11 +487,17 @@ final class MultiCurrency {
 	 * @return string|int|float
 	 */
 	public function convert_coupon_threshold( $amount, $coupon ) {
-		if ( ( is_admin() && ! wp_doing_ajax() ) || ! $coupon instanceof \WC_Coupon ) {
+		if ( ! $coupon instanceof \WC_Coupon || $amount === '' || $amount === null ) {
 			return $amount;
 		}
 
-		if ( $amount === '' || $amount === null ) {
+		$bound = class_exists( OrderCouponRate::class, false ) ? OrderCouponRate::rate_for( $coupon ) : null;
+
+		if ( null !== $bound ) {
+			return 1.0 === $bound[0] ? $amount : round( (float) $amount * $bound[0], $bound[1] );
+		}
+
+		if ( is_admin() && ! wp_doing_ajax() ) {
 			return $amount;
 		}
 
@@ -414,7 +524,9 @@ final class MultiCurrency {
 		$slug = $this->get_current_language_slug();
 		$rate = $this->get_exchange_rate();
 
-		$hash[] = $slug . '_' . $rate;
+		// Decimals too: a pay frame can round at the store setting under the same language and rate.
+		$dp     = function_exists( 'wc_get_price_decimals' ) ? wc_get_price_decimals() : '';
+		$hash[] = $slug . '_' . $rate . '_' . ( is_numeric( $dp ) ? (int) $dp : '' );
 
 		return $hash;
 	}
@@ -462,21 +574,24 @@ final class MultiCurrency {
 	}
 
 	/**
-	 * The exchange rate for the current language: 1.0 when it has no currency row.
+	 * The exchange rate for the current language: 1.0 when it has no currency row or no language is decided yet.
 	 *
 	 * @return float Exchange rate multiplier.
 	 */
 	public function get_exchange_rate(): float {
-		if ( $this->cached_rate !== null ) {
-			return $this->cached_rate;
+		$lang_slug = $this->get_current_language_slug();
+
+		// Undecided: the base currency (filter_currency()) at 1.0, never memoised; WooCommerce can price the cart that early.
+		if ( '' === $lang_slug ) {
+			return 1.0;
 		}
 
-		$lang_slug    = $this->get_current_language_slug();
-		$lang_setting = $this->get_currency_for_language( $lang_slug );
+		if ( ! isset( $this->rates[ $lang_slug ] ) ) {
+			$lang_setting              = $this->get_currency_for_language( $lang_slug );
+			$this->rates[ $lang_slug ] = $lang_setting !== null ? (float) $lang_setting['exchange_rate'] : 1.0;
+		}
 
-		$this->cached_rate = $lang_setting !== null ? (float) $lang_setting['exchange_rate'] : 1.0;
-
-		return $this->cached_rate;
+		return $this->rates[ $lang_slug ];
 	}
 
 	/**
@@ -546,9 +661,10 @@ final class MultiCurrency {
 	/**
 	 * Load the currency rows from `perflocale_settings.wc_currencies`; empty without the settings service.
 	 *
+	 * @internal Also read by OrderCouponRate.
 	 * @return array<string, array{currency_code: string, exchange_rate: float, manual_rate: bool, display: string, position: string}>
 	 */
-	private function load_currencies(): array {
+	public function load_currencies(): array {
 		if ( $this->currencies !== null ) {
 			return $this->currencies;
 		}

@@ -408,7 +408,8 @@ final class AutoTranslateJob extends AbstractJob {
 		[ $settings, $cache, $langs ] = $services;
 		$default                      = $langs->get_default();
 
-		if ( 'publish' !== $source->post_status || ! $default || ! $settings->mt_enabled() ) {
+		// Switching auto-translate off also stops queued runs, each at its next slice.
+		if ( 'publish' !== $source->post_status || ! $default || ! $settings->mt_enabled() || ! (bool) $settings->get( 'mt_auto_translate_on_publish' ) ) {
 			return self::stop( $source, $state );
 		}
 

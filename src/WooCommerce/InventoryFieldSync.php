@@ -122,6 +122,11 @@ final class InventoryFieldSync {
 	];
 
 	/**
+	 * One shared quantity: copied whoever saves (the saver-rights hold leaves them out).
+	 */
+	private const STOCK_KEYS = [ '_stock', '_stock_status', '_manage_stock', '_backorders' ];
+
+	/**
 	 * The InventorySync instance this belongs to.
 	 *
 	 * @var InventorySync
@@ -140,8 +145,9 @@ final class InventoryFieldSync {
 
 	/**
 	 * Shared keys a WooCommerce save changed, waiting for it (or its flow, when `waiting`) to end; blog id => product id.
+	 * `users`: whose rights bound the saves, taken at save time (gate_users()); empty = ungated.
 	 *
-	 * @var array<int, array<int, array{keys: array<int, string>, variation: bool, parent: int, waiting?: bool}>>
+	 * @var array<int, array<int, array{keys: array<int, string>, variation: bool, parent: int, users: list<int>, waiting?: bool}>>
 	 */
 	private array $crud_pending = [];
 
@@ -263,13 +269,17 @@ final class InventoryFieldSync {
 			return;
 		}
 
-		$blog     = get_current_blog_id();
-		$previous = $this->crud_pending[ $blog ][ $product_id ]['keys'] ?? [];
+		$blog      = get_current_blog_id();
+		$previous  = $this->crud_pending[ $blog ][ $product_id ] ?? [ 'keys' => [], 'users' => [] ];
+		$variation = $product instanceof \WC_Product_Variation;
+		$parent    = (int) $product->get_parent_id();
 
 		$this->crud_pending[ $blog ][ $product_id ] = [
-			'keys'      => array_values( array_unique( array_merge( $previous, array_keys( $keys ) ) ) ),
-			'variation' => $product instanceof \WC_Product_Variation,
-			'parent'    => (int) $product->get_parent_id(),
+			'keys'      => array_values( array_unique( array_merge( $previous['keys'], array_keys( $keys ) ) ) ),
+			'variation' => $variation,
+			'parent'    => $parent,
+			// The saver now, not whoever is current when a flow flushes the record.
+			'users'     => array_values( array_unique( array_merge( $previous['users'], self::gate_users( $variation ? $parent : $product_id ) ) ) ),
 		];
 	}
 
@@ -344,13 +354,15 @@ final class InventoryFieldSync {
 			return;
 		}
 
+		$users = array_values( array_map( [ \PerfLocale\Util\Scalar::class, 'int' ], (array) ( $pending['users'] ?? [] ) ) );
+
 		if ( ! $pending['variation'] ) {
-			$this->sync_product_fields( $product_id, $keys );
+			$this->sync_product_fields( $product_id, $keys, $users );
 
 			return;
 		}
 
-		$touched = $this->sync_variation_fields( $product_id, false, $keys );
+		$touched = $this->sync_variation_fields( $product_id, false, $keys, $users );
 
 		if ( [] !== $touched ) {
 			$this->queue_sibling_rollups( array_keys( $touched ) );
@@ -595,13 +607,104 @@ final class InventoryFieldSync {
 	}
 
 	/**
+	 * Whether a save writes only to the copies its saver may edit, and that user: a non-cron save by a logged-in user who
+	 * may edit the saved product. Orders, checkout, cron and WP-CLI without a user update every copy (owner L-7863 Q8).
+	 *
+	 * @internal Also CatalogTermSync's rule.
+	 *
+	 * @param int $product_id Saved product (a variation's parent).
+	 * @return array{0: bool, 1: int}
+	 */
+	public static function rights_gate( int $product_id ): array {
+		$user = get_current_user_id();
+
+		return [ ! wp_doing_cron() && $user > 0 && \PerfLocale\Helper::user_can_edit_object( $product_id, $user ), $user ];
+	}
+
+	/**
+	 * The users whose rights bound a save of $product_id: the saver when rights_gate() gates the save, else none.
+	 *
+	 * @param int $product_id Saved product (a variation's parent).
+	 * @return list<int>
+	 */
+	private static function gate_users( int $product_id ): array {
+		[ $gated, $user ] = self::rights_gate( $product_id );
+
+		return $gated ? [ $user ] : [];
+	}
+
+	/**
+	 * Whether any of the save's users may not edit the copy.
+	 *
+	 * @param list<int> $users      gate_users().
+	 * @param int       $product_id The copy's product (a variation's parent).
+	 * @return bool
+	 */
+	private static function held_for( array $users, int $product_id ): bool {
+		foreach ( $users as $user ) {
+			if ( ! \PerfLocale\Helper::user_can_edit_object( $product_id, $user ) ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Whether two meta values differ: scalars as the text meta stores, anything else serialized.
+	 *
+	 * @param mixed $a One value.
+	 * @param mixed $b The other.
+	 * @return bool
+	 */
+	private static function differs( mixed $a, mixed $b ): bool {
+		if ( ( null === $a || is_scalar( $a ) ) && ( null === $b || is_scalar( $b ) ) ) {
+			return (string) $a !== (string) $b;
+		}
+
+		return serialize( $a ) !== serialize( $b ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_serialize -- Comparison only.
+	}
+
+	/**
+	 * The fields a copy the saver may not edit does not take: every non-stock field. The copy is counted for the save
+	 * notice when a value would change and the current user, a saver, may see the copy.
+	 *
+	 * @param array<string, mixed> $values        Source values (read_source_values()).
+	 * @param int                  $target_id     Copy.
+	 * @param int                  $saved_parent  Saved product (a variation's parent).
+	 * @param int                  $target_parent The copy's product (a variation's parent).
+	 * @param list<int>            $users         gate_users() of the save.
+	 * @return array<string, true>
+	 */
+	private static function rights_held( array $values, int $target_id, int $saved_parent, int $target_parent, array $users ): array {
+		$held   = [];
+		$differ = false;
+
+		foreach ( $values as $field => $value ) {
+			$field = (string) $field;
+
+			if ( ! in_array( $field, self::STOCK_KEYS, true ) ) {
+				$held[ $field ] = true;
+				$differ         = $differ || self::differs( get_post_meta( $target_id, $field, true ), $value );
+			}
+		}
+
+		if ( $differ && in_array( get_current_user_id(), $users, true ) && \PerfLocale\Helper::user_can_view_object( $target_parent ) ) {
+			\PerfLocale\Translation\ContentSync::note_rights_skip( $saved_parent, $target_parent );
+		}
+
+		return $held;
+	}
+
+	/**
 	 * Copy shared physical fields to all language variants of a product.
 	 *
 	 * @param int                     $product_id Post ID of the saved product.
 	 * @param array<int, string>|null $only_keys  Copy only these synced fields (a code save passes its changed keys); null: all.
+	 * @param list<int>|null          $users      gate_users() taken at save time (a deferred save); null: now.
 	 * @return void
 	 */
-	public function sync_product_fields( int $product_id, ?array $only_keys = null ): void {
+	public function sync_product_fields( int $product_id, ?array $only_keys = null, ?array $users = null ): void {
 		// A full copy covers whatever a save of this product recorded.
 		if ( null === $only_keys ) {
 			$this->forget_record( get_current_blog_id(), $product_id );
@@ -670,6 +773,7 @@ final class InventoryFieldSync {
 			$values = $this->read_source_values( $product_id, $fields, $derive );
 
 			$synced_ids = [];
+			$users      = $users ?? self::gate_users( $product_id );
 
 			foreach ( $translations as $link ) {
 				$sibling_id = (int) $link->object_id;
@@ -695,9 +799,11 @@ final class InventoryFieldSync {
 					$rederive       = null !== $only_keys;
 					$stock_written  = false;
 					$manage_written = false;
+					// Asked under the sibling lock, right before the writes.
+					$held = self::held_for( $users, $sibling_id ) ? self::rights_held( $values, $sibling_id, $product_id, $sibling_id, $users ) : [];
 
 					foreach ( $values as $field => $value ) {
-						if ( $owned && '_stock' === $field ) {
+						if ( ( $owned && '_stock' === $field ) || isset( $held[ $field ] ) ) {
 							continue;
 						}
 
@@ -907,9 +1013,10 @@ final class InventoryFieldSync {
 	 * @param int                     $variation_id   Saved variation ID.
 	 * @param bool                    $rollup_parents Roll touched sibling parents up inline (bulk edit passes false, rolls up once).
 	 * @param array<int, string>|null $only_keys      Copy only these synced fields (a code save passes its changed keys); null: all.
+	 * @param list<int>|null          $users          gate_users() taken at save time (a deferred save); null: now.
 	 * @return array<int, true> Touched sibling parent IDs (keys).
 	 */
-	public function sync_variation_fields( int $variation_id, bool $rollup_parents = true, ?array $only_keys = null ): array {
+	public function sync_variation_fields( int $variation_id, bool $rollup_parents = true, ?array $only_keys = null, ?array $users = null ): array {
 		// A full copy covers whatever a save of this variation recorded.
 		if ( null === $only_keys ) {
 			$this->forget_record( get_current_blog_id(), $variation_id );
@@ -995,6 +1102,10 @@ final class InventoryFieldSync {
 				return [];
 			}
 
+			// A variation is edited through its product: the rights are the copy product's (as WooCommerce's screen).
+			$saved_parent = \PerfLocale\Util\Scalar::int( $parent_id );
+			$users        = $users ?? self::gate_users( $saved_parent );
+
 			foreach ( $matched as $sib_parent_id => $sib_variation_id ) {
 				if ( $sib_variation_id <= 0 || $sib_variation_id === $variation_id || $this->sync->is_sync_opted_out( $sib_parent_id, 0, $stored ) || $this->sync->is_sync_opted_out( $sib_variation_id, $sib_parent_id, $stored ) ) {
 					continue;
@@ -1015,9 +1126,10 @@ final class InventoryFieldSync {
 					$rederive       = null !== $only_keys;
 					$stock_written  = false;
 					$manage_written = false;
+					$held           = self::held_for( $users, $sib_parent_id ) ? self::rights_held( $values, $sib_variation_id, $saved_parent, $sib_parent_id, $users ) : [];
 
 					foreach ( $values as $field => $value ) {
-						if ( $owned && '_stock' === $field ) {
+						if ( ( $owned && '_stock' === $field ) || isset( $held[ $field ] ) ) {
 							continue;
 						}
 

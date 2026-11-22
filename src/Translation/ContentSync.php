@@ -1057,6 +1057,20 @@ final class ContentSync {
 	}
 
 	/**
+	 * Count a copy a save of $post_id left alone because the saver may not edit it, for a write service outside Sync
+	 * Fields (WooCommerce field sync); the caller has found a value the write would change.
+	 *
+	 * @param int $post_id    Saved post.
+	 * @param int $sibling_id Copy left as it was.
+	 * @return void
+	 */
+	public static function note_rights_skip( int $post_id, int $sibling_id ): void {
+		if ( $post_id > 0 && $sibling_id > 0 ) {
+			self::record_skip( $post_id, $sibling_id );
+		}
+	}
+
+	/**
 	 * Note a sibling a save of $post_id skipped because the saver may not edit it.
 	 *
 	 * It counts only when the write would have changed one of its values, judged against the saved post's final
